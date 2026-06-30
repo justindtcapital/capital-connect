@@ -51,6 +51,8 @@ export const Route = createRootRoute({
       { name: "twitter:title", content: "VenturePulse — DTC Network Intelligence" },
       { name: "twitter:description", content: "DTC network management" },
       { name: "twitter:card", content: "summary" },
+      { property: "og:image", content: "https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/eec20a45-e73e-4a3e-aff1-da50fc1c15c9/id-preview-82758b98--33c9a4dc-3d95-4e54-9da9-413bf3238ece.lovable.app-1782850835844.png" },
+      { name: "twitter:image", content: "https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/eec20a45-e73e-4a3e-aff1-da50fc1c15c9/id-preview-82758b98--33c9a4dc-3d95-4e54-9da9-413bf3238ece.lovable.app-1782850835844.png" },
     ],
     links: [
       { rel: "stylesheet", href: appCss },

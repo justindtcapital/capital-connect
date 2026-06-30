@@ -4,6 +4,9 @@ import { createContext, useContext, useEffect, useState, type ReactNode } from "
 // To grant access to another person, add their lowercase email here.
 const ALLOWED_EMAILS = [
   "justin.adorante@dell.com",
+  "chris.falloon@dell.com",
+  "julia.beech@dell.com",
+  "chris.hillock@dell.com",
 ];
 
 const STORAGE_KEY = "vp-auth-email";

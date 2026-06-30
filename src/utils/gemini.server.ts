@@ -33,12 +33,24 @@ function vertexUrl(model: string): string {
 let vertexAuth: GoogleAuth | null = null;
 async function getVertexToken(): Promise<string> {
   if (!vertexAuth) {
-    vertexAuth = new GoogleAuth({ scopes: "https://www.googleapis.com/auth/cloud-platform" });
+    const credsJson = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
+    const opts: ConstructorParameters<typeof GoogleAuth>[0] = {
+      scopes: "https://www.googleapis.com/auth/cloud-platform",
+    };
+    if (credsJson) {
+      try {
+        opts.credentials = JSON.parse(credsJson);
+      } catch (e) {
+        throw new Error("GOOGLE_APPLICATION_CREDENTIALS_JSON is not valid JSON");
+      }
+    }
+    vertexAuth = new GoogleAuth(opts);
   }
   const token = await vertexAuth.getAccessToken();
-  if (!token) throw new Error("Could not obtain a Google Cloud access token — set up ADC (gcloud auth application-default login) or GOOGLE_APPLICATION_CREDENTIALS");
+  if (!token) throw new Error("Could not obtain a Google Cloud access token — set GOOGLE_APPLICATION_CREDENTIALS_JSON to a service-account key JSON");
   return token;
 }
+
 
 // ── Wire types (subset of the Gemini REST shape we use) ──────────
 // JSON value type — kept serializable so GeminiContent can round-trip through a

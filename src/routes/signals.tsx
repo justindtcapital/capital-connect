@@ -5,7 +5,7 @@ import { fetchLinkedInFeed } from "@/utils/linkedin.functions";
 import { fetchDriveDocs } from "@/utils/drive.functions";
 import { fetchGmailFeed } from "@/utils/gmail.functions";
 import { fetchPortfolioCompanies, fetchContacts } from "@/utils/sheets.functions";
-import type { Contact } from "@/lib/types";
+import type { Contact, PortfolioCompany } from "@/lib/types";
 import {
   buildFeed,
   bucketOf,
@@ -283,7 +283,7 @@ function SignalsPage() {
   // Filter lists are the full canonical taxonomies (always shown). The portfolio
   // company list is the full portfolio, narrowed to the selected segments.
   const companies = useMemo(() => {
-    let list = portfolio ?? [];
+    let list: PortfolioCompany[] = portfolio ?? [];
     if (segSel.length) list = list.filter((p) => segSel.includes(bucketOf(p.domain)));
     return [...list].map((p) => p.name).sort((a, b) => a.localeCompare(b));
   }, [portfolio, segSel]);
@@ -579,7 +579,7 @@ function SignalsPage() {
                 <AlertTriangle className="h-4 w-4" /> Compliance flags
               </div>
               <ul className="list-disc pl-6 text-xs text-amber-700 space-y-0.5">
-                {result.compliance.map((c, i) => (
+                {result.compliance.map((c: string, i: number) => (
                   <li key={i}>{c}</li>
                 ))}
               </ul>

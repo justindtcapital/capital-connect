@@ -533,7 +533,7 @@ function HomePage() {
               </p>
             ) : (
               <div className="divide-y divide-border">
-                {attention.map((a) => {
+                {attention.map((a: AttentionItem) => {
                   const r = REASON_STYLE[a.reason];
                   return (
                     <Link
@@ -581,7 +581,7 @@ function HomePage() {
         <Card>
           <CardContent className="p-5">
             <Suspense fallback={<DigestSkeleton />}>
-              <Await promise={digest}>{(d) => <DigestBody digest={d} />}</Await>
+              <Await promise={digest}>{(d) => <DigestBody digest={d as HomeDigest} />}</Await>
             </Suspense>
           </CardContent>
         </Card>

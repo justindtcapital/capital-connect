@@ -1,16 +1,19 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import {
-  Outlet,
-  Link,
-  createRootRouteWithContext,
-  useRouter,
-  HeadContent,
-  Scripts,
-} from "@tanstack/react-router";
-import { useEffect, type ReactNode } from "react";
+import { Outlet, Link, createRootRoute, HeadContent, Scripts } from "@tanstack/react-router";
+import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
+import { AppSidebar } from "@/components/app-sidebar";
+import { FilterProvider, useFilters } from "@/lib/filter-context";
+import { SelectionProvider } from "@/lib/selection-context";
+import { DashboardFilterProvider, useDashboardFilters } from "@/lib/dashboard-filter-context";
+import { TargetingFilterProvider, useTargetingFilters } from "@/lib/targeting-filter-context";
+import { TargetSelectionProvider } from "@/lib/target-selection-context";
+import { PortfolioFilterProvider, usePortfolioFilters } from "@/lib/portfolio-filter-context";
+import { FilterOptionsProvider } from "@/lib/filter-options-context";
+import { AuthProvider, useAuth } from "@/lib/auth-context";
+import { LoginScreen } from "@/components/login-screen";
+import { Button } from "@/components/ui/button";
+import { Toaster } from "@/components/ui/sonner";
 
 import appCss from "../styles.css?url";
-import { reportLovableError } from "../lib/lovable-error-reporting";
 
 function NotFoundComponent() {
   return (
@@ -34,79 +37,45 @@ function NotFoundComponent() {
   );
 }
 
-function ErrorComponent({ error, reset }: { error: Error; reset: () => void }) {
-  console.error(error);
-  const router = useRouter();
-  useEffect(() => {
-    reportLovableError(error, { boundary: "tanstack_root_error_component" });
-  }, [error]);
-
-  return (
-    <div className="flex min-h-screen items-center justify-center bg-background px-4">
-      <div className="max-w-md text-center">
-        <h1 className="text-xl font-semibold tracking-tight text-foreground">
-          This page didn't load
-        </h1>
-        <p className="mt-2 text-sm text-muted-foreground">
-          Something went wrong on our end. You can try refreshing or head back home.
-        </p>
-        <div className="mt-6 flex flex-wrap justify-center gap-2">
-          <button
-            onClick={() => {
-              router.invalidate();
-              reset();
-            }}
-            className="inline-flex items-center justify-center rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
-          >
-            Try again
-          </button>
-          <a
-            href="/"
-            className="inline-flex items-center justify-center rounded-md border border-input bg-background px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-accent"
-          >
-            Go home
-          </a>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()({
+export const Route = createRootRoute({
   head: () => ({
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
-      { title: "Lovable App" },
-      { name: "description", content: "Lovable Generated Project" },
-      { name: "author", content: "Lovable" },
-      { property: "og:title", content: "Lovable App" },
-      { property: "og:description", content: "Lovable Generated Project" },
+      { title: "VenturePulse — DTC Network Intelligence" },
+      { name: "description", content: "DTC network management" },
+      { name: "author", content: "Dell Technologies Capital" },
+      { property: "og:title", content: "VenturePulse — DTC Network Intelligence" },
+      { property: "og:description", content: "DTC network management" },
       { property: "og:type", content: "website" },
+      { name: "twitter:title", content: "VenturePulse — DTC Network Intelligence" },
+      { name: "twitter:description", content: "DTC network management" },
       { name: "twitter:card", content: "summary" },
-      { name: "twitter:site", content: "@Lovable" },
     ],
     links: [
+      { rel: "stylesheet", href: appCss },
+      { rel: "preconnect", href: "https://fonts.googleapis.com" },
+      { rel: "preconnect", href: "https://fonts.gstatic.com", crossOrigin: "anonymous" },
       {
         rel: "stylesheet",
-        href: appCss,
+        href: "https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap",
       },
     ],
   }),
   shellComponent: RootShell,
   component: RootComponent,
   notFoundComponent: NotFoundComponent,
-  errorComponent: ErrorComponent,
 });
 
-function RootShell({ children }: { children: ReactNode }) {
+function RootShell({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
       <head>
         <HeadContent />
       </head>
-      <body>
+      <body style={{ fontFamily: "'Inter', sans-serif" }}>
         {children}
+        <Toaster richColors position="top-right" />
         <Scripts />
       </body>
     </html>
@@ -114,12 +83,79 @@ function RootShell({ children }: { children: ReactNode }) {
 }
 
 function RootComponent() {
-  const { queryClient } = Route.useRouteContext();
+  return (
+    <AuthProvider>
+      <AuthGate />
+    </AuthProvider>
+  );
+}
+
+function AuthGate() {
+  const { email, ready } = useAuth();
+
+  // Avoid flashing the login screen before the stored session is read.
+  if (!ready) return null;
+  if (!email) return <LoginScreen />;
 
   return (
-    <QueryClientProvider client={queryClient}>
-      {/* Required: nested routes render here. Removing <Outlet /> breaks all child routes. */}
-      <Outlet />
-    </QueryClientProvider>
+    <FilterOptionsProvider>
+    <FilterProvider>
+      <DashboardFilterProvider>
+        <TargetingFilterProvider>
+          <PortfolioFilterProvider>
+            <SelectionProvider>
+              <TargetSelectionProvider>
+                <SidebarProvider>
+                  <div className="min-h-screen flex w-full">
+                    <SidebarWithFilters />
+                    <div className="flex-1 flex flex-col min-w-0">
+                      <header className="h-12 flex items-center justify-between border-b border-border bg-background px-4">
+                        <SidebarTrigger />
+                        <UserMenu />
+                      </header>
+                      <main className="flex-1 overflow-auto">
+                        <Outlet />
+                      </main>
+                    </div>
+                  </div>
+                </SidebarProvider>
+              </TargetSelectionProvider>
+            </SelectionProvider>
+          </PortfolioFilterProvider>
+        </TargetingFilterProvider>
+      </DashboardFilterProvider>
+    </FilterProvider>
+    </FilterOptionsProvider>
+  );
+}
+
+function UserMenu() {
+  const { email, logout } = useAuth();
+  return (
+    <div className="flex items-center gap-3">
+      <span className="text-sm text-muted-foreground">{email}</span>
+      <Button variant="ghost" size="sm" onClick={logout}>
+        Sign out
+      </Button>
+    </div>
+  );
+}
+
+function SidebarWithFilters() {
+  const { filters, setFilters } = useFilters();
+  const { filters: dashFilters, setFilters: setDashFilters } = useDashboardFilters();
+  const { filters: targetFilters, setFilters: setTargetFilters } = useTargetingFilters();
+  const { filters: portfolioFilters, setFilters: setPortfolioFilters } = usePortfolioFilters();
+  return (
+    <AppSidebar
+      filters={filters}
+      onFiltersChange={setFilters}
+      dashboardFilters={dashFilters}
+      onDashboardFiltersChange={setDashFilters}
+      targetingFilters={targetFilters}
+      onTargetingFiltersChange={setTargetFilters}
+      portfolioFilters={portfolioFilters}
+      onPortfolioFiltersChange={setPortfolioFilters}
+    />
   );
 }

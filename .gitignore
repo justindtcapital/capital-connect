@@ -16,6 +16,17 @@ dist-ssr
 .nitro
 *.local
 
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Google service-account key (Vertex/Gemini auth) — never commit
+sa-key.json
+*-sa-key.json
+service-account*.json
+gcp-*.json
+
 # Wrangler / Cloudflare
 .wrangler/
 .dev.vars

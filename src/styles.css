@@ -4,20 +4,6 @@
 
 @custom-variant dark (&:is(.dark *));
 
-/*
- * Design system definition.
- *
- * The @theme inline block maps CSS custom properties to Tailwind utility
- * classes (e.g. --color-primary -> bg-primary, text-primary).
- *
- * The :root and .dark blocks define the actual color values using oklch.
- * All colors MUST use oklch format.
- *
- * To add a new semantic color:
- * 1. Add the variable to :root (light value) and .dark (dark value)
- * 2. Register it in @theme inline as --color-<name>: var(--<name>)
- */
-
 @theme inline {
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
@@ -34,6 +20,7 @@
   --color-popover-foreground: var(--popover-foreground);
   --color-primary: var(--primary);
   --color-primary-foreground: var(--primary-foreground);
+  --color-primary-glow: var(--primary-glow);
   --color-secondary: var(--secondary);
   --color-secondary-foreground: var(--secondary-foreground);
   --color-muted: var(--muted);
@@ -59,77 +46,132 @@
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-ring: var(--sidebar-ring);
+  --color-hot: var(--hot);
+  --color-hot-foreground: var(--hot-foreground);
+  --color-warm: var(--warm);
+  --color-warm-foreground: var(--warm-foreground);
+  --color-cold: var(--cold);
+  --color-cold-foreground: var(--cold-foreground);
 }
 
 :root {
-  --radius: 0.625rem;
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.129 0.042 264.695);
+  --radius: 0.5rem;
+  /* Dell Technologies Capital — electric blue on a cool near-white, deep navy ink */
+  --background: oklch(0.985 0.003 240);
+  --foreground: oklch(0.21 0.04 256);
   --card: oklch(1 0 0);
-  --card-foreground: oklch(0.129 0.042 264.695);
+  --card-foreground: oklch(0.21 0.04 256);
   --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.129 0.042 264.695);
-  --primary: oklch(0.208 0.042 265.755);
-  --primary-foreground: oklch(0.984 0.003 247.858);
-  --secondary: oklch(0.968 0.007 247.896);
-  --secondary-foreground: oklch(0.208 0.042 265.755);
-  --muted: oklch(0.968 0.007 247.896);
-  --muted-foreground: oklch(0.554 0.046 257.417);
-  --accent: oklch(0.968 0.007 247.896);
-  --accent-foreground: oklch(0.208 0.042 265.755);
-  --destructive: oklch(0.577 0.245 27.325);
-  --destructive-foreground: oklch(0.984 0.003 247.858);
-  --border: oklch(0.929 0.013 255.508);
-  --input: oklch(0.929 0.013 255.508);
-  --ring: oklch(0.704 0.04 256.788);
-  --chart-1: oklch(0.646 0.222 41.116);
-  --chart-2: oklch(0.6 0.118 184.704);
-  --chart-3: oklch(0.398 0.07 227.392);
-  --chart-4: oklch(0.828 0.189 84.429);
-  --chart-5: oklch(0.769 0.188 70.08);
-  --sidebar: oklch(0.984 0.003 247.858);
-  --sidebar-foreground: oklch(0.129 0.042 264.695);
-  --sidebar-primary: oklch(0.208 0.042 265.755);
-  --sidebar-primary-foreground: oklch(0.984 0.003 247.858);
-  --sidebar-accent: oklch(0.968 0.007 247.896);
-  --sidebar-accent-foreground: oklch(0.208 0.042 265.755);
-  --sidebar-border: oklch(0.929 0.013 255.508);
-  --sidebar-ring: oklch(0.704 0.04 256.788);
+  --popover-foreground: oklch(0.21 0.04 256);
+  --primary: oklch(0.48 0.18 252);
+  --primary-foreground: oklch(1 0 0);
+  /* Brighter companion blue for gradients/glows */
+  --primary-glow: oklch(0.62 0.19 252);
+  --secondary: oklch(0.96 0.006 247);
+  --secondary-foreground: oklch(0.24 0.04 256);
+  --muted: oklch(0.96 0.006 247);
+  --muted-foreground: oklch(0.52 0.03 252);
+  --accent: oklch(0.95 0.022 252);
+  --accent-foreground: oklch(0.3 0.09 252);
+  --destructive: oklch(0.585 0.22 27);
+  --destructive-foreground: oklch(1 0 0);
+  --border: oklch(0.9 0.008 247);
+  --input: oklch(0.9 0.008 247);
+  --ring: oklch(0.48 0.18 252);
+  /* Charts anchored on the new electric blue */
+  --chart-1: oklch(0.48 0.18 252);
+  --chart-2: oklch(0.637 0.135 163);
+  --chart-3: oklch(0.735 0.145 85);
+  --chart-4: oklch(0.598 0.2 295);
+  --chart-5: oklch(0.645 0.246 16);
+  /* Sidebar — dark navy scheme */
+  --sidebar: oklch(0.16 0.035 252);
+  --sidebar-foreground: oklch(0.93 0.012 245);
+  --sidebar-primary: oklch(0.62 0.19 252);
+  --sidebar-primary-foreground: oklch(1 0 0);
+  --sidebar-accent: oklch(0.22 0.04 252);
+  --sidebar-accent-foreground: oklch(0.97 0.01 245);
+  --sidebar-border: oklch(0.26 0.04 252);
+  --sidebar-ring: oklch(0.62 0.19 252);
+  /* Temperature tokens */
+  --hot: oklch(0.936 0.032 25);
+  --hot-foreground: oklch(0.505 0.213 27);
+  --warm: oklch(0.962 0.042 90);
+  --warm-foreground: oklch(0.554 0.135 66);
+  --cold: oklch(0.93 0.03 252);
+  --cold-foreground: oklch(0.48 0.18 252);
+  /* Gradients & elevation (referenced via bg-[var(--…)] / shadow-[var(--…)]) */
+  --gradient-primary: linear-gradient(135deg, var(--primary), var(--primary-glow));
+  --gradient-sidebar: linear-gradient(180deg, var(--sidebar), oklch(0.12 0.03 252));
+  --shadow-card: 0 1px 2px 0 oklch(0.2 0.04 256 / 0.06), 0 1px 3px 0 oklch(0.2 0.04 256 / 0.08);
+  --shadow-elegant: 0 12px 32px -12px oklch(0.48 0.18 252 / 0.4);
+}
+
+/* The sidebar is dark navy, but its inner panels (filters, search, bulk actions)
+   use GLOBAL tokens (text-foreground, bg-card, border-border, …). Scope a token
+   remap to the sidebar container so that content stays readable on navy without
+   touching component classNames. Portalled popovers/dialogs render OUTSIDE this
+   element, so they keep the light theme. Also paints the vertical navy gradient. */
+[data-sidebar="sidebar"] {
+  background: var(--gradient-sidebar);
+  --background: oklch(0.13 0.03 252);
+  --foreground: var(--sidebar-foreground);
+  --card: oklch(0.13 0.03 252);
+  --card-foreground: var(--sidebar-foreground);
+  --popover: oklch(0.16 0.035 252);
+  --popover-foreground: var(--sidebar-foreground);
+  --muted: oklch(0.22 0.04 252);
+  --muted-foreground: oklch(0.72 0.03 245);
+  --secondary: oklch(0.22 0.04 252);
+  --secondary-foreground: var(--sidebar-foreground);
+  --accent: var(--sidebar-accent);
+  --accent-foreground: var(--sidebar-accent-foreground);
+  --border: var(--sidebar-border);
+  --input: var(--sidebar-border);
+  --primary: var(--sidebar-primary);
+  --primary-foreground: var(--sidebar-primary-foreground);
+  --ring: var(--sidebar-ring);
 }
 
 .dark {
-  --background: oklch(0.129 0.042 264.695);
-  --foreground: oklch(0.984 0.003 247.858);
-  --card: oklch(0.208 0.042 265.755);
-  --card-foreground: oklch(0.984 0.003 247.858);
-  --popover: oklch(0.208 0.042 265.755);
-  --popover-foreground: oklch(0.984 0.003 247.858);
-  --primary: oklch(0.929 0.013 255.508);
-  --primary-foreground: oklch(0.208 0.042 265.755);
-  --secondary: oklch(0.279 0.041 260.031);
-  --secondary-foreground: oklch(0.984 0.003 247.858);
-  --muted: oklch(0.279 0.041 260.031);
-  --muted-foreground: oklch(0.704 0.04 256.788);
-  --accent: oklch(0.279 0.041 260.031);
-  --accent-foreground: oklch(0.984 0.003 247.858);
+  --background: oklch(0.145 0.005 285);
+  --foreground: oklch(0.985 0.002 264);
+  --card: oklch(0.205 0.008 285);
+  --card-foreground: oklch(0.985 0.002 264);
+  --popover: oklch(0.205 0.008 285);
+  --popover-foreground: oklch(0.985 0.002 264);
+  --primary: oklch(0.615 0.175 241);
+  --primary-foreground: oklch(0.145 0.005 285);
+  --secondary: oklch(0.269 0.01 285);
+  --secondary-foreground: oklch(0.985 0.002 264);
+  --muted: oklch(0.269 0.01 285);
+  --muted-foreground: oklch(0.708 0.015 264);
+  --accent: oklch(0.269 0.01 285);
+  --accent-foreground: oklch(0.985 0.002 264);
   --destructive: oklch(0.704 0.191 22.216);
-  --destructive-foreground: oklch(0.984 0.003 247.858);
+  --destructive-foreground: oklch(0.985 0.002 264);
   --border: oklch(1 0 0 / 10%);
   --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.551 0.027 264.364);
-  --chart-1: oklch(0.488 0.243 264.376);
-  --chart-2: oklch(0.696 0.17 162.48);
-  --chart-3: oklch(0.769 0.188 70.08);
-  --chart-4: oklch(0.627 0.265 303.9);
-  --chart-5: oklch(0.645 0.246 16.439);
-  --sidebar: oklch(0.208 0.042 265.755);
-  --sidebar-foreground: oklch(0.984 0.003 247.858);
-  --sidebar-primary: oklch(0.488 0.243 264.376);
-  --sidebar-primary-foreground: oklch(0.984 0.003 247.858);
-  --sidebar-accent: oklch(0.279 0.041 260.031);
-  --sidebar-accent-foreground: oklch(0.984 0.003 247.858);
+  --ring: oklch(0.615 0.175 241);
+  --chart-1: oklch(0.615 0.175 241);
+  --chart-2: oklch(0.696 0.17 162);
+  --chart-3: oklch(0.769 0.188 70);
+  --chart-4: oklch(0.627 0.265 304);
+  --chart-5: oklch(0.645 0.246 16);
+  --sidebar: oklch(0.205 0.008 285);
+  --sidebar-foreground: oklch(0.985 0.002 264);
+  --sidebar-primary: oklch(0.615 0.175 241);
+  --sidebar-primary-foreground: oklch(0.985 0.002 264);
+  --sidebar-accent: oklch(0.269 0.01 285);
+  --sidebar-accent-foreground: oklch(0.985 0.002 264);
   --sidebar-border: oklch(1 0 0 / 10%);
-  --sidebar-ring: oklch(0.551 0.027 264.364);
+  --sidebar-ring: oklch(0.615 0.175 241);
+  --hot: oklch(0.3 0.06 25);
+  --hot-foreground: oklch(0.7 0.18 25);
+  --warm: oklch(0.32 0.06 80);
+  --warm-foreground: oklch(0.75 0.15 75);
+  --cold: oklch(0.28 0.05 241);
+  --cold-foreground: oklch(0.7 0.15 241);
 }
 
 @layer base {
@@ -141,4 +183,61 @@
     background-color: var(--color-background);
     color: var(--color-foreground);
   }
+}
+
+/* ── Workspace icons (home "Jump into a workspace") ──────────────────────────
+   Bespoke animated SVGs (see components/home/WorkspaceIcons.tsx). Elements are
+   static at rest; animation runs only while the card (.group) is hovered OR the
+   icon container carries .wsi--active (idle choreography). currentColor drives
+   the hue, set per-module on the tile. */
+
+/* transform origins — most glyphs spin/scale about their own center; bars grow
+   from the bottom; full-icon rotations (radar sweep, orbit, scan ring) pivot on
+   the 24×24 viewBox center. */
+.wsi [class*="wsi-"] { transform-box: fill-box; transform-origin: center; }
+.wsi .wsi-bar { transform-origin: bottom; }
+.wsi .wsi-sweep,
+.wsi .wsi-scan,
+.wsi .wsi-orbit { transform-box: view-box; transform-origin: 12px 12px; }
+
+/* line-graph "draw" needs a dash setup even at rest */
+.wsi .wsi-line { stroke-dasharray: 34; stroke-dashoffset: 0; }
+
+/* Trigger: animate on card-hover or while flagged active by the idle loop. */
+.group:hover .wsi-node,  .wsi--active .wsi-node  { animation: wsi-pulse 1.6s ease-in-out infinite; }
+.group:hover .wsi-link,  .wsi--active .wsi-link  { animation: wsi-fade 2s ease-in-out infinite; }
+.group:hover .wsi-scan,  .wsi--active .wsi-scan  { animation: wsi-spin 6s linear infinite; }
+.group:hover .wsi-ping,  .wsi--active .wsi-ping  { animation: wsi-ping 1.6s ease-out infinite; }
+.group:hover .wsi-center,.wsi--active .wsi-center{ animation: wsi-lock 1.4s ease-in-out infinite; }
+.group:hover .wsi-dot,   .wsi--active .wsi-dot   { animation: wsi-pop 1.9s ease-in-out infinite; }
+.group:hover .wsi-spark, .wsi--active .wsi-spark { animation: wsi-twinkle 1.5s ease-in-out infinite; }
+.group:hover .wsi-win,   .wsi--active .wsi-win   { animation: wsi-glow 1.8s ease-in-out infinite; }
+.group:hover .wsi-arrow, .wsi--active .wsi-arrow { animation: wsi-rise 1.7s ease-in-out infinite; }
+.group:hover .wsi-sweep, .wsi--active .wsi-sweep { animation: wsi-spin 1.8s linear infinite; }
+.group:hover .wsi-blip,  .wsi--active .wsi-blip  { animation: wsi-blip 1.8s ease-in-out infinite; }
+.group:hover .wsi-bar,   .wsi--active .wsi-bar   { animation: wsi-bar 1.6s ease-out infinite; }
+.group:hover .wsi-orbit, .wsi--active .wsi-orbit { animation: wsi-spin 2.6s linear infinite; }
+.group:hover .wsi-line,  .wsi--active .wsi-line  { animation: wsi-draw 1.8s ease-out infinite; }
+
+/* stagger delays (placed AFTER the assignments so they override the shorthand's
+   reset of animation-delay) */
+.group:hover .wsi-d1, .wsi--active .wsi-d1 { animation-delay: 0.16s; }
+.group:hover .wsi-d2, .wsi--active .wsi-d2 { animation-delay: 0.32s; }
+.group:hover .wsi-d3, .wsi--active .wsi-d3 { animation-delay: 0.48s; }
+
+@keyframes wsi-pulse { 0%, 100% { opacity: 0.85; transform: scale(1); } 50% { opacity: 1; transform: scale(1.18); } }
+@keyframes wsi-fade  { 0%, 100% { opacity: 0.3; } 50% { opacity: 0.9; } }
+@keyframes wsi-spin  { to { transform: rotate(360deg); } }
+@keyframes wsi-ping  { 0% { transform: scale(0.5); opacity: 0.7; } 100% { transform: scale(1.35); opacity: 0; } }
+@keyframes wsi-lock  { 0%, 100% { transform: scale(0.55); opacity: 0.6; } 50% { transform: scale(1); opacity: 1; } }
+@keyframes wsi-pop   { 0%, 100% { transform: scale(0); } 30%, 70% { transform: scale(1); } }
+@keyframes wsi-twinkle { 0%, 100% { opacity: 0.35; transform: scale(0.7) rotate(0deg); } 50% { opacity: 1; transform: scale(1.1) rotate(20deg); } }
+@keyframes wsi-glow  { 0%, 100% { opacity: 0.25; } 50% { opacity: 1; } }
+@keyframes wsi-rise  { 0%, 100% { transform: translateY(1px); opacity: 0.6; } 50% { transform: translateY(-2px); opacity: 1; } }
+@keyframes wsi-blip  { 0%, 100% { opacity: 0; } 15% { opacity: 1; } 60% { opacity: 0; } }
+@keyframes wsi-bar   { 0% { transform: scaleY(0.25); } 60%, 100% { transform: scaleY(1); } }
+@keyframes wsi-draw  { 0% { stroke-dashoffset: 34; } 65%, 100% { stroke-dashoffset: 0; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .wsi [class*="wsi-"] { animation: none !important; }
 }

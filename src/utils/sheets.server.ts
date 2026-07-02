@@ -85,7 +85,10 @@ export async function fetchSheetTab(tabName: string): Promise<string[][]> {
   if (cached) return cached;
 
   const spreadsheetId = process.env.GOOGLE_SPREADSHEET_ID;
-  if (!spreadsheetId) throw new Error("GOOGLE_SPREADSHEET_ID secret is not configured");
+  if (!spreadsheetId) {
+    console.error("[sheets] GOOGLE_SPREADSHEET_ID missing/empty; env keys:", Object.keys(process.env).filter((k) => k.startsWith("GOOGLE")));
+    throw new Error("GOOGLE_SPREADSHEET_ID secret is not configured");
+  }
 
   const token = await getAccessToken();
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(tabName)}`;

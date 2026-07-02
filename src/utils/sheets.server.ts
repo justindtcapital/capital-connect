@@ -862,6 +862,7 @@ const INTERACTION_COLS: Record<string, string> = {
   "requires follow up": "isFollowUp",
   "follow up resolved": "followUpComplete",
   type: "type",
+  "source ref": "sourceRef",
 };
 
 // Canonical Notes-tab column order used when the tab is created from scratch.
@@ -900,6 +901,7 @@ export async function appendInteractionRows(rows: InteractionRowInput[]): Promis
   if (rows.length === 0) return;
   await ensureTab(TAB_NAMES.interactions, INTERACTION_HEADERS);
   await ensureColumn(TAB_NAMES.interactions, "Type");
+  if (rows.some((r) => r.sourceRef)) await ensureColumn(TAB_NAMES.interactions, "Source Ref");
   const sheetRows = await fetchSheetTab(TAB_NAMES.interactions).catch(() => [] as string[][]);
   const headers = (sheetRows[0] || []).map((h) => h.trim().toLowerCase());
 
@@ -911,8 +913,8 @@ export async function appendInteractionRows(rows: InteractionRowInput[]): Promis
       "note content": r.summary,
       "requires follow up": r.requiresFollowUp ? "TRUE" : "FALSE",
       "follow up resolved": r.resolved ? "TRUE" : "FALSE",
-      "source ref": r.sourceRef ?? "",
       type: r.type,
+      "source ref": r.sourceRef ?? "",
     };
     return headers.length
       ? headers.map((h) => byHeader[h] ?? "")
@@ -923,6 +925,7 @@ export async function appendInteractionRows(rows: InteractionRowInput[]): Promis
           r.requiresFollowUp ? "TRUE" : "FALSE",
           r.resolved ? "TRUE" : "FALSE",
           r.type,
+          r.sourceRef ?? "",
         ];
   };
 
@@ -1156,6 +1159,7 @@ export async function buildContacts(): Promise<Contact[]> {
       summary: i.summary || "",
       isFollowUp: i.isFollowUp?.toLowerCase() === "true",
       followUpComplete: i.followUpComplete?.toLowerCase() === "true",
+      sourceRef: i.sourceRef || undefined,
     }));
 
     // Follow-up pending: either from Notes tab or from Contact's Follow Up Flag

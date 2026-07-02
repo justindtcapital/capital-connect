@@ -7,8 +7,10 @@ import {
 } from "@/utils/sheets.functions";
 import type { Contact, PortfolioCompany } from "@/lib/types";
 import { ContactList } from "@/components/crm/ContactList";
+import { syncAsanaActivities } from "@/utils/activity-sync.functions";
+import { syncEventExposure } from "@/utils/event-exposure.functions";
 import { Button } from "@/components/ui/button";
-import { Plus, Upload, Download, ClipboardPaste, ChevronDown, Gauge, Loader2 } from "lucide-react";
+import { Plus, Upload, Download, ClipboardPaste, ChevronDown, Gauge, Loader2, Activity } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -67,6 +69,48 @@ function CrmPage() {
   const [bulkUploadOpen, setBulkUploadOpen] = useState(false);
   const [pasteOpen, setPasteOpen] = useState(false);
   const [recalcBusy, setRecalcBusy] = useState(false);
+  const [syncBusy, setSyncBusy] = useState(false);
+
+  // Pull BD/GTM activities from Asana and log each onto the contacts it matches
+  // (deduped, read-only). Safe to re-run — only new/newly-matched activities land.
+  const handleSyncActivity = async () => {
+    setSyncBusy(true);
+    try {
+      const [res, exp] = await Promise.all([syncAsanaActivities(), syncEventExposure()]);
+      if (!res.ok) {
+        toast.error(res.error || "Activity sync failed.");
+        return;
+      }
+      if (res.activities === 0) {
+        toast.info("No BD/GTM activities found in Asana (check the project GIDs / access).");
+      } else if (res.logged === 0) {
+        toast.success(
+          `Up to date — ${res.matched} matched activit${res.matched !== 1 ? "ies" : "y"}, nothing new to log.`,
+        );
+      } else {
+        toast.success(
+          `Logged ${res.logged} activit${res.logged !== 1 ? "ies" : "y"} across ${res.contactsTouched} contact${res.contactsTouched !== 1 ? "s" : ""}` +
+            (res.skipped > 0 ? ` · ${res.skipped} already synced.` : "."),
+        );
+      }
+      if (!exp.ok) {
+        toast.error(exp.error || "Event-exposure sync failed.");
+      } else if (exp.exposuresLogged > 0 || exp.engagementsLogged > 0) {
+        toast.success(
+          `Event exposure: tagged ${exp.exposuresLogged} compan${exp.exposuresLogged !== 1 ? "ies" : "y"}` +
+            (exp.engagementsLogged > 0
+              ? ` · ${exp.engagementsLogged} attendee engagement${exp.engagementsLogged !== 1 ? "s" : ""}.`
+              : "."),
+        );
+      }
+      await router.invalidate();
+    } catch (e) {
+      console.error("syncAsanaActivities failed", e);
+      toast.error("Activity sync failed — see console.");
+    } finally {
+      setSyncBusy(false);
+    }
+  };
 
   // Recompute every unlocked contact's rating from activity and persist changes.
   const handleRecalc = async () => {
@@ -158,9 +202,25 @@ function CrmPage() {
             variant="outline"
             size="sm"
             className="text-xs"
+            onClick={handleSyncActivity}
+            disabled={syncBusy}
+            title="Pull BD/GTM activities from Asana and log each onto the contacts it matches (read-only, deduped). Safe to re-run."
+          >
+            {syncBusy ? (
+              <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
+            ) : (
+              <Activity className="h-3.5 w-3.5 mr-1.5" />
+            )}
+            {syncBusy ? "Syncing…" : "Sync activity"}
+          </Button>
+
+          <Button
+            variant="outline"
+            size="sm"
+            className="text-xs"
             onClick={handleRecalc}
             disabled={recalcBusy}
-            title="Recompute Hot/Warm/Cold from activity. Manually-set ratings are left untouched."
+            title="Recompute Council/Hot/Warm/Cold from activity. Manually-set ratings are left untouched."
           >
             {recalcBusy ? (
               <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />

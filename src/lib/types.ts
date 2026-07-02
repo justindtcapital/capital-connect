@@ -108,6 +108,8 @@ export interface Interaction {
   summary: string;
   isFollowUp?: boolean;
   followUpComplete?: boolean;
+  /** e.g. "asana:<gid>" when mirrored from Asana activity sync. */
+  sourceRef?: string;
 }
 
 const INTERACTION_TYPES: readonly InteractionType[] = [
@@ -327,6 +329,8 @@ export interface PortfolioCompany {
   employees: PortfolioEmployee[];
   events: PortfolioEvent[];
   introductions: PortfolioIntro[];
+  /** Event-exposure tags from completed portco events (PortCo Event Exposure tab). */
+  exposures?: PortCoExposure[];
   asanaFields?: Record<string, string>;
 }
 

@@ -441,6 +441,7 @@ export const TAB_NAMES = {
   dailyBriefing: "Daily Briefing",
   activityInsights: "Activity Insights Log",
   activityConnections: "Activity Connections",
+  portcoExposure: "PortCo Event Exposure",
 };
 
 // One row per day of headline counts — the baseline the Home page diffs against
@@ -2177,5 +2178,51 @@ function groupBy(
     if (!map[k]) map[k] = [];
     map[k].push(item);
   }
+  return map;
+}
+
+// ── PortCo Event Exposure ────────────────────────────────────
+
+export const PORTCO_EXPOSURE_HEADERS = [
+  "Company",
+  "Event",
+  "Date",
+  "Format",
+  "Source",
+  "Logged Date",
+];
+
+/** Read the PortCo Event Exposure tab and group rows by company name. */
+export async function buildPortcoExposures(): Promise<Map<string, PortCoExposure[]>> {
+  await ensureTab(TAB_NAMES.portcoExposure, PORTCO_EXPOSURE_HEADERS);
+  const rows = await fetchSheetTab(TAB_NAMES.portcoExposure).catch(() => [] as string[][]);
+  if (rows.length < 2) return new Map();
+
+  const map = new Map<string, PortCoExposure[]>();
+  const header = (rows[0] || []).map((h) => h.trim().toLowerCase());
+  const idx = (name: string) => header.indexOf(name.toLowerCase());
+  const companyIdx = idx("Company");
+  const eventIdx = idx("Event");
+  const dateIdx = idx("Date");
+  const formatIdx = idx("Format");
+  const sourceIdx = idx("Source");
+  const loggedDateIdx = idx("Logged Date");
+
+  for (const r of rows.slice(1)) {
+    const company = companyIdx === -1 ? "" : r[companyIdx] || "";
+    if (!company.trim()) continue;
+    const exp: PortCoExposure = {
+      company: company.trim(),
+      event: eventIdx === -1 ? "" : r[eventIdx] || "",
+      date: dateIdx === -1 ? "" : r[dateIdx] || "",
+      format: formatIdx === -1 ? "" : r[formatIdx] || "",
+      source: sourceIdx === -1 ? "" : r[sourceIdx] || "",
+      loggedDate: loggedDateIdx === -1 ? "" : r[loggedDateIdx] || "",
+    };
+    const key = company.trim().toLowerCase();
+    if (!map.has(key)) map.set(key, []);
+    map.get(key)!.push(exp);
+  }
+
   return map;
 }

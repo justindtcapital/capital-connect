@@ -4,7 +4,7 @@ import { enrichContact } from "@/utils/apollo.functions";
 import type { ApolloEnrichmentResult } from "@/utils/apollo.server";
 import { toast } from "sonner";
 import type { Contact, Interaction, InteractionType, Temperature, EngagementSource } from "@/lib/types";
-import { ENGAGEMENT_SOURCES, CONTACT_TYPES, RECORD_SOURCES } from "@/lib/types";
+import { ENGAGEMENT_SOURCES, CONTACT_TYPES, RECORD_SOURCES, isAsanaSourced, asanaTaskUrl } from "@/lib/types";
 import { inferInterestAreas } from "@/lib/interest-domains";
 import {
   Sheet,
@@ -19,6 +19,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { TemperatureBadge } from "./TemperatureBadge";
+import { EngagementBreakdown } from "./EngagementScore";
 import { ContactAvatar } from "./ContactAvatar";
 import {
   Building2,
@@ -83,7 +84,7 @@ interface ContactDetailProps {
   onContactUpdate?: (contact: Contact) => void;
 }
 
-const TIERS: Temperature[] = ["Hot", "Warm", "Cold"];
+const TIERS: Temperature[] = ["Council", "Hot", "Warm", "Cold"];
 
 // Rating control in the detail header. Shows the current tier + activity score,
 // lets you manually set the rating (which locks it from auto-scoring), and lets
@@ -763,6 +764,10 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
 
           <ScrollArea className="flex-1 -mx-6 px-6">
             <div className="py-5 space-y-6">
+              <section className="border-b border-border pb-6">
+                <EngagementBreakdown contact={contact} />
+              </section>
+
               {/* Metadata */}
               <section className="border-b border-border pb-6">
                 <div className="flex items-center justify-between mb-3">
@@ -1164,7 +1169,8 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                     {sortedInteractions.map((interaction) => {
                       const Icon = interactionIcons[interaction.type] || MessageSquare;
                       const colorClass = interactionColors[interaction.type] || interactionColors.note;
-                      const isEditingThis = editingInteractionId === interaction.id;
+                      const readOnly = isAsanaSourced(interaction);
+                      const isEditingThis = editingInteractionId === interaction.id && !readOnly;
 
                       return (
                         <div key={interaction.id} className="flex gap-3 relative group">
@@ -1222,13 +1228,25 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                                       )}
                                     </button>
                                   )}
-                                  <button
-                                    onClick={() => startEditingInteraction(interaction)}
-                                    className="ml-auto opacity-50 hover:opacity-100 transition-opacity"
-                                    title="Edit interaction"
-                                  >
-                                    <Pencil className="h-3 w-3 text-muted-foreground hover:text-foreground" />
-                                  </button>
+                                  {readOnly ? (
+                                    <a
+                                      href={asanaTaskUrl(interaction.sourceRef)}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="ml-auto inline-flex items-center gap-1 text-[9px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded-full border border-border text-muted-foreground hover:text-foreground"
+                                      title="Synced from Asana (read-only) — open the task"
+                                    >
+                                      Asana <ExternalLink className="h-2.5 w-2.5" />
+                                    </a>
+                                  ) : (
+                                    <button
+                                      onClick={() => startEditingInteraction(interaction)}
+                                      className="ml-auto opacity-50 hover:opacity-100 transition-opacity"
+                                      title="Edit interaction"
+                                    >
+                                      <Pencil className="h-3 w-3 text-muted-foreground hover:text-foreground" />
+                                    </button>
+                                  )}
                                 </div>
                                 <p className="text-xs text-muted-foreground mt-0.5">
                                   {interaction.summary}

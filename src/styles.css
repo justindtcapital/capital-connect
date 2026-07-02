@@ -48,6 +48,8 @@
   --color-sidebar-ring: var(--sidebar-ring);
   --color-hot: var(--hot);
   --color-hot-foreground: var(--hot-foreground);
+  --color-council: var(--council);
+  --color-council-foreground: var(--council-foreground);
   --color-warm: var(--warm);
   --color-warm-foreground: var(--warm-foreground);
   --color-cold: var(--cold);
@@ -94,6 +96,8 @@
   --sidebar-border: oklch(0.26 0.04 252);
   --sidebar-ring: oklch(0.62 0.19 252);
   /* Temperature tokens */
+  --council: oklch(0.93 0.045 300);
+  --council-foreground: oklch(0.5 0.2 300);
   --hot: oklch(0.936 0.032 25);
   --hot-foreground: oklch(0.505 0.213 27);
   --warm: oklch(0.962 0.042 90);
@@ -166,6 +170,8 @@
   --sidebar-accent-foreground: oklch(0.985 0.002 264);
   --sidebar-border: oklch(1 0 0 / 10%);
   --sidebar-ring: oklch(0.615 0.175 241);
+  --council: oklch(0.32 0.07 300);
+  --council-foreground: oklch(0.78 0.16 300);
   --hot: oklch(0.3 0.06 25);
   --hot-foreground: oklch(0.7 0.18 25);
   --warm: oklch(0.32 0.06 80);

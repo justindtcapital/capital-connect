@@ -10,8 +10,10 @@ import {
 } from "@/components/ui/table";
 import { Checkbox } from "@/components/ui/checkbox";
 import { TemperatureBadge } from "./TemperatureBadge";
+import { EngagementScore } from "./EngagementScore";
 import { ContactAvatar } from "./ContactAvatar";
 import { AlertCircle, CheckCircle2, ChevronUp, ChevronDown, ChevronsUpDown, Lock } from "lucide-react";
+import { effectiveScore } from "@/lib/activity-score";
 import { useSelection } from "@/lib/selection-context";
 
 interface ContactTableProps {
@@ -28,7 +30,9 @@ type SortKey =
   | "areasOfInterest"
   | "prime"
   | "temperature"
+  | "engagement"
   | "followUp"
+  | "contactType"
   | "source"
   | "dateAdded";
 
@@ -41,13 +45,15 @@ const COLUMNS: { key: SortKey; label: string }[] = [
   { key: "areasOfInterest", label: "Area of Interest" },
   { key: "prime", label: "Contact Prime" },
   { key: "temperature", label: "Status" },
+  { key: "engagement", label: "Engagement" },
   { key: "followUp", label: "Follow-up" },
+  { key: "contactType", label: "Type" },
   { key: "source", label: "Source" },
   { key: "dateAdded", label: "Added" },
 ];
 
-// Hot/Warm/Cold sort by intensity rather than alphabetically.
-const TEMP_RANK: Record<string, number> = { Hot: 3, Warm: 2, Cold: 1 };
+// Council/Hot/Warm/Cold sort by intensity rather than alphabetically.
+const TEMP_RANK: Record<string, number> = { Council: 4, Hot: 3, Warm: 2, Cold: 1 };
 
 function followUpRank(c: Contact): number {
   const open = c.interactions.some((i) => i.isFollowUp && !i.followUpComplete);
@@ -74,8 +80,12 @@ function sortValue(c: Contact, key: SortKey): string | number {
       return c.prime.toLowerCase();
     case "temperature":
       return TEMP_RANK[c.temperature] ?? 0;
+    case "engagement":
+      return effectiveScore(c);
     case "followUp":
       return followUpRank(c);
+    case "contactType":
+      return (c.contactType ?? "").toLowerCase();
     case "source":
       return (c.source || "Manual Entry").toLowerCase();
     case "dateAdded":
@@ -213,6 +223,9 @@ export function ContactTable({ contacts, onSelect }: ContactTableProps) {
                     )}
                   </span>
                 </TableCell>
+                <TableCell className="whitespace-nowrap" onClick={() => onSelect(contact)}>
+                  <EngagementScore contact={contact} />
+                </TableCell>
                 <TableCell onClick={() => onSelect(contact)}>
                   {hasOpenFollowUps && (
                     <div className="flex items-center gap-1 text-red-500">
@@ -226,6 +239,9 @@ export function ContactTable({ contacts, onSelect }: ContactTableProps) {
                       <span className="text-xs font-medium">Done</span>
                     </div>
                   )}
+                </TableCell>
+                <TableCell className="text-sm text-muted-foreground whitespace-nowrap" onClick={() => onSelect(contact)}>
+                  {contact.contactType || "—"}
                 </TableCell>
                 <TableCell className="text-sm text-muted-foreground whitespace-nowrap" onClick={() => onSelect(contact)}>
                   {contact.source || "Manual Entry"}

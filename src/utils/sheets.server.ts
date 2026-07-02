@@ -1181,7 +1181,9 @@ export async function buildContacts(): Promise<Contact[]> {
     // Map "Relationship Status" to Temperature
     const rawTemp = (c.temperature || "").trim();
     const temperature: Temperature =
-      rawTemp === "Hot" || rawTemp === "Warm" || rawTemp === "Cold" ? rawTemp : "Cold";
+      rawTemp === "Council" || rawTemp === "Hot" || rawTemp === "Warm" || rawTemp === "Cold"
+        ? rawTemp
+        : "Cold";
 
     const contact: Contact = {
       // Stable identity: the urid is the id when present, so the client key is

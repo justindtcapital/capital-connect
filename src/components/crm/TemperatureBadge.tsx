@@ -13,6 +13,7 @@ export function TemperatureBadge({ temperature, className }: TemperatureBadgePro
       variant="outline"
       className={cn(
         "text-[10px] font-semibold uppercase tracking-wide border-0",
+        temperature === "Council" && "bg-council text-council-foreground",
         temperature === "Hot" && "bg-hot text-hot-foreground",
         temperature === "Warm" && "bg-warm text-warm-foreground",
         temperature === "Cold" && "bg-cold text-cold-foreground",

@@ -1,4 +1,6 @@
-export type Temperature = "Hot" | "Warm" | "Cold";
+// Ordered strongest → weakest. "Council" is the top tier (inner circle):
+// auto-assigned at a very high activity score, or set manually and locked.
+export type Temperature = "Council" | "Hot" | "Warm" | "Cold";
 
 // How a contact came to engage with a portfolio company.
 export type EngagementSource =
@@ -110,6 +112,18 @@ export interface Interaction {
   followUpComplete?: boolean;
   /** e.g. "asana:<gid>" when mirrored from Asana activity sync. */
   sourceRef?: string;
+}
+
+/** An interaction synced from Asana (BD/GTM activity) is a read-only mirror. */
+export function isAsanaSourced(i: Pick<Interaction, "sourceRef">): boolean {
+  return !!i.sourceRef && i.sourceRef.startsWith("asana:");
+}
+
+/** Build the Asana task permalink from an "asana:<gid>" source ref ("" if n/a). */
+export function asanaTaskUrl(sourceRef?: string): string {
+  if (!sourceRef || !sourceRef.startsWith("asana:")) return "";
+  const gid = sourceRef.slice("asana:".length).trim();
+  return gid ? `https://app.asana.com/0/0/${gid}` : "";
 }
 
 const INTERACTION_TYPES: readonly InteractionType[] = [

@@ -17,6 +17,7 @@ import type {
   BulkEditField,
   EmailActivityRecord,
   ConnectionPlan,
+  PortCoExposure,
 } from "@/lib/types";
 import { scoreContact } from "@/lib/activity-score";
 import { inferInterestAreas } from "@/lib/interest-domains";

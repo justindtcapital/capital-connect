@@ -139,3 +139,8 @@ export function scoreContact(contact: Contact, now: number = Date.now()): Activi
 
   return { score, tier, drivers };
 }
+
+/** Returns just the numeric 0–100 engagement score for a contact. */
+export function effectiveScore(contact: Contact, now: number = Date.now()): number {
+  return scoreContact(contact, now).score;
+}

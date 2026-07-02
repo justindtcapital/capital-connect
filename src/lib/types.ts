@@ -18,6 +18,16 @@ export interface PortCoEngagement {
   source: EngagementSource;
 }
 
+/** A company-level event exposure row from the PortCo Event Exposure tab. */
+export interface PortCoExposure {
+  company: string;
+  event: string;
+  date: string;
+  format: string;
+  source: string;
+  loggedDate: string;
+}
+
 // Canonical origin of a Contact or Target record. Attribution is by the ENGINE
 // or entry-point that produced the record: discovery surfaced via Sumble's
 // technographic search → "Sumble"; via Apollo people/attribute search → "Apollo";

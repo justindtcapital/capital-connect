@@ -889,6 +889,8 @@ export interface InteractionRowInput {
   resolved?: boolean;
   /** Optional stable contact key; left blank falls back to the email join. */
   urid?: string;
+  /** Optional external source reference (e.g. "asana:12345"). */
+  sourceRef?: string;
 }
 
 // Append one or more interaction rows to the Notes tab in a single batched
@@ -910,6 +912,7 @@ export async function appendInteractionRows(rows: InteractionRowInput[]): Promis
       "note content": r.summary,
       "requires follow up": r.requiresFollowUp ? "TRUE" : "FALSE",
       "follow up resolved": r.resolved ? "TRUE" : "FALSE",
+      "source ref": r.sourceRef ?? "",
       type: r.type,
     };
     return headers.length

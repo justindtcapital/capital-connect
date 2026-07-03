@@ -631,13 +631,15 @@ function SignalsPage() {
                   No signals match these filters.
                 </p>
               ) : (
-                <div className="grid gap-3 lg:grid-cols-2">
+                <div className="max-w-4xl mx-auto space-y-3">
                   {filtered.map((card) => {
                     const isOpen = expanded === card.id;
                     return (
                       <article
                         key={card.id}
-                        className="rounded-lg border border-border bg-card overflow-hidden"
+                        className={`rounded-xl border bg-card overflow-hidden transition-shadow ${
+                          isOpen ? "border-primary/40 ring-1 ring-primary/20 shadow-sm" : "border-border"
+                        }`}
                       >
                         <button
                           type="button"
@@ -647,64 +649,67 @@ function SignalsPage() {
                           <div className="flex items-start gap-3">
                             <CompanyAvatar card={card} />
                             <div className="min-w-0 flex-1">
-                              <div className="flex items-center gap-2 flex-wrap">
+                              <div className="flex items-center gap-2 min-w-0">
                                 <span className="text-sm font-semibold truncate">
                                   {card.company}
                                 </span>
-                                {card.timeLabel && (
-                                  <span className="text-[11px] text-muted-foreground ml-auto shrink-0">
-                                    {card.timeLabel}
-                                  </span>
-                                )}
-                              </div>
-                              <div className="flex items-center gap-1.5 flex-wrap mt-1">
-                                <Badge
-                                  variant="outline"
-                                  className={`text-[9px] ${sourceTypeClass[card.sourceType] || ""}`}
-                                >
-                                  {card.sourceType}
-                                </Badge>
-                                {card.segment && (
+                                <span className="text-muted-foreground">·</span>
+                                <div className="flex items-center gap-1.5 flex-wrap">
                                   <Badge
                                     variant="outline"
-                                    className={`text-[9px] ${segmentClass[card.segment] || ""}`}
+                                    className={`text-[10px] ${sourceTypeClass[card.sourceType] || ""}`}
                                   >
-                                    {card.segment}
+                                    {card.sourceType}
                                   </Badge>
-                                )}
-                                {card.industry && (
-                                  <Badge variant="outline" className="text-[9px]">
-                                    {card.industry}
-                                  </Badge>
-                                )}
-                                {card.relevance != null && (
-                                  <Badge variant="secondary" className="text-[9px]">
-                                    {card.relevance}/10
-                                  </Badge>
-                                )}
+                                  {card.segment && (
+                                    <Badge
+                                      variant="outline"
+                                      className={`text-[10px] ${segmentClass[card.segment] || ""}`}
+                                    >
+                                      {card.segment}
+                                    </Badge>
+                                  )}
+                                  {card.industry && (
+                                    <Badge variant="outline" className="text-[10px]">
+                                      {card.industry}
+                                    </Badge>
+                                  )}
+                                </div>
+                                <div className="ml-auto flex items-center gap-2 shrink-0">
+                                  {card.timeLabel && (
+                                    <span className="text-[11px] text-muted-foreground whitespace-nowrap">
+                                      {card.timeLabel}
+                                    </span>
+                                  )}
+                                  <span className="text-muted-foreground">
+                                    {isOpen ? (
+                                      <ChevronDown className="h-4 w-4" />
+                                    ) : (
+                                      <ChevronRight className="h-4 w-4" />
+                                    )}
+                                  </span>
+                                </div>
                               </div>
-                              <h3 className="text-sm font-medium mt-2 leading-snug">
+                              <h3 className="text-lg font-bold mt-2 leading-snug">
                                 {card.headline}
                               </h3>
-                              {card.summary && !isOpen && (
-                                <p className="text-xs text-muted-foreground mt-1 line-clamp-2">
+                              {card.summary && (
+                                <p
+                                  className={`text-sm text-muted-foreground mt-1.5 leading-relaxed ${
+                                    isOpen ? "" : "line-clamp-2"
+                                  }`}
+                                >
                                   {card.summary}
                                 </p>
                               )}
-                              <ScoreStrip card={card} />
                             </div>
-                            <span className="text-muted-foreground shrink-0 mt-0.5">
-                              {isOpen ? (
-                                <ChevronDown className="h-4 w-4" />
-                              ) : (
-                                <ChevronRight className="h-4 w-4" />
-                              )}
-                            </span>
                           </div>
                         </button>
 
                         {isOpen && (
                           <div className="px-4 pb-4 pt-0 space-y-3 border-t border-border/60">
+                            <ScoreStrip card={card} />
+
                             {card.insight && (
                               <div className="pt-3 grid gap-2 sm:grid-cols-2">
                                 <div className="rounded-md border border-border bg-muted/20 p-2.5">
@@ -767,16 +772,31 @@ function SignalsPage() {
                             <div className="flex items-center gap-2 flex-wrap">
                               <Button
                                 size="sm"
-                                className="h-7 text-[11px]"
+                                className="h-9 text-xs"
                                 onClick={() => setBroadcastCard(card)}
                               >
-                                <Megaphone className="h-3 w-3" /> Broadcast
+                                <Megaphone className="h-4 w-4 mr-1.5" /> Broadcast
                               </Button>
+                              {card.sourceUrl && (
+                                <a
+                                  href={card.sourceUrl}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                >
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    className="h-9 text-xs"
+                                  >
+                                    <ExternalLink className="h-4 w-4 mr-1.5" /> Open source
+                                  </Button>
+                                </a>
+                              )}
                               {card.email && (
                                 <Button
                                   variant="outline"
                                   size="sm"
-                                  className="h-7 text-[11px]"
+                                  className="h-9 text-xs"
                                   onClick={() => emailRecPerson(card)}
                                 >
                                   Email {card.person || "contact"}
@@ -785,21 +805,10 @@ function SignalsPage() {
                               <Link
                                 to="/companies"
                                 search={{ c: card.company }}
-                                className="inline-flex items-center gap-1 h-7 px-2 rounded-md border border-border text-[11px] hover:bg-accent transition-colors"
+                                className="inline-flex items-center gap-1 h-9 px-3 rounded-md border border-border text-xs font-medium hover:bg-accent transition-colors"
                               >
-                                <Building2 className="h-3 w-3" /> Company intel
+                                <Building2 className="h-4 w-4" /> Company intel
                               </Link>
-                              {card.sourceUrl && (
-                                <a
-                                  href={card.sourceUrl}
-                                  target="_blank"
-                                  rel="noopener noreferrer"
-                                  className="text-primary hover:underline inline-flex items-center gap-0.5 text-[11px]"
-                                >
-                                  {card.sourceIsSearch ? "find source" : "source"}{" "}
-                                  <ExternalLink className="h-3 w-3" />
-                                </a>
-                              )}
                             </div>
                           </div>
                         )}

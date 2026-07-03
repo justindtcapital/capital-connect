@@ -31,6 +31,37 @@ function vertexUrl(model: string): string {
 // Cached GoogleAuth client — discovers credentials via ADC and refreshes tokens
 // internally, so getAccessToken() is cheap to call per request.
 let vertexAuth: GoogleAuth | null = null;
+// Parse a service-account JSON that may have been pasted with real newlines
+// inside the private_key (which is invalid JSON). We try strict parse first,
+// then fall back to escaping raw newlines that appear inside string values.
+function parseServiceAccountJson(raw: string): Record<string, unknown> {
+  const trimmed = raw.trim();
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    // Escape raw CR/LF inside string literals. Walk the text tracking whether
+    // we're inside a "..." string and whether the previous char was a backslash.
+    let out = "";
+    let inStr = false;
+    let esc = false;
+    for (const ch of trimmed) {
+      if (inStr) {
+        if (esc) { out += ch; esc = false; continue; }
+        if (ch === "\\") { out += ch; esc = true; continue; }
+        if (ch === '"') { out += ch; inStr = false; continue; }
+        if (ch === "\n") { out += "\\n"; continue; }
+        if (ch === "\r") { out += "\\r"; continue; }
+        if (ch === "\t") { out += "\\t"; continue; }
+        out += ch;
+      } else {
+        if (ch === '"') inStr = true;
+        out += ch;
+      }
+    }
+    return JSON.parse(out);
+  }
+}
+
 async function getVertexToken(): Promise<string> {
   if (!vertexAuth) {
     const credsJson = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
@@ -39,9 +70,15 @@ async function getVertexToken(): Promise<string> {
     };
     if (credsJson) {
       try {
-        opts.credentials = JSON.parse(credsJson);
+        const creds = parseServiceAccountJson(credsJson) as { private_key?: string };
+        // Normalize literal "\n" sequences in the private_key that some UIs
+        // strip newlines from — the PEM MUST have real newlines to decode.
+        if (creds.private_key && !creds.private_key.includes("\n") && creds.private_key.includes("\\n")) {
+          creds.private_key = creds.private_key.replace(/\\n/g, "\n");
+        }
+        (opts as { credentials?: unknown }).credentials = creds;
       } catch (e) {
-        throw new Error("GOOGLE_APPLICATION_CREDENTIALS_JSON is not valid JSON");
+        throw new Error(`GOOGLE_APPLICATION_CREDENTIALS_JSON is not valid JSON: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
     vertexAuth = new GoogleAuth(opts);

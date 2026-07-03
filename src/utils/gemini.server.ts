@@ -76,7 +76,7 @@ async function getVertexToken(): Promise<string> {
         if (creds.private_key && !creds.private_key.includes("\n") && creds.private_key.includes("\\n")) {
           creds.private_key = creds.private_key.replace(/\\n/g, "\n");
         }
-        opts.credentials = creds as ConstructorParameters<typeof GoogleAuth>[0]["credentials"];
+        (opts as { credentials?: unknown }).credentials = creds;
       } catch (e) {
         throw new Error(`GOOGLE_APPLICATION_CREDENTIALS_JSON is not valid JSON: ${e instanceof Error ? e.message : String(e)}`);
       }

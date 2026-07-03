@@ -7,7 +7,7 @@ import {
 } from "@/utils/sheets.functions";
 import type { Contact, PortfolioCompany } from "@/lib/types";
 import { ContactList } from "@/components/crm/ContactList";
-import { syncAsanaActivities } from "@/utils/activity-sync.functions";
+import { syncAsanaActivities, syncActivityTracks } from "@/utils/activity-sync.functions";
 import { syncEventExposure } from "@/utils/event-exposure.functions";
 import { Button } from "@/components/ui/button";
 import { Plus, Upload, Download, ClipboardPaste, ChevronDown, Gauge, Loader2, Activity } from "lucide-react";
@@ -64,7 +64,7 @@ function CrmPage() {
   const contacts = useMemo(() => allContacts.filter((c) => !isPortfolioContact(c)), [allContacts]);
   const { filters } = useFilters();
   const { updateOptions } = useFilterOptions();
-  const { allFilteredContacts, selectedContacts } = useSelection();
+  const { allFilteredContacts, selectedContacts, setOnBulkDelete } = useSelection();
   const router = useRouter();
   const [bulkUploadOpen, setBulkUploadOpen] = useState(false);
   const [pasteOpen, setPasteOpen] = useState(false);
@@ -76,7 +76,11 @@ function CrmPage() {
   const handleSyncActivity = async () => {
     setSyncBusy(true);
     try {
-      const [res, exp] = await Promise.all([syncAsanaActivities(), syncEventExposure()]);
+      const [res, exp, tracks] = await Promise.all([
+        syncAsanaActivities(),
+        syncEventExposure(),
+        syncActivityTracks(),
+      ]);
       if (!res.ok) {
         toast.error(res.error || "Activity sync failed.");
         return;
@@ -101,6 +105,14 @@ function CrmPage() {
             (exp.engagementsLogged > 0
               ? ` · ${exp.engagementsLogged} attendee engagement${exp.engagementsLogged !== 1 ? "s" : ""}.`
               : "."),
+        );
+      }
+      // Mirror raw BD/GTM activities into their own sheet tabs.
+      if (!tracks.ok) {
+        toast.error(tracks.error || "BD/GTM tab sync failed.");
+      } else if (tracks.bdLogged > 0 || tracks.gtmLogged > 0) {
+        toast.success(
+          `BD/GTM tabs: added ${tracks.bdLogged} BD · ${tracks.gtmLogged} GTM row${tracks.gtmLogged !== 1 ? "s" : ""}.`,
         );
       }
       await router.invalidate();
@@ -168,6 +180,12 @@ function CrmPage() {
       ].sort(),
     [companies, contacts],
   );
+
+  // After a bulk delete, re-run the loader so the removed contacts drop out of view.
+  useEffect(() => {
+    setOnBulkDelete(() => void router.invalidate());
+    return () => setOnBulkDelete(undefined);
+  }, [setOnBulkDelete, router]);
 
   useEffect(() => {
     const sectors = [...new Set(contacts.map((x) => x.sector).filter(Boolean))].sort();

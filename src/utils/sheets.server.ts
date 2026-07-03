@@ -18,6 +18,7 @@ import type {
   EmailActivityRecord,
   ConnectionPlan,
   PortCoExposure,
+  AsanaActivity,
 } from "@/lib/types";
 import { scoreContact } from "@/lib/activity-score";
 import { inferInterestAreas } from "@/lib/interest-domains";
@@ -440,7 +441,107 @@ export const TAB_NAMES = {
   activityInsights: "Activity Insights Log",
   activityConnections: "Activity Connections",
   portcoExposure: "PortCo Event Exposure",
+  bd: "BD",
+  gtm: "GTM",
 };
+
+// One row per BD / GTM activity mirrored from its Asana Activity Tracking
+// project. Append-only log, deduped on Activity GID so re-running the sync only
+// adds activities created (or newly matched) since last time.
+export const ACTIVITY_TRACK_HEADERS = [
+  "Activity GID",
+  "Date",
+  "Name",
+  "Type",
+  "Status",
+  "Owner",
+  "Company",
+  "Person",
+  "Completed",
+  "Notes",
+  "URL",
+];
+
+export interface ActivityTrackSyncResult {
+  /** New BD activity rows written this run. */
+  bdLogged: number;
+  /** New GTM activity rows written this run. */
+  gtmLogged: number;
+  /** BD activities skipped because already present (by GID). */
+  bdSkipped: number;
+  /** GTM activities skipped because already present (by GID). */
+  gtmSkipped: number;
+}
+
+// Order values to ACTIVITY_TRACK_HEADERS.
+function activityTrackRow(a: AsanaActivity): string[] {
+  return [
+    a.gid,
+    a.date || "",
+    a.name || "",
+    a.type || "",
+    a.status || "",
+    a.owner || "",
+    a.company || "",
+    a.person || "",
+    a.completed ? "TRUE" : "FALSE",
+    a.notes || "",
+    a.url || "",
+  ];
+}
+
+// Mirror one track's activities into its own tab (BD or GTM), deduped by GID.
+async function syncOneActivityTrack(
+  tabName: string,
+  activities: AsanaActivity[],
+): Promise<{ logged: number; skipped: number }> {
+  await ensureTab(tabName, ACTIVITY_TRACK_HEADERS);
+  const rows = await fetchSheetTab(tabName).catch(() => [] as string[][]);
+  const header = (rows[0] || []).map((h) => h.trim().toLowerCase());
+  const gidIdx = header.indexOf("activity gid");
+  const existing = new Set<string>();
+  if (gidIdx !== -1) {
+    for (const r of rows.slice(1)) {
+      const g = (r[gidIdx] || "").trim();
+      if (g) existing.add(g);
+    }
+  }
+
+  const newRows: string[][] = [];
+  let skipped = 0;
+  for (const a of activities) {
+    if (existing.has(a.gid)) {
+      skipped++;
+      continue;
+    }
+    existing.add(a.gid);
+    newRows.push(activityTrackRow(a));
+  }
+
+  if (newRows.length > 0) await appendSheetRows(tabName, newRows);
+  return { logged: newRows.length, skipped };
+}
+
+// Split Asana activities by track and mirror each into its own tab (BD / GTM).
+// Idempotent: deduped by Activity GID, so it's safe to run repeatedly.
+export async function syncActivityTracks(
+  activities: AsanaActivity[],
+): Promise<ActivityTrackSyncResult> {
+  const bd = activities.filter((a) => a.track === "BD");
+  const gtm = activities.filter((a) => a.track === "GTM");
+
+  const [bdRes, gtmRes] = await Promise.all([
+    syncOneActivityTrack(TAB_NAMES.bd, bd),
+    syncOneActivityTrack(TAB_NAMES.gtm, gtm),
+  ]);
+
+  return {
+    bdLogged: bdRes.logged,
+    gtmLogged: gtmRes.logged,
+    bdSkipped: bdRes.skipped,
+    gtmSkipped: gtmRes.skipped,
+  };
+}
 
 // One row per day of headline counts — the baseline the Home page diffs against
 // for its "+N this week" deltas (and the substrate for future sparklines).
@@ -683,6 +784,33 @@ export interface AddContactInput {
   source?: string;
   /** V2: supporting "why surfaced" reasoning, written to "Source Context". */
   sourceContext?: string;
+  /** Apollo professional headline (written to the "Headline" column). */
+  headline?: string;
+  /** Pre-formatted employment history (written to "Employment History"). */
+  employmentHistory?: string;
+}
+
+// Portfolio-company match: returns "Portfolio" when the given company (or any
+// comma/semicolon/slash-separated token within it) exactly matches a portfolio
+// company name, else "". Used to stamp a contact's sector on add/enrich.
+// buildPortfolioCompanies is cached (5-min TTL) so repeated calls in an import
+// loop don't re-hit the Sheets API.
+export async function resolvePortfolioSector(company: string): Promise<string> {
+  const raw = (company || "").trim();
+  if (!raw) return "";
+  const companies = await buildPortfolioCompanies().catch(() => []);
+  const set = new Set(
+    companies.map((c) => c.name.trim().toLowerCase()).filter(Boolean),
+  );
+  if (set.size === 0) return "";
+  const tokens = raw
+    .split(/[,;/]/)
+    .map((t) => t.trim().toLowerCase())
+    .filter(Boolean);
+  for (const t of [raw.toLowerCase(), ...tokens]) {
+    if (set.has(t)) return "Portfolio";
+  }
+  return "";
 }
 
 // Header-aware append to the Contacts tab: place each value in the column whose
@@ -696,6 +824,15 @@ export async function addContactRow(data: AddContactInput): Promise<void> {
   // Stamp a stable surrogate key on every new contact. Ensure the column exists
   // first so the header-aware append below has a slot to write it into.
   await ensureColumn(TAB_NAMES.contacts, "urid");
+  // Ensure the enrichment columns exist when we have something to put in them.
+  if (data.headline) await ensureColumn(TAB_NAMES.contacts, "Headline");
+  if (data.employmentHistory) await ensureColumn(TAB_NAMES.contacts, "Employment History");
+
+  // Sector: a portfolio-company employer always wins ("Portfolio"); otherwise
+  // keep whatever sector was passed in (e.g. the Apollo industry).
+  const portfolioSector = await resolvePortfolioSector(data.company);
+  const sector = portfolioSector || data.sector;
+
   const valueByHeader: Record<string, string> = {
     urid: crypto.randomUUID(),
     name: data.name,
@@ -712,8 +849,8 @@ export async function addContactRow(data: AddContactInput): Promise<void> {
     city: data.location,
     "relationship prime": data.prime,
     prime: data.prime,
-    "industry category": data.sector,
-    sector: data.sector,
+    "industry category": sector,
+    sector: sector,
     "relationship status": data.temperature,
     "follow up flag": "FALSE",
     "date added": now,
@@ -723,6 +860,9 @@ export async function addContactRow(data: AddContactInput): Promise<void> {
     origin: data.source ?? "",
     // V2 supporting reasoning.
     "source context": data.sourceContext ?? "",
+    // Apollo enrichment extras (written only if the columns exist).
+    headline: data.headline ?? "",
+    "employment history": data.employmentHistory ?? "",
   };
 
   const rows = await fetchSheetTab(TAB_NAMES.contacts);
@@ -835,6 +975,7 @@ const CONTACT_COLS: Record<string, string> = {
   "lead source": "source",
   origin: "source",
   "source context": "sourceContext",
+  "tech stack": "techStack",
   urid: "urid",
 };
 
@@ -1213,6 +1354,7 @@ export async function buildContacts(): Promise<Contact[]> {
       // Canonical origin — blank/legacy values backfill to "Manual Entry".
       source: normalizeSource(c.source),
       sourceContext: c.sourceContext || "",
+      techStack: c.techStack || "",
     };
     // Attach the live activity score and whether the rating is manually locked.
     // Lock + provenance match on urid first, then email (transition fallback).
@@ -1424,6 +1566,9 @@ const MERGE_FIELD_HEADERS: Record<string, string> = {
   areasOfInterest: "areas of interest",
   source: "source",
   sourceContext: "source context",
+  headline: "headline",
+  employmentHistory: "employment history",
+  techStack: "tech stack",
 };
 
 export interface MergeResult {
@@ -1446,18 +1591,30 @@ export async function mergeContactFields(
 ): Promise<MergeResult> {
   // A human edit may target a column that doesn't exist on older sheets
   // (e.g. "Contact Type", "Areas of Interest"); create it first. Idempotent.
-  if (source === "user") {
-    for (const field of Object.keys(fields)) {
-      if (
-        (field === "contactType" ||
-          field === "areasOfInterest" ||
-          field === "source" ||
-          field === "sourceContext") &&
-        fields[field] !== undefined
-      ) {
+  // Columns that may not exist on older sheets. Created for both sources so that
+  // unattended Apollo enrichment (source "apollo") can also fill Headline /
+  // Employment History, which older sheets won't have.
+  for (const field of Object.keys(fields)) {
+    if (
+      (field === "contactType" ||
+        field === "areasOfInterest" ||
+        field === "source" ||
+        field === "sourceContext" ||
+        field === "headline" ||
+        field === "employmentHistory") &&
+      fields[field] !== undefined
+    ) {
+      if (source === "user" || field === "headline" || field === "employmentHistory") {
         await ensureColumn(TAB_NAMES.contacts, MERGE_FIELD_HEADERS[field]);
       }
     }
+  }
+
+  // A portfolio-company employer always sets sector "Portfolio" (overrides any
+  // Apollo-provided industry), mirroring addContactRow.
+  if (fields.sector !== undefined && fields.company) {
+    const portfolioSector = await resolvePortfolioSector(fields.company);
+    if (portfolioSector) fields = { ...fields, sector: portfolioSector };
   }
 
   const rows = await fetchSheetTab(TAB_NAMES.contacts);
@@ -1533,6 +1690,129 @@ export async function mergeContactFields(
   }
 
   return { success: false, written: [], skipped: [] };
+}
+
+export interface BulkMergeUpdate {
+  email: string;
+  urid?: string;
+  fields: Record<string, string | undefined>;
+}
+
+// Batched multi-contact version of mergeContactFields: reads the Contacts tab
+// ONCE, applies the same fill/overwrite semantics per row, and commits every
+// change in a single write. Used by the bulk actions (Apollo enrich, interest
+// inference, tech-stack load) so N contacts cost ~one sheet read + one write
+// instead of N of each. Same rules as mergeContactFields: source "user" always
+// writes; "apollo" is fill-only and never clobbers a human-edited field. A
+// portfolio-company employer still forces sector "Portfolio".
+export async function bulkMergeContactFields(
+  updates: BulkMergeUpdate[],
+  source: "user" | "apollo",
+  // When true, write a field only if the sheet cell is currently empty (never
+  // clobber an existing value), while still stamping provenance as `source`.
+  // Used to persist auto-inferred values (e.g. interest areas) without
+  // overwriting anything a human curated.
+  fillEmptyOnly = false,
+): Promise<{ updated: number; written: number }> {
+  if (updates.length === 0) return { updated: 0, written: 0 };
+
+  // Create any columns that may not exist on older sheets, once up front (must
+  // happen before the header row is read below).
+  const allFields = new Set<string>();
+  for (const u of updates) for (const f of Object.keys(u.fields)) allFields.add(f);
+  const ensurable = [
+    "contactType",
+    "areasOfInterest",
+    "source",
+    "sourceContext",
+    "headline",
+    "employmentHistory",
+    "techStack",
+  ];
+  for (const f of ensurable) {
+    if (allFields.has(f)) await ensureColumn(TAB_NAMES.contacts, MERGE_FIELD_HEADERS[f]);
+  }
+
+  const rows = await fetchSheetTab(TAB_NAMES.contacts);
+  if (rows.length < 2) return { updated: 0, written: 0 };
+  const headers = rows[0].map((h) => h.trim().toLowerCase());
+  const emailIdx = headers.indexOf("email");
+  const uridIdx = headers.indexOf("urid");
+  if (emailIdx === -1) throw new Error("Contacts tab is missing the Email column");
+
+  // Row lookup maps (stable urid first, then email).
+  const rowByEmail = new Map<string, number>();
+  const rowByUrid = new Map<string, number>();
+  for (let i = 1; i < rows.length; i++) {
+    const e = (rows[i][emailIdx] || "").trim().toLowerCase();
+    if (e && !rowByEmail.has(e)) rowByEmail.set(e, i);
+    const u = uridIdx !== -1 ? (rows[i][uridIdx] || "").trim().toLowerCase() : "";
+    if (u && !rowByUrid.has(u)) rowByUrid.set(u, i);
+  }
+
+  const provenance = await buildFieldProvenance();
+  const ts = new Date().toISOString();
+  const cellUpdates: { range: string; value: string }[] = [];
+  const provStamps: string[][] = [];
+  const changedRows = new Set<number>();
+
+  for (const upd of updates) {
+    const emailKey = (upd.email || "").trim().toLowerCase();
+    const uridKey = (upd.urid || "").trim().toLowerCase();
+    const i =
+      (uridKey ? rowByUrid.get(uridKey) : undefined) ??
+      (emailKey ? rowByEmail.get(emailKey) : undefined);
+    if (i === undefined) continue;
+
+    let fields = upd.fields;
+    // Portfolio-company employer forces sector "Portfolio".
+    if (fields.sector !== undefined && fields.company) {
+      const portfolioSector = await resolvePortfolioSector(fields.company);
+      if (portfolioSector) fields = { ...fields, sector: portfolioSector };
+    }
+
+    const prov = {
+      ...(emailKey ? provenance.get(emailKey) || {} : {}),
+      ...(uridKey ? provenance.get(uridKey) || {} : {}),
+    };
+    const rowUridVal = uridIdx !== -1 ? rows[i][uridIdx] || "" : "";
+
+    for (const [field, rawValue] of Object.entries(fields)) {
+      if (rawValue === undefined) continue;
+      const header = MERGE_FIELD_HEADERS[field];
+      const colIdx = header ? headers.indexOf(header) : -1;
+      if (colIdx === -1) continue;
+      const value = rawValue;
+      const current = (rows[i][colIdx] || "").trim();
+
+      let shouldWrite = false;
+      if (fillEmptyOnly) {
+        shouldWrite = current === "";
+      } else if (source === "user") {
+        shouldWrite = true;
+      } else if (prov[field] === "user") {
+        shouldWrite = false;
+      } else if (current === "") {
+        shouldWrite = true;
+      } else if (prov[field] === "apollo" && current !== value) {
+        shouldWrite = true;
+      }
+      if (!shouldWrite) continue;
+
+      cellUpdates.push({ range: `${colLetters(colIdx)}${i + 1}`, value });
+      provStamps.push([rows[i][emailIdx], field, source, ts, rowUridVal || upd.urid || ""]);
+      changedRows.add(i);
+    }
+  }
+
+  if (cellUpdates.length > 0) {
+    await updateSheetCells(TAB_NAMES.contacts, cellUpdates);
+    await ensureTab(TAB_NAMES.fieldProvenance, FIELD_PROVENANCE_HEADERS);
+    await ensureColumn(TAB_NAMES.fieldProvenance, "URID");
+    await appendSheetRows(TAB_NAMES.fieldProvenance, provStamps);
+  }
+
+  return { updated: changedRows.size, written: cellUpdates.length };
 }
 
 // ── Rating transitions (network progression, #9) ─────────────
@@ -1940,6 +2220,106 @@ export async function updateTargetFields(
   if (updates.length === 0) return { success: false };
   await updateSheetCells(TAB_NAMES.targets, updates);
   return { success: true };
+}
+
+// Physically delete rows from a tab by their 1-based sheet row numbers. Issues a
+// single batchUpdate of deleteDimension requests, sorted DESCENDING so earlier
+// deletions don't shift the indices of later ones. Best-effort: no-op if the tab's
+// sheetId can't be resolved. Invalidates the cache so the next read is fresh.
+async function deleteSheetRows(tabName: string, rowNumbers: number[]): Promise<number> {
+  const rows = [...new Set(rowNumbers)].filter((n) => n >= 2).sort((a, b) => b - a);
+  if (rows.length === 0) return 0;
+  const sheetId = await getSheetId(tabName);
+  if (sheetId == null) throw new Error(`Could not resolve sheetId for tab "${tabName}"`);
+  const spreadsheetId = process.env.GOOGLE_SPREADSHEET_ID;
+  if (!spreadsheetId) throw new Error("GOOGLE_SPREADSHEET_ID secret is not configured");
+  const token = await getAccessToken();
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}:batchUpdate`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      requests: rows.map((n) => ({
+        deleteDimension: {
+          // rowNumber is 1-based; deleteDimension uses 0-based, end-exclusive.
+          range: { sheetId, dimension: "ROWS", startIndex: n - 1, endIndex: n },
+        },
+      })),
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Sheets deleteDimension error for "${tabName}" [${res.status}]: ${body}`);
+  }
+  cache.delete(tabName);
+  return rows.length;
+}
+
+// Hard-delete contacts from the Contacts tab, matched by email (case-insensitive).
+export async function bulkDeleteContacts(emails: string[]): Promise<{ deleted: number }> {
+  const wanted = new Set(emails.map((e) => e.trim().toLowerCase()).filter(Boolean));
+  if (wanted.size === 0) return { deleted: 0 };
+
+  const rows = await fetchSheetTab(TAB_NAMES.contacts);
+  if (rows.length < 2) return { deleted: 0 };
+  const headers = rows[0].map((h) => h.trim().toLowerCase());
+  const emailIdx = headers.indexOf("email");
+  if (emailIdx === -1) throw new Error("Contacts tab is missing the Email column");
+
+  const rowNumbers: number[] = [];
+  for (let i = 1; i < rows.length; i++) {
+    const e = (rows[i][emailIdx] || "").trim().toLowerCase();
+    if (e && wanted.has(e)) rowNumbers.push(i + 1);
+  }
+  const deleted = await deleteSheetRows(TAB_NAMES.contacts, rowNumbers);
+  return { deleted };
+}
+
+// Hard-delete targets from the Targets tab. Each entry is matched by stable URID
+// first (survives edits), falling back to the derived target key.
+export async function bulkDeleteTargets(
+  entries: { key?: string; urid?: string }[],
+): Promise<{ deleted: number }> {
+  const wantedUrids = new Set(
+    entries.map((e) => (e.urid || "").trim().toLowerCase()).filter(Boolean),
+  );
+  const wantedKeys = new Set(
+    entries.map((e) => (e.key || "").trim().toLowerCase()).filter(Boolean),
+  );
+  if (wantedUrids.size === 0 && wantedKeys.size === 0) return { deleted: 0 };
+
+  const rows = await fetchSheetTab(TAB_NAMES.targets);
+  if (rows.length < 2) return { deleted: 0 };
+  const headers = rows[0].map((h) => h.trim().toLowerCase());
+  const uridIdx = headers.indexOf("urid");
+  const firstIdx = headers.indexOf("first name");
+  const lastIdx = headers.indexOf("last name");
+  const companyIdx = headers.indexOf("company");
+  const emailIdx = headers.indexOf("email");
+
+  const rowNumbers: number[] = [];
+  for (let i = 1; i < rows.length; i++) {
+    const rowUrid = uridIdx !== -1 ? (rows[i][uridIdx] || "").trim().toLowerCase() : "";
+    if (rowUrid && wantedUrids.has(rowUrid)) {
+      rowNumbers.push(i + 1);
+      continue;
+    }
+    if (wantedKeys.size > 0) {
+      const email = (emailIdx !== -1 ? rows[i][emailIdx] : "") || "";
+      const name = [
+        firstIdx !== -1 ? rows[i][firstIdx] || "" : "",
+        lastIdx !== -1 ? rows[i][lastIdx] || "" : "",
+      ]
+        .filter(Boolean)
+        .join(" ");
+      const company = (companyIdx !== -1 ? rows[i][companyIdx] : "") || "";
+      if (wantedKeys.has(targetKeyOf({ email, name, company }).toLowerCase())) {
+        rowNumbers.push(i + 1);
+      }
+    }
+  }
+  const deleted = await deleteSheetRows(TAB_NAMES.targets, rowNumbers);
+  return { deleted };
 }
 
 export async function appendTargetOutreach(

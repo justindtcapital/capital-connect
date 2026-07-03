@@ -4,8 +4,10 @@ import {
   buildContacts,
   appendInteractionRows,
   fetchSheetTab,
+  syncActivityTracks as syncActivityTracksToSheets,
   TAB_NAMES,
   type InteractionRowInput,
+  type ActivityTrackSyncResult,
 } from "./sheets.server";
 import { matchActivitiesToContact } from "@/lib/activity-match";
 import type { AsanaActivity, Contact, InteractionType } from "@/lib/types";
@@ -137,6 +139,36 @@ export const syncAsanaActivities = createServerFn({ method: "POST" }).handler(
     } catch (err) {
       console.error("[asana] syncAsanaActivities failed:", err);
       return { ...EMPTY, ok: false, error: err instanceof Error ? err.message : "Sync failed" };
+    }
+  },
+);
+
+export interface ActivityTrackResult extends ActivityTrackSyncResult {
+  ok: boolean;
+  error?: string;
+}
+
+const EMPTY_TRACK: ActivityTrackResult = {
+  ok: true,
+  bdLogged: 0,
+  gtmLogged: 0,
+  bdSkipped: 0,
+  gtmSkipped: 0,
+};
+
+// Mirror every BD/GTM activity from Asana into its own "BD" and "GTM" sheet tab.
+// Creates the tabs on first run and dedupes by Activity GID, so it's safe to run
+// repeatedly — a re-run only appends activities added since last time.
+export const syncActivityTracks = createServerFn({ method: "POST" }).handler(
+  async (): Promise<ActivityTrackResult> => {
+    try {
+      const activities = await fetchActivities();
+      if (activities.length === 0) return EMPTY_TRACK;
+      const res = await syncActivityTracksToSheets(activities);
+      return { ok: true, ...res };
+    } catch (err) {
+      console.error("[asana] syncActivityTracks failed:", err);
+      return { ...EMPTY_TRACK, ok: false, error: err instanceof Error ? err.message : "Sync failed" };
     }
   },
 );

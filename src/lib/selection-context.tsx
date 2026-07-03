@@ -11,6 +11,8 @@ interface SelectionContextType {
   setFilteredContacts: (contacts: Contact[]) => void;
   onBulkUpdate?: (updatedContacts: Contact[]) => void;
   setOnBulkUpdate: (fn: ((updatedContacts: Contact[]) => void) | undefined) => void;
+  onBulkDelete?: (deletedIds: string[]) => void;
+  setOnBulkDelete: (fn: ((deletedIds: string[]) => void) | undefined) => void;
 }
 
 const SelectionContext = createContext<SelectionContextType>({
@@ -22,12 +24,14 @@ const SelectionContext = createContext<SelectionContextType>({
   clearSelection: () => {},
   setFilteredContacts: () => {},
   setOnBulkUpdate: () => {},
+  setOnBulkDelete: () => {},
 });
 
 export function SelectionProvider({ children }: { children: ReactNode }) {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [allFilteredContacts, setAllFilteredContacts] = useState<Contact[]>([]);
   const [onBulkUpdate, setOnBulkUpdateState] = useState<((updatedContacts: Contact[]) => void) | undefined>();
+  const [onBulkDelete, setOnBulkDeleteState] = useState<((deletedIds: string[]) => void) | undefined>();
 
   const toggleId = useCallback((id: string) => {
     setSelectedIds((prev) => {
@@ -59,6 +63,10 @@ export function SelectionProvider({ children }: { children: ReactNode }) {
     setOnBulkUpdateState(() => fn);
   }, []);
 
+  const setOnBulkDelete = useCallback((fn: ((deletedIds: string[]) => void) | undefined) => {
+    setOnBulkDeleteState(() => fn);
+  }, []);
+
   return (
     <SelectionContext.Provider
       value={{
@@ -71,6 +79,8 @@ export function SelectionProvider({ children }: { children: ReactNode }) {
         setFilteredContacts,
         onBulkUpdate,
         setOnBulkUpdate,
+        onBulkDelete,
+        setOnBulkDelete,
       }}
     >
       {children}

@@ -631,53 +631,51 @@ function SignalsPage() {
                   No signals match these filters.
                 </p>
               ) : (
-                <div className="max-w-4xl mx-auto space-y-3">
+                <div className="mx-auto max-w-4xl space-y-3">
                   {filtered.map((card) => {
                     const isOpen = expanded === card.id;
                     return (
                       <article
                         key={card.id}
-                        className={`rounded-xl border bg-card overflow-hidden transition-shadow ${
-                          isOpen ? "border-primary/40 ring-1 ring-primary/20 shadow-sm" : "border-border"
+                        className={`rounded-xl border bg-card overflow-hidden transition-colors ${
+                          isOpen ? "border-primary/40 ring-1 ring-primary/20" : "border-border"
                         }`}
                       >
                         <button
                           type="button"
                           onClick={() => setExpanded(isOpen ? null : card.id)}
-                          className="w-full text-left p-4 hover:bg-accent/30 transition-colors"
+                          className="w-full text-left p-5 hover:bg-accent/30 transition-colors"
                         >
-                          <div className="flex items-start gap-3">
+                          <div className="flex items-start gap-4">
                             <CompanyAvatar card={card} />
                             <div className="min-w-0 flex-1">
-                              <div className="flex items-center gap-2 min-w-0">
-                                <span className="text-sm font-semibold truncate">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className="text-sm font-semibold text-foreground shrink-0">
                                   {card.company}
                                 </span>
-                                <span className="text-muted-foreground">·</span>
-                                <div className="flex items-center gap-1.5 flex-wrap">
+                                <span className="text-muted-foreground/60">·</span>
+                                <Badge
+                                  variant="outline"
+                                  className={`text-[10px] ${sourceTypeClass[card.sourceType] || ""}`}
+                                >
+                                  {card.sourceType}
+                                </Badge>
+                                {card.segment && (
                                   <Badge
                                     variant="outline"
-                                    className={`text-[10px] ${sourceTypeClass[card.sourceType] || ""}`}
+                                    className={`text-[10px] ${segmentClass[card.segment] || ""}`}
                                   >
-                                    {card.sourceType}
+                                    {card.segment}
                                   </Badge>
-                                  {card.segment && (
-                                    <Badge
-                                      variant="outline"
-                                      className={`text-[10px] ${segmentClass[card.segment] || ""}`}
-                                    >
-                                      {card.segment}
-                                    </Badge>
-                                  )}
-                                  {card.industry && (
-                                    <Badge variant="outline" className="text-[10px]">
-                                      {card.industry}
-                                    </Badge>
-                                  )}
-                                </div>
+                                )}
+                                {card.industry && (
+                                  <Badge variant="outline" className="text-[10px]">
+                                    {card.industry}
+                                  </Badge>
+                                )}
                                 <div className="ml-auto flex items-center gap-2 shrink-0">
                                   {card.timeLabel && (
-                                    <span className="text-[11px] text-muted-foreground whitespace-nowrap">
+                                    <span className="text-[11px] text-muted-foreground">
                                       {card.timeLabel}
                                     </span>
                                   )}
@@ -690,12 +688,12 @@ function SignalsPage() {
                                   </span>
                                 </div>
                               </div>
-                              <h3 className="text-lg font-bold mt-2 leading-snug">
+                              <h3 className="text-lg font-bold tracking-tight mt-2 leading-snug">
                                 {card.headline}
                               </h3>
                               {card.summary && (
                                 <p
-                                  className={`text-sm text-muted-foreground mt-1.5 leading-relaxed ${
+                                  className={`text-sm text-muted-foreground mt-1.5 ${
                                     isOpen ? "" : "line-clamp-2"
                                   }`}
                                 >
@@ -707,9 +705,10 @@ function SignalsPage() {
                         </button>
 
                         {isOpen && (
-                          <div className="px-4 pb-4 pt-0 space-y-3 border-t border-border/60">
-                            <ScoreStrip card={card} />
-
+                          <div className="px-5 pb-5 pt-0 space-y-3 border-t border-border/60">
+                            <div className="pt-3">
+                              <ScoreStrip card={card} />
+                            </div>
                             {card.insight && (
                               <div className="pt-3 grid gap-2 sm:grid-cols-2">
                                 <div className="rounded-md border border-border bg-muted/20 p-2.5">
@@ -769,34 +768,28 @@ function SignalsPage() {
                             <div className="pt-1">
                               <MarkdownMessage text={card.body || card.summary || "_No detail._"} />
                             </div>
-                            <div className="flex items-center gap-2 flex-wrap">
-                              <Button
-                                size="sm"
-                                className="h-9 text-xs"
-                                onClick={() => setBroadcastCard(card)}
-                              >
-                                <Megaphone className="h-4 w-4 mr-1.5" /> Broadcast
-                              </Button>
+                            <div className="flex items-center gap-2 flex-wrap pt-1">
                               {card.sourceUrl && (
-                                <a
-                                  href={card.sourceUrl}
-                                  target="_blank"
-                                  rel="noopener noreferrer"
+                                <Button
+                                  asChild
+                                  variant="outline"
+                                  size="sm"
+                                  className="h-9"
                                 >
-                                  <Button
-                                    variant="outline"
-                                    size="sm"
-                                    className="h-9 text-xs"
-                                  >
-                                    <ExternalLink className="h-4 w-4 mr-1.5" /> Open source
-                                  </Button>
-                                </a>
+                                  <a href={card.sourceUrl} target="_blank" rel="noopener noreferrer">
+                                    <ExternalLink className="h-4 w-4" />
+                                    {card.sourceIsSearch ? "Find source" : "Open source"}
+                                  </a>
+                                </Button>
                               )}
+                              <Button size="sm" className="h-9" onClick={() => setBroadcastCard(card)}>
+                                <Megaphone className="h-4 w-4" /> Broadcast
+                              </Button>
                               {card.email && (
                                 <Button
                                   variant="outline"
                                   size="sm"
-                                  className="h-9 text-xs"
+                                  className="h-9"
                                   onClick={() => emailRecPerson(card)}
                                 >
                                   Email {card.person || "contact"}
@@ -805,7 +798,7 @@ function SignalsPage() {
                               <Link
                                 to="/companies"
                                 search={{ c: card.company }}
-                                className="inline-flex items-center gap-1 h-9 px-3 rounded-md border border-border text-xs font-medium hover:bg-accent transition-colors"
+                                className="inline-flex items-center gap-1 h-9 px-3 rounded-md border border-border text-sm hover:bg-accent transition-colors"
                               >
                                 <Building2 className="h-4 w-4" /> Company intel
                               </Link>

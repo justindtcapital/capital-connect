@@ -17,7 +17,10 @@ import {
   setContactRating as setContactRatingServer,
   clearContactRatingOverride as clearContactRatingOverrideServer,
   bulkUpdateContacts as bulkUpdateContactsServer,
+  bulkDeleteContacts as bulkDeleteContactsServer,
+  bulkDeleteTargets as bulkDeleteTargetsServer,
   mergeContactFields as mergeContactFieldsServer,
+  bulkMergeContactFields as bulkMergeContactFieldsServer,
   storeApolloRaw as storeApolloRawServer,
   logEmailActivity as logEmailActivityServer,
   buildEmailActivity as buildEmailActivityServer,
@@ -35,7 +38,9 @@ import {
   type ImportResultInput,
   type DailyMetrics,
   type SnapshotResult,
+  type BulkMergeUpdate,
 } from "./sheets.server";
+import { enrichPerson } from "./apollo.server";
 import { sampleContacts, sampleTargets, samplePortfolioCompanies } from "@/lib/sample-data";
 import { normalizeInteractionType } from "@/lib/types";
 import type {
@@ -183,6 +188,9 @@ export const addContact = createServerFn({ method: "POST" })
       /** Canonical RecordSource; defaults to "Manual Entry". */
       source?: string;
       sourceContext?: string;
+      /** Apollo enrichment extras. */
+      headline?: string;
+      employmentHistory?: string;
     }) => data,
   )
   .handler(async ({ data }) => {
@@ -379,6 +387,17 @@ export const bulkUpdateContacts = createServerFn({ method: "POST" })
   .inputValidator((data: { emails: string[]; field: BulkEditField; value: string }) => data)
   .handler(async ({ data }) => bulkUpdateContactsServer(data.emails, data.field, data.value));
 
+// Hard-delete the given contacts (by email) from the Contacts sheet. Permanent.
+export const bulkDeleteContacts = createServerFn({ method: "POST" })
+  .inputValidator((data: { emails: string[] }) => data)
+  .handler(async ({ data }) => bulkDeleteContactsServer(data.emails));
+
+// Hard-delete the given targets (by stable URID, or derived target key) from the
+// Targets sheet. Permanent.
+export const bulkDeleteTargets = createServerFn({ method: "POST" })
+  .inputValidator((data: { entries: { key?: string; urid?: string }[] }) => data)
+  .handler(async ({ data }) => bulkDeleteTargetsServer(data.entries));
+
 // Non-destructive contact field merge. source "user" = human edit (writes all,
 // stamps user-owned); source "apollo" = fill-only enrichment that never
 // overwrites human-edited fields. Single path for edits and enrichment.
@@ -401,6 +420,107 @@ export const storeApolloRaw = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     await storeApolloRawServer(data.email, data.payload);
     return { success: true };
+  });
+
+// ── Bulk actions (multi-contact) ─────────────────────────────
+
+// Mass Apollo enrichment: enrich each selected contact and non-destructively
+// fill blank fields (title/company/phone/location/sector/headline/employment
+// history) in ONE batched sheet write. Apollo never overwrites human-edited
+// fields; a portfolio-company employer forces sector "Portfolio". The full
+// payload is archived per matched contact.
+export const bulkEnrichContacts = createServerFn({ method: "POST" })
+  .inputValidator(
+    (data: { contacts: { email: string; name: string; company?: string; urid?: string }[] }) => data,
+  )
+  .handler(async ({ data }) => {
+    const updates: BulkMergeUpdate[] = [];
+    let matched = 0;
+    let notFound = 0;
+    let failed = 0;
+
+    for (const c of data.contacts) {
+      const email = (c.email || "").trim();
+      if (!email) { failed++; continue; }
+      const parts = (c.name || "").trim().split(/\s+/);
+      try {
+        const r = await enrichPerson({
+          email,
+          firstName: parts[0] || undefined,
+          lastName: parts.slice(1).join(" ") || undefined,
+          organizationName: c.company || undefined,
+        });
+        if (!r.found) { notFound++; continue; }
+        matched++;
+        // Archive the raw payload (best-effort).
+        storeApolloRawServer(email, r).catch(() => {});
+        const location = [r.city, r.state].filter(Boolean).join(", ");
+        const employment = (r.employmentHistory || [])
+          .map((j) => {
+            const base = [j.title, j.company].filter(Boolean).join(" @ ");
+            return j.current ? `${base} (current)` : base;
+          })
+          .filter(Boolean)
+          .join("; ");
+        updates.push({
+          email,
+          urid: c.urid,
+          fields: {
+            title: r.title || undefined,
+            company: r.company || undefined,
+            phone: r.phone || undefined,
+            location: location || undefined,
+            sector: r.industry || undefined,
+            headline: r.headline || undefined,
+            employmentHistory: employment || undefined,
+          },
+        });
+      } catch (e) {
+        console.error("[bulkEnrichContacts] enrich failed for", email, e);
+        failed++;
+      }
+    }
+
+    const res = await bulkMergeContactFieldsServer(updates, "apollo");
+    return { matched, notFound, failed, updated: res.updated };
+  });
+
+// Mass "areas of interest" load: infer each contact's interest domains from
+// title/company/sector and PERSIST them to the sheet. Fill-only — a contact
+// whose "Areas of Interest" cell already has a value (manual curation) is left
+// untouched (the merge decides this from the real sheet cell, since the client's
+// areasOfInterest is often auto-inferred at read time). Deterministic + free.
+export const bulkLoadInterests = createServerFn({ method: "POST" })
+  .inputValidator(
+    (data: {
+      contacts: {
+        email: string;
+        urid?: string;
+        title?: string;
+        company?: string;
+        sector?: string;
+      }[];
+    }) => data,
+  )
+  .handler(async ({ data }) => {
+    const { inferInterestAreas } = await import("@/lib/interest-domains");
+    const updates: BulkMergeUpdate[] = [];
+    let inferred = 0;
+
+    for (const c of data.contacts) {
+      const areas = inferInterestAreas(c.title || "", c.company || "", c.sector || "");
+      if (areas.length === 0) continue;
+      inferred++;
+      updates.push({
+        email: c.email,
+        urid: c.urid,
+        fields: { areasOfInterest: areas.join(", ") },
+      });
+    }
+
+    // Fill-only: persist inferred areas only where the sheet cell is blank.
+    const res = await bulkMergeContactFieldsServer(updates, "user", true);
+    return { inferred, updated: res.updated };
   });
 
 // Fresh existing-contact emails (lowercased), for commit-time dedup.

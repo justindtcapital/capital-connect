@@ -16,6 +16,8 @@ export interface ApolloEnrichmentResult {
   state?: string;
   country?: string;
   headline?: string;
+  /** The person's org industry/sector (Apollo `organization.industry`). */
+  industry?: string;
   photoUrl?: string;
   phone?: string;
   /** Where the phone came from — UI uses this to label "Mobile/Personal/Work/Company". */
@@ -119,6 +121,13 @@ function extractPerson(person: Record<string, unknown>): ApolloEnrichmentResult 
     country = "";
   }
 
+  // Industry/sector: person-level first, then the organization record.
+  let industry = String(person.industry || "");
+  if (!industry && person.organization && typeof person.organization === "object") {
+    const org = person.organization as Record<string, unknown>;
+    if (org.industry) industry = String(org.industry);
+  }
+
   return {
     found: true,
     name: String(person.name || [person.first_name, person.last_name].filter(Boolean).join(" ")),
@@ -131,6 +140,7 @@ function extractPerson(person: Record<string, unknown>): ApolloEnrichmentResult 
     state,
     country,
     headline: String(person.headline || ""),
+    industry,
     photoUrl: String(person.photo_url || ""),
     phone,
     phoneSource,

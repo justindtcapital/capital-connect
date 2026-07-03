@@ -486,6 +486,65 @@ export const scanSignals = createServerFn({ method: "POST" })
     }
   });
 
+// ── Areas-of-interest suggestion ─────────────────────────────────
+// Suggest a contact's interest domains from their title/company/sector using
+// Gemini, falling back to the deterministic rule-based inference when Gemini is
+// unconfigured or errors. Returns a de-duplicated list of short domain labels.
+export interface SuggestAreasResult {
+  ok: boolean;
+  areas: string[];
+  source: "gemini" | "rules";
+  error?: string;
+}
+
+export const suggestAreasOfInterest = createServerFn({ method: "POST" })
+  .inputValidator((data: { title?: string; company?: string; sector?: string; existing?: string[] }) => data)
+  .handler(async ({ data }): Promise<SuggestAreasResult> => {
+    const { inferInterestAreas } = await import("@/lib/interest-domains");
+    const rules = () => inferInterestAreas(data.title || "", data.company || "", data.sector || "");
+
+    if (!isGeminiConfigured()) {
+      return { ok: true, areas: rules(), source: "rules" };
+    }
+    try {
+      const prompt = [
+        "You classify a business contact into a few broad areas of professional interest.",
+        "Given their title, company, and sector, return 3-6 short domain labels (1-2 words each)",
+        "such as: AI, Data, Security, Cloud, Fintech, Healthcare, Sales, Marketing, Product, Finance,",
+        "Operations, Supply Chain, Logistics, Investing, Energy, Public Sector, Legal, People.",
+        "Prefer specific, useful labels over generic ones. Do NOT repeat labels already listed as existing.",
+        "",
+        `Title: ${data.title || "(unknown)"}`,
+        `Company: ${data.company || "(unknown)"}`,
+        `Sector: ${data.sector || "(unknown)"}`,
+        `Existing areas (do not repeat): ${(data.existing || []).join(", ") || "(none)"}`,
+        "",
+        'Respond ONLY with a JSON array of strings, e.g. ["AI","Data","Security"]. No prose.',
+      ].join("\n");
+
+      const r = await geminiGenerate({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: { maxOutputTokens: 400, temperature: 0.3, thinkingConfig: { thinkingBudget: 256 } },
+      });
+      const text = responseText(r) || "";
+      const match = text.match(/\[[\s\S]*\]/);
+      let areas: string[] = [];
+      if (match) {
+        try {
+          const parsed = JSON.parse(match[0]);
+          if (Array.isArray(parsed)) {
+            areas = parsed.map((x) => String(x).trim()).filter(Boolean);
+          }
+        } catch { /* fall through to rules */ }
+      }
+      if (areas.length === 0) return { ok: true, areas: rules(), source: "rules" };
+      return { ok: true, areas, source: "gemini" };
+    } catch (err) {
+      console.error("[gemini] suggestAreasOfInterest failed, using rules:", err);
+      return { ok: true, areas: rules(), source: "rules" };
+    }
+  });
+
 // ── Home daily briefing ──────────────────────────────────────────
 // A light, direct Gemini call (NOT the audited agent layer) that turns the
 // home dashboard's already-loaded numbers into a short narrative briefing.

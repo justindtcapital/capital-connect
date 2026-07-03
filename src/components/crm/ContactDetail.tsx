@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import type { Contact, Interaction, InteractionType, Temperature, EngagementSource } from "@/lib/types";
 import { ENGAGEMENT_SOURCES, CONTACT_TYPES, RECORD_SOURCES, isAsanaSourced, asanaTaskUrl } from "@/lib/types";
 import { inferInterestAreas } from "@/lib/interest-domains";
+import { suggestAreasOfInterest } from "@/utils/gemini.functions";
 import {
   Sheet,
   SheetContent,
@@ -75,7 +76,7 @@ import { TechStackSection } from "./TechStackSection";
 import { ActivitySection } from "./ActivitySection";
 import { useAsanaActivities } from "@/lib/use-activities";
 import { matchActivitiesToContact } from "@/lib/activity-match";
-import { Sparkles } from "lucide-react";
+import { Sparkles, Loader2 } from "lucide-react";
 
 interface ContactDetailProps {
   contact: Contact | null;
@@ -243,6 +244,7 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
   const [newEvent, setNewEvent] = useState({ name: "", type: "attended" as "attended" | "invited" });
   const [addAreaOpen, setAddAreaOpen] = useState(false);
   const [newArea, setNewArea] = useState("");
+  const [suggestingAreas, setSuggestingAreas] = useState(false);
   const [newInteraction, setNewInteraction] = useState({
     type: "note" as InteractionType,
     summary: "",
@@ -334,13 +336,23 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
             canApply: true,
           }
         : null,
+      result.industry
+        ? {
+            key: "sector",
+            label: "Sector / Industry",
+            apolloValue: result.industry,
+            currentValue: contact.sector || "",
+            contactField: "sector" as keyof Contact,
+            canApply: true,
+          }
+        : null,
       result.headline
         ? {
             key: "headline",
             label: "Headline",
             apolloValue: result.headline,
             currentValue: "",
-            canApply: false,
+            canApply: true,
           }
         : null,
     ].filter(Boolean) as Array<{
@@ -459,6 +471,25 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
     if (typeof updates.company === "string") sheetUpdates.company = updates.company;
     if (typeof updates.phone === "string") sheetUpdates.phone = updates.phone;
     if (typeof updates.location === "string") sheetUpdates.location = updates.location;
+    // Sector: when applied, also send company so the merge can apply the
+    // portfolio-company override ("Portfolio") server-side.
+    if (typeof updates.sector === "string") {
+      sheetUpdates.sector = updates.sector;
+      sheetUpdates.company = sheetUpdates.company ?? contact.company;
+    }
+    // Headline (selectable) + employment history (additive) — columns the merge
+    // creates on demand.
+    if (selectedFields.headline && apolloResult.headline) {
+      sheetUpdates.headline = apolloResult.headline;
+    }
+    const history = (apolloResult.employmentHistory || [])
+      .map((j) => {
+        const base = [j.title, j.company].filter(Boolean).join(" @ ");
+        return j.current ? `${base} (current)` : base;
+      })
+      .filter(Boolean)
+      .join("; ");
+    if (history) sheetUpdates.employmentHistory = history;
 
     if (Object.keys(sheetUpdates).length === 0) {
       toast.success(`Applied ${count} field${count !== 1 ? "s" : ""} from Apollo`);
@@ -708,18 +739,38 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
     void persistAreas(areas);
   };
 
-  // Re-infer interest domains from title + company and merge them in (manual
-  // override afterwards — persisted like any edit).
-  const suggestAreas = () => {
-    const suggested = inferInterestAreas(contact.title, contact.company, contact.sector);
-    const merged = [...new Set([...contact.areasOfInterest, ...suggested])];
-    if (merged.length === contact.areasOfInterest.length) {
-      toast.info("No new domains to suggest from this title/company.");
-      return;
+  // Suggest interest domains from title/company/sector via Gemini (falling back
+  // to the rule-based inference server-side), then merge them in and persist.
+  const suggestAreas = async () => {
+    if (suggestingAreas) return;
+    setSuggestingAreas(true);
+    try {
+      let suggested: string[] = [];
+      try {
+        const res = await suggestAreasOfInterest({
+          data: {
+            title: contact.title,
+            company: contact.company,
+            sector: contact.sector,
+            existing: contact.areasOfInterest,
+          },
+        });
+        suggested = res.areas;
+      } catch (e) {
+        console.error("suggestAreasOfInterest failed, using local inference:", e);
+        suggested = inferInterestAreas(contact.title, contact.company, contact.sector);
+      }
+      const merged = [...new Set([...contact.areasOfInterest, ...suggested])];
+      if (merged.length === contact.areasOfInterest.length) {
+        toast.info("No new domains to suggest from this title/company.");
+        return;
+      }
+      if (onContactUpdate) onContactUpdate({ ...contact, areasOfInterest: merged });
+      void persistAreas(merged);
+      toast.success("Added suggested interest domains.");
+    } finally {
+      setSuggestingAreas(false);
     }
-    if (onContactUpdate) onContactUpdate({ ...contact, areasOfInterest: merged });
-    void persistAreas(merged);
-    toast.success("Added suggested interest domains.");
   };
 
   const removePortCoIntro = (co: string) => {
@@ -1000,9 +1051,11 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                     Areas of Interest
                   </h3>
                   <div className="flex items-center gap-1.5">
-                    <Button variant="ghost" size="sm" className={actionBtnClass} onClick={suggestAreas} title="Infer domains from title + company">
-                      <Sparkles className="h-3 w-3 mr-1" />
-                      Suggest
+                    <Button variant="ghost" size="sm" className={actionBtnClass} onClick={() => void suggestAreas()} disabled={suggestingAreas} title="Infer domains from title + company">
+                      {suggestingAreas
+                        ? <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                        : <Sparkles className="h-3 w-3 mr-1" />}
+                      {suggestingAreas ? "Suggesting…" : "Suggest"}
                     </Button>
                     <Button variant="outline" size="sm" className={actionBtnClass} onClick={() => setAddAreaOpen(true)}>
                       <Plus className="h-3 w-3 mr-1" />
@@ -1033,6 +1086,18 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
 
               {/* Tech Stack (contact's company, via Sumble) */}
               <section className="border-b border-border pb-6">
+                {contact.techStack ? (
+                  <div className="mb-4">
+                    <p className="text-xs font-medium text-muted-foreground mb-2">Tech Stack (loaded)</p>
+                    <div className="flex flex-wrap gap-1.5">
+                      {contact.techStack.split(",").map((t) => t.trim()).filter(Boolean).map((t) => (
+                        <span key={t} className="rounded-full bg-muted px-2 py-0.5 text-xs text-foreground">
+                          {t}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
                 <TechStackSection company={contact.company} email={primaryEmail} compact />
               </section>
 

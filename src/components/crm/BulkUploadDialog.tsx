@@ -20,6 +20,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { EventPicker } from "@/components/events/EventPicker";
+import { MultiSelect } from "@/components/ui/multi-select";
 import { addContact, addEvent as addEventToSheet, addPortcoIntro, addNote, fetchContactEmails, logImportResult, fetchImportHistory } from "@/utils/sheets.functions";
 import { enrichContact } from "@/utils/apollo.functions";
 import { toast } from "sonner";
@@ -45,6 +46,9 @@ interface ParsedRow {
   location: string;
   prime: string;
   sector: string;
+  // Apollo-enrichment-only (never mapped from CSV columns).
+  headline: string;
+  employmentHistory: string;
 }
 
 interface ImportHistoryRow {
@@ -60,7 +64,9 @@ interface ImportHistoryRow {
   failed: number;
 }
 
-type FieldKey = keyof ParsedRow;
+// headline/employmentHistory are Apollo-only — never CSV columns, so they're
+// excluded from the column-mapping keys.
+type FieldKey = keyof Omit<ParsedRow, "headline" | "employmentHistory">;
 type Mapping = Record<FieldKey, number>;
 
 // The importable fields, in display order. Name + email are required.
@@ -168,11 +174,29 @@ function autoMap(headers: string[]): Mapping {
   return result;
 }
 
+// Format Apollo employment history into one cell: "Title @ Company (current); …".
+function formatEmploymentHistory(
+  history?: Array<{ title: string; company: string; current: boolean }>,
+): string {
+  if (!history || history.length === 0) return "";
+  return history
+    .map((j) => {
+      const base = [j.title, j.company].filter(Boolean).join(" @ ");
+      return j.current ? `${base} (current)` : base;
+    })
+    .filter(Boolean)
+    .join("; ");
+}
+
 // Best-effort Apollo enrichment for a single row — fills ONLY the blank fields
-// (title, company, phone, location), never overwriting what the CSV provided.
-// Returns the row unchanged on no-match or error so import never blocks.
+// (title, company, phone, location, sector), never overwriting what the CSV
+// provided, and additionally captures the person's headline + employment
+// history (columns the CSV never carries). The portfolio-company sector override
+// is applied server-side on add. Returns the row unchanged on no-match/error so
+// import never blocks.
 async function enrichRow(r: ParsedRow): Promise<{ row: ParsedRow; enriched: boolean }> {
-  if (r.title && r.company && r.phone && r.location) return { row: r, enriched: false };
+  // Skip the Apollo call only when every enrichable field is already present.
+  if (r.title && r.company && r.phone && r.location && r.sector) return { row: r, enriched: false };
   const parts = r.name.trim().split(/\s+/);
   const firstName = parts[0] || "";
   const lastName = parts.slice(1).join(" ");
@@ -193,10 +217,15 @@ async function enrichRow(r: ParsedRow): Promise<{ row: ParsedRow; enriched: bool
       company: r.company || result.company || "",
       phone: r.phone || result.phone || "",
       location: r.location || apolloLocation,
+      sector: r.sector || result.industry || "",
+      headline: r.headline || result.headline || "",
+      employmentHistory: r.employmentHistory || formatEmploymentHistory(result.employmentHistory),
     };
     const enriched =
       row.title !== r.title || row.company !== r.company ||
-      row.phone !== r.phone || row.location !== r.location;
+      row.phone !== r.phone || row.location !== r.location ||
+      row.sector !== r.sector || row.headline !== r.headline ||
+      row.employmentHistory !== r.employmentHistory;
     return { row, enriched };
   } catch (e) {
     console.error("apollo enrich failed", r.email, e);
@@ -209,7 +238,7 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
   const [fileName, setFileName] = useState("");
   const [mapping, setMapping] = useState<Mapping>(emptyMapping());
   const [eventName, setEventName] = useState("");
-  const [portcoName, setPortcoName] = useState("");
+  const [portcoNames, setPortcoNames] = useState<string[]>([]);
   const [source, setSource] = useState("");
   // Hands-off by default: imported contacts are auto-enriched unless unchecked.
   const [enrichOnImport, setEnrichOnImport] = useState(true);
@@ -261,6 +290,8 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
       location: cell(r, mapping.location),
       prime: cell(r, mapping.prime),
       sector: cell(r, mapping.sector),
+      headline: "",
+      employmentHistory: "",
     }));
 
     const existing = new Set(existingEmails.map((e) => e.trim().toLowerCase()).filter(Boolean));
@@ -285,7 +316,7 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
     setFileName("");
     setMapping(emptyMapping());
     setEventName("");
-    setPortcoName("");
+    setPortcoNames([]);
     setSource("");
     setEnrichOnImport(true);
     setBusy(false);
@@ -297,7 +328,7 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
     const importId =
       typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `imp-${Date.now()}`;
     const evt = eventName.trim();
-    const portco = portcoName.trim();
+    const portcos = portcoNames.map((p) => p.trim()).filter(Boolean);
     const src = source.trim();
 
     // Idempotency: re-read existing emails server-side right before committing so
@@ -337,6 +368,8 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
             location: r.location,
             prime: r.prime,
             sector: r.sector,
+            headline: r.headline,
+            employmentHistory: r.employmentHistory,
             temperature: "Warm",
             source: "CSV Import",
           },
@@ -352,13 +385,19 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
             console.error("event tag failed", r.email, e);
           }
         }
-        if (portco) {
-          try {
-            await addPortcoIntro({ data: { contactEmail: r.email, portcoName: portco } });
-            taggedPortco++;
-          } catch (e) {
-            console.error("portco tag failed", r.email, e);
+        if (portcos.length > 0) {
+          // Tag the contact with each selected portfolio company (independent,
+          // best-effort). Count the contact once if any tag lands.
+          let taggedAny = false;
+          for (const portco of portcos) {
+            try {
+              await addPortcoIntro({ data: { contactEmail: r.email, portcoName: portco } });
+              taggedAny = true;
+            } catch (e) {
+              console.error("portco tag failed", r.email, portco, e);
+            }
           }
+          if (taggedAny) taggedPortco++;
         }
         if (src) {
           try {
@@ -400,7 +439,10 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
     if (enrichOnImport) parts.push(`${enrichedCount} enriched`);
     if (totalDupes > 0) parts.push(`${totalDupes} duplicate${totalDupes !== 1 ? "s" : ""} skipped`);
     if (evt) parts.push(`${taggedEvent} → event "${evt}"`);
-    if (portco) parts.push(`${taggedPortco} → portco "${portco}"`);
+    if (portcos.length > 0)
+      parts.push(
+        `${taggedPortco} → ${portcos.length === 1 ? `portco "${portcos[0]}"` : `${portcos.length} portcos`}`,
+      );
     if (src) parts.push(`${taggedSource} → source "${src}"`);
     const message = parts.join(" · ");
     if (failed > 0) toast.warning(`${message} · ${failed} failed (see console)`);
@@ -496,20 +538,15 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
                     </div>
                     <div>
                       <Label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
-                        Tag with portfolio company
+                        Tag with portfolio companies
                       </Label>
-                      <Input
-                        list="bulk-portco-options"
-                        value={portcoName}
-                        onChange={(e) => setPortcoName(e.target.value)}
-                        placeholder="Portfolio company…"
-                        className="h-9 text-xs"
+                      <MultiSelect
+                        options={portcoOptions}
+                        value={portcoNames}
+                        onChange={setPortcoNames}
+                        placeholder="Portfolio companies…"
+                        className="h-9"
                       />
-                      <datalist id="bulk-portco-options">
-                        {portcoOptions.map((name) => (
-                          <option key={name} value={name} />
-                        ))}
-                      </datalist>
                     </div>
                     <div>
                       <Label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">

@@ -34,6 +34,7 @@ import {
   Loader2,
   Copy,
   CheckCircle2,
+  Trash2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -71,6 +72,16 @@ import {
   SheetDescription,
 } from "@/components/ui/sheet";
 import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
   Table,
   TableBody,
   TableCell,
@@ -84,6 +95,7 @@ import {
   logTargetOutreach,
   saveTargetConnectionStrategy,
   updateTargetFields,
+  bulkDeleteTargets,
 } from "@/utils/sheets.functions";
 import { NetworkBuilderDialog } from "@/components/crm/NetworkBuilderDialog";
 import { NetworkFinderDialog } from "@/components/crm/NetworkFinderDialog";
@@ -307,11 +319,15 @@ function TargetingPage() {
   const { filters } = useTargetingFilters();
   const {
     selectedIds,
+    selectedTargets,
     toggleId,
     toggleAll: contextToggleAll,
+    clearSelection,
     setFilteredTargets,
     setOnBulkUpdate,
   } = useTargetSelection();
+  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
+  const [deletingTargets, setDeletingTargets] = useState(false);
   const { updateOptions } = useFilterOptions();
   const loaderData = Route.useLoaderData();
   const [targets, setTargets] = useState<TargetLead[]>(loaderData.targets);
@@ -820,6 +836,32 @@ function TargetingPage() {
     );
   };
 
+  // Hard-delete the selected targets from the Targets sheet (confirmed first),
+  // matched by stable URID with a target-key fallback, then drop them locally.
+  const deleteSelected = async () => {
+    const doomed = selectedTargets;
+    if (doomed.length === 0) return;
+    setDeletingTargets(true);
+    try {
+      const entries = doomed.map((t) => ({ urid: t.urid, key: targetKeyOf(t) }));
+      const res = await bulkDeleteTargets({ data: { entries } });
+      const goneIds = new Set(doomed.map((t) => t.id));
+      setTargets((prev) => prev.filter((t) => !goneIds.has(t.id)));
+      if (activeTarget && goneIds.has(activeTarget.id)) {
+        setDetailOpen(false);
+        setActiveTarget(null);
+      }
+      clearSelection();
+      toast.success(`Deleted ${res.deleted} target${res.deleted !== 1 ? "s" : ""}.`);
+    } catch (e) {
+      console.error("bulkDeleteTargets failed", e);
+      toast.error("Delete failed — see console.");
+    } finally {
+      setDeletingTargets(false);
+      setConfirmDeleteOpen(false);
+    }
+  };
+
   const startEditing = () => {
     if (!activeTarget) return;
     setEditData({
@@ -939,6 +981,16 @@ function TargetingPage() {
               <Button size="sm" className={actionBtnClass} onClick={promoteSelected}>
                 <ArrowUpRight className="h-3 w-3 mr-1" />
                 Promote All
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className={`${actionBtnClass} text-destructive border-destructive/30 hover:bg-destructive/10 hover:text-destructive`}
+                onClick={() => setConfirmDeleteOpen(true)}
+                disabled={deletingTargets}
+              >
+                <Trash2 className="h-3 w-3 mr-1" />
+                Delete
               </Button>
             </>
           )}
@@ -1681,6 +1733,40 @@ function TargetingPage() {
           }).catch((e) => console.error("logTargetOutreach failed", e));
         }}
       />
+
+      {/* Confirm bulk delete */}
+      <AlertDialog open={confirmDeleteOpen} onOpenChange={setConfirmDeleteOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Delete {selectedIds.size} target{selectedIds.size !== 1 ? "s" : ""}?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              This permanently removes {selectedIds.size === 1 ? "this target" : "these targets"}{" "}
+              from the Targets sheet. This can't be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deletingTargets}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault();
+                void deleteSelected();
+              }}
+              disabled={deletingTargets}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {deletingTargets ? (
+                <>
+                  <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> Deleting…
+                </>
+              ) : (
+                <>Delete {selectedIds.size}</>
+              )}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* New Target Dialog */}
       <Dialog open={newTargetOpen} onOpenChange={setNewTargetOpen}>

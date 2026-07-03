@@ -11,6 +11,8 @@ interface TargetSelectionContextType {
   setFilteredTargets: (targets: TargetLead[]) => void;
   onBulkUpdate?: (updatedTargets: TargetLead[]) => void;
   setOnBulkUpdate: (fn: ((updatedTargets: TargetLead[]) => void) | undefined) => void;
+  onBulkDelete?: (deletedIds: string[]) => void;
+  setOnBulkDelete: (fn: ((deletedIds: string[]) => void) | undefined) => void;
 }
 
 const TargetSelectionContext = createContext<TargetSelectionContextType>({
@@ -22,12 +24,14 @@ const TargetSelectionContext = createContext<TargetSelectionContextType>({
   clearSelection: () => {},
   setFilteredTargets: () => {},
   setOnBulkUpdate: () => {},
+  setOnBulkDelete: () => {},
 });
 
 export function TargetSelectionProvider({ children }: { children: ReactNode }) {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [allFilteredTargets, setAllFilteredTargets] = useState<TargetLead[]>([]);
   const [onBulkUpdate, setOnBulkUpdateState] = useState<((updatedTargets: TargetLead[]) => void) | undefined>();
+  const [onBulkDelete, setOnBulkDeleteState] = useState<((deletedIds: string[]) => void) | undefined>();
 
   const toggleId = useCallback((id: string) => {
     setSelectedIds((prev) => {
@@ -59,6 +63,10 @@ export function TargetSelectionProvider({ children }: { children: ReactNode }) {
     setOnBulkUpdateState(() => fn);
   }, []);
 
+  const setOnBulkDelete = useCallback((fn: ((deletedIds: string[]) => void) | undefined) => {
+    setOnBulkDeleteState(() => fn);
+  }, []);
+
   return (
     <TargetSelectionContext.Provider
       value={{
@@ -71,6 +79,8 @@ export function TargetSelectionProvider({ children }: { children: ReactNode }) {
         setFilteredTargets,
         onBulkUpdate,
         setOnBulkUpdate,
+        onBulkDelete,
+        setOnBulkDelete,
       }}
     >
       {children}

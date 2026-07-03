@@ -22,8 +22,10 @@ import {
   ensureTab,
   appendSheetRow,
   writeSheetRow,
+  bulkMergeContactFields,
   TAB_NAMES,
   PORTCO_INTEL_HEADERS,
+  type BulkMergeUpdate,
 } from "./sheets.server";
 
 // ── Sheet cache for Sumble PortCo intel ──────────────────────────
@@ -268,6 +270,67 @@ export const getCompanyTechStack = createServerFn({ method: "POST" })
       console.error("[sumble] getCompanyTechStack failed:", err);
       return { found: false, error: err instanceof Error ? err.message : "Sumble request failed", technologies: [] };
     }
+  });
+
+// Mass tech-stack load: resolve each selected contact's company to a Sumble org,
+// aggregate its hiring-signal tech stack ONCE per unique company (dedup avoids
+// re-spending credits), and persist the top technologies to each contact's
+// "Tech Stack" column in a single batched write. Credit-costly (Sumble jobs are
+// billed), so the UI gates this behind a confirm showing the unique-company
+// count. Contacts whose company can't be resolved are skipped.
+const TECH_STACK_MAX = 12; // how many technologies to store per contact
+export const bulkLoadTechStack = createServerFn({ method: "POST" })
+  .inputValidator(
+    (data: {
+      contacts: { email: string; urid?: string; company?: string; website?: string; linkedinUrl?: string }[];
+    }) => data,
+  )
+  .handler(async ({ data }) => {
+    if (!isSumbleConfigured()) {
+      return { companies: 0, resolved: 0, updated: 0, skipped: data.contacts.length, error: "Sumble isn't configured (SUMBLE_API_KEY missing)." };
+    }
+
+    // Group contacts by a normalized company key so each company is priced once.
+    const groups = new Map<string, { company: string; website?: string; members: typeof data.contacts }>();
+    let skipped = 0;
+    for (const c of data.contacts) {
+      const company = (c.company || "").trim();
+      if (!company) { skipped++; continue; }
+      const key = company.toLowerCase();
+      if (!groups.has(key)) groups.set(key, { company, website: c.website, members: [] });
+      groups.get(key)!.members.push(c);
+    }
+
+    const updates: BulkMergeUpdate[] = [];
+    let resolved = 0;
+    let creditsRemaining: number | undefined;
+
+    for (const { company, website, members } of groups.values()) {
+      try {
+        // Resolve to a Sumble org: website host first, else match by name.
+        let domain = hostOf(website);
+        if (!domain) {
+          const m = await matchOrganization(company, website);
+          domain = m.org?.domain || "";
+        }
+        if (!domain) { skipped += members.length; continue; }
+
+        const res = await buildPortcoTechStack(domain);
+        if (res.credits?.remaining !== undefined) creditsRemaining = res.credits.remaining;
+        if (!res.found || res.technologies.length === 0) { skipped += members.length; continue; }
+        resolved++;
+        const stack = res.technologies.slice(0, TECH_STACK_MAX).map((t) => t.name).join(", ");
+        for (const m of members) {
+          updates.push({ email: m.email, urid: m.urid, fields: { techStack: stack } });
+        }
+      } catch (e) {
+        console.error("[bulkLoadTechStack] failed for", company, e);
+        skipped += members.length;
+      }
+    }
+
+    const merge = await bulkMergeContactFields(updates, "user");
+    return { companies: groups.size, resolved, updated: merge.updated, skipped, creditsRemaining };
   });
 
 // Opt-in confirmation pass: confirm specific technologies (the jobs-derived names,

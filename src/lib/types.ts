@@ -190,6 +190,8 @@ export interface Contact {
   source?: RecordSource;
   /** V2: supporting "why surfaced" reasoning (Sumble technographic context). */
   sourceContext?: string;
+  /** Company tech stack (comma-separated), loaded from Sumble hiring signals. */
+  techStack?: string;
 }
 
 export interface ContactFilters {

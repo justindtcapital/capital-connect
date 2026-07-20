@@ -1,11 +1,19 @@
 import { createFileRoute } from "@tanstack/react-router";
-import type { Contact } from "@/lib/types";
-import { useMemo, useState } from "react";
+import type { Contact, PortfolioEvent } from "@/lib/types";
+import { useMemo, useRef, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { fetchContacts, fetchRatingTransitions } from "@/utils/sheets.functions";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { fetchContacts, fetchRatingTransitions, fetchPortfolioCompanies } from "@/utils/sheets.functions";
+import { fetchAsanaPortcoData, type AsanaPortcoData } from "@/utils/asana.functions";
 import { networkProgressionInsights, type InsightNarrative } from "@/utils/insights.functions";
-import { Users, Flame, Bell, Link2, Sparkles, Loader2, TrendingUp } from "lucide-react";
+import { Sparkles, Loader2, TrendingUp, Landmark, Calendar } from "lucide-react";
 import { toast } from "sonner";
 
 type Transition = { from: string; to: string; ts: string };
@@ -27,17 +35,25 @@ import {
 import {
   BarChart,
   Bar,
-  LineChart,
-  Line,
-  PieChart,
-  Pie,
-  Cell,
+  AreaChart,
+  Area,
   XAxis,
   YAxis,
   CartesianGrid,
   Tooltip,
   ResponsiveContainer,
 } from "recharts";
+import {
+  buildIntelligence,
+  temperatureRiver,
+  type PulseInsight,
+  type Recommendation,
+} from "@/lib/dashboard-intelligence";
+import { PulseIsland } from "@/components/dashboard/PulseIsland";
+import { NetworkConstellation } from "@/components/dashboard/NetworkConstellation";
+import { InstrumentStrip } from "@/components/dashboard/InstrumentStrip";
+import { RecommendationsBand } from "@/components/dashboard/RecommendationsBand";
+import { ThesisIntelligenceMap } from "@/components/dashboard/ThesisIntelligenceMap";
 
 export const Route = createFileRoute("/dashboard")({
   head: () => ({
@@ -47,10 +63,50 @@ export const Route = createFileRoute("/dashboard")({
     ],
   }),
   validateSearch: (search: Record<string, unknown>) => ({ cf: parseCfParam(search.cf) }),
-  loader: async () => ({
-    contacts: await fetchContacts(),
-    transitions: await fetchRatingTransitions(),
-  }),
+  loader: async () => {
+    const [contacts, transitions, asana, portfolio] = await Promise.all([
+      fetchContacts(),
+      fetchRatingTransitions(),
+      fetchAsanaPortcoData().catch(
+        (): AsanaPortcoData => ({
+          fieldsByCompanyName: {},
+          namesByCompanyName: {},
+          eventsByCompanyName: {},
+        }),
+      ),
+      fetchPortfolioCompanies().catch(() => []),
+    ]);
+
+    // Derive lead investor per portco from the Asana "Lead Investor" custom field.
+    // The field name can carry trailing whitespace, so match on a trim/lowercase
+    // normalization (this was the fix for the Akka sourcing issue).
+    const investorByPortco: Record<string, string> = {};
+    for (const [key, fields] of Object.entries(asana.fieldsByCompanyName)) {
+      for (const [fieldName, fieldValue] of Object.entries(fields)) {
+        if (fieldName.trim().toLowerCase() === "lead investor" && fieldValue && fieldValue.trim()) {
+          investorByPortco[key] = fieldValue.trim();
+          break;
+        }
+      }
+    }
+
+    const portfolioPortcos = [
+      ...new Set(
+        (portfolio || [])
+          .map((p: { name?: string }) => (p.name || "").trim())
+          .filter(Boolean),
+      ),
+    ];
+
+    return {
+      contacts,
+      transitions,
+      investorByPortco,
+      portcoNames: asana.namesByCompanyName,
+      eventsByPortco: asana.eventsByCompanyName,
+      portfolioPortcos,
+    };
+  },
   component: DashboardPage,
 });
 
@@ -78,10 +134,6 @@ function monthTick(key: string): string {
   return MONTHS[Number(mo) - 1] ?? key;
 }
 
-// Registry of reportable contact dimensions: the single source of truth for
-// what's filterable. Each accessor returns the value(s) a contact has for the
-// dimension; cross-filtering (matchesFilters) and chart clicks both key off the
-// `dim`. Add a new filterable field here — nothing else needs to change.
 const CONTACT_DIMS: Dimension<Contact>[] = [
   { dim: "prime", label: "Prime", get: (c) => c.prime },
   { dim: "sector", label: "Sector", get: (c) => c.sector },
@@ -95,15 +147,12 @@ const CONTACT_DIMS: Dimension<Contact>[] = [
   },
 ];
 
-// Numeric measures available to the chart builder (record count is implicit).
 const CONTACT_METRICS: Metric<Contact>[] = [
   { key: "intros", label: "PortCo intros", get: (c) => c.portCoIntros.length },
   { key: "events", label: "Events attended", get: (c) => c.eventsAttended.length },
   { key: "engagements", label: "Engagements", get: (c) => (c.portCoEngagements || []).length },
 ];
 
-// How the drill-down list can be organized. "Engagement" buckets each contact by
-// how they connect to the network (portfolio intro / event / direct).
 type DrillGroupBy =
   | "engagement"
   | "temperature"
@@ -123,7 +172,6 @@ const DRILL_GROUP_OPTIONS: { value: DrillGroupBy; label: string }[] = [
   { value: "none", label: "No grouping" },
 ];
 
-// Stable section order for the dimensions that have a natural ordering.
 const DRILL_GROUP_ORDER: Partial<Record<DrillGroupBy, string[]>> = {
   engagement: ["Portfolio intro", "Event — attended", "Event — invited", "Direct / other"],
   temperature: ["Hot", "Warm", "Cold"],
@@ -178,6 +226,21 @@ function groupDrillContacts(
     });
 }
 
+interface InvestorPortco {
+  key: string;
+  name: string;
+  leads: number;
+  events: PortfolioEvent[];
+  eventsThisMonth: number;
+}
+interface InvestorRecord {
+  investor: string;
+  totalPortcos: number;
+  totalLeads: number;
+  totalEvents: number;
+  portcos: InvestorPortco[];
+}
+
 function DrillContactRow({ c, onClick }: { c: Contact; onClick: () => void }) {
   return (
     <button
@@ -196,19 +259,48 @@ function DrillContactRow({ c, onClick }: { c: Contact; onClick: () => void }) {
   );
 }
 
+function SectionLabel({
+  eyebrow,
+  title,
+  hint,
+}: {
+  eyebrow: string;
+  title: string;
+  hint?: string;
+}) {
+  return (
+    <div className="flex items-end justify-between gap-3">
+      <div>
+        <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
+          {eyebrow}
+        </p>
+        <h2 className="text-sm font-semibold text-foreground mt-0.5">{title}</h2>
+      </div>
+      {hint && <p className="text-[11px] text-muted-foreground hidden sm:block">{hint}</p>}
+    </div>
+  );
+}
+
 function DashboardPage() {
-  const { contacts, transitions } = Route.useLoaderData() as {
-    contacts: Contact[];
-    transitions: Transition[];
-  };
+  const { contacts, transitions, investorByPortco, portcoNames, eventsByPortco, portfolioPortcos } =
+    Route.useLoaderData() as {
+      contacts: Contact[];
+      transitions: Transition[];
+      investorByPortco: Record<string, string>;
+      portcoNames: Record<string, string>;
+      eventsByPortco: Record<string, PortfolioEvent[]>;
+      portfolioPortcos: string[];
+    };
   const { filters } = useDashboardFilters();
   const { crossFilters, focus, clear, clearAll, drill, drillOpen, setDrillOpen } =
     useChartDrill(CONTACT_DIMS);
   const [selectedContact, setSelectedContact] = useState<Contact | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
   const [drillGroupBy, setDrillGroupBy] = useState<DrillGroupBy>("engagement");
+  const [selectedInvestor, setSelectedInvestor] = useState<string | null>(null);
+  const [focusContactId, setFocusContactId] = useState<string | null>(null);
+  const constellationRef = useRef<HTMLDivElement>(null);
 
-  // Sidebar filters first, then the click-driven cross-filters from the charts.
   const filtered = useMemo(() => {
     return contacts.filter((c) => {
       if (filters.sector !== "all" && c.sector !== filters.sector) return false;
@@ -221,19 +313,21 @@ function DashboardPage() {
     });
   }, [contacts, filters, crossFilters]);
 
-  const hotCount = filtered.filter((c) => c.temperature === "Hot").length;
-  const followUpCount = filtered.filter((c) => c.followUpPending).length;
-  const totalIntros = filtered.reduce((sum, c) => sum + c.portCoIntros.length, 0);
+  const intelligence = useMemo(
+    () => buildIntelligence(filtered, contacts, transitions, investorByPortco, portcoNames),
+    [filtered, contacts, transitions, investorByPortco, portcoNames],
+  );
 
   const introsByPrime = useMemo(() => {
     const map: Record<string, number> = {};
     filtered.forEach((c) => {
       map[c.prime] = (map[c.prime] || 0) + c.portCoIntros.length;
     });
-    return Object.entries(map).map(([name, intros]) => ({ name: name || "—", intros }));
+    return Object.entries(map)
+      .map(([name, intros]) => ({ name: name || "—", intros }))
+      .sort((a, b) => b.intros - a.intros);
   }, [filtered]);
 
-  // Real intro velocity: portfolio engagements bucketed by month, last 12 months.
   const velocityData = useMemo(() => {
     const now = new Date();
     const keys: string[] = [];
@@ -251,37 +345,7 @@ function DashboardPage() {
     return keys.map((k) => ({ month: k, intros: counts.get(k) || 0 }));
   }, [filtered]);
 
-  const eventsDistribution = useMemo(() => {
-    const map: Record<string, number> = {};
-    filtered.forEach((c) =>
-      c.eventsAttended.forEach((ev) => {
-        map[ev] = (map[ev] || 0) + 1;
-      }),
-    );
-    return Object.entries(map)
-      .map(([name, value]) => ({ name, value }))
-      .sort((a, b) => b.value - a.value);
-  }, [filtered]);
-
-  const sectorExposure = useMemo(() => {
-    const map: Record<string, number> = {};
-    filtered.forEach((c) => {
-      if (c.sector) map[c.sector] = (map[c.sector] || 0) + 1;
-    });
-    return Object.entries(map)
-      .map(([name, count]) => ({ name, count }))
-      .sort((a, b) => b.count - a.count);
-  }, [filtered]);
-
-  // Temperature mix (Hot / Warm / Cold).
-  const temperatureMix = useMemo(() => {
-    const order = ["Hot", "Warm", "Cold"];
-    const m: Record<string, number> = {};
-    filtered.forEach((c) => {
-      m[c.temperature] = (m[c.temperature] || 0) + 1;
-    });
-    return order.filter((t) => m[t]).map((t) => ({ name: t, value: m[t] }));
-  }, [filtered]);
+  const riverData = useMemo(() => temperatureRiver(filtered), [filtered]);
 
   const portCoExposure = useMemo(() => {
     const introMap: Record<string, number> = {};
@@ -296,189 +360,444 @@ function DashboardPage() {
       .slice(0, 12);
   }, [filtered]);
 
-  const TEMP_COLORS: Record<string, string> = {
-    Hot: "oklch(0.645 0.246 16)",
-    Warm: "oklch(0.735 0.145 85)",
-    Cold: "oklch(0.6 0.18 200)",
-  };
+  const investorReport = useMemo(() => {
+    const leadsByPortco = new Map<string, number>();
+    for (const c of contacts) {
+      for (const intro of c.portCoIntros || []) {
+        const k = intro.trim().toLowerCase();
+        if (k) leadsByPortco.set(k, (leadsByPortco.get(k) || 0) + 1);
+      }
+    }
+
+    const now = new Date();
+    const thisMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+
+    const byInvestor = new Map<string, InvestorRecord>();
+    for (const [key, investor] of Object.entries(investorByPortco)) {
+      const events = eventsByPortco[key] || [];
+      const eventsThisMonth = events.filter((e) => monthKeyOf(e.date) === thisMonth).length;
+      const leads = leadsByPortco.get(key) || 0;
+      const rec = byInvestor.get(investor) || {
+        investor,
+        totalPortcos: 0,
+        totalLeads: 0,
+        totalEvents: 0,
+        portcos: [],
+      };
+      rec.totalPortcos += 1;
+      rec.totalLeads += leads;
+      rec.totalEvents += events.length;
+      rec.portcos.push({ key, name: portcoNames[key] || key, leads, events, eventsThisMonth });
+      byInvestor.set(investor, rec);
+    }
+    return [...byInvestor.values()].sort(
+      (a, b) => b.totalPortcos - a.totalPortcos || b.totalLeads - a.totalLeads,
+    );
+  }, [contacts, investorByPortco, portcoNames, eventsByPortco]);
+
+  const investorExposure = useMemo(
+    () => investorReport.slice(0, 12).map((r) => ({ name: r.investor, portcos: r.totalPortcos })),
+    [investorReport],
+  );
+
+  const selectedRecord = useMemo(
+    () => investorReport.find((r) => r.investor === selectedInvestor) || null,
+    [investorReport, selectedInvestor],
+  );
 
   const openContact = (c: Contact) => {
     setSelectedContact(c);
     setDetailOpen(true);
+    setFocusContactId(c.id);
   };
 
-  // Group the drilled records for the side panel (e.g. by engagement / company).
   const drillGroups = useMemo(
     () => (drillGroupBy === "none" ? [] : groupDrillContacts(filtered, drillGroupBy)),
     [filtered, drillGroupBy],
   );
 
+  const handlePulseAct = (pulse: PulseInsight) => {
+    if (pulse.contactId) {
+      const c = contacts.find((x) => x.id === pulse.contactId);
+      if (c) openContact(c);
+      return;
+    }
+    if (pulse.focus) focus(pulse.focus.dim, pulse.focus.value);
+    if (pulse.id === "steady") clearAll();
+  };
+
+  const handleRecAct = (rec: Recommendation) => {
+    if (rec.contactId) {
+      const c = contacts.find((x) => x.id === rec.contactId);
+      if (c) openContact(c);
+      return;
+    }
+    if (rec.focus) focus(rec.focus.dim, rec.focus.value);
+  };
+
+  const scrollToConstellation = () => {
+    constellationRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+  };
+
   return (
-    <div className="p-6 max-w-[1400px] mx-auto space-y-6">
-      <div>
-        <h1 className="text-lg font-bold text-foreground">Network Analytics</h1>
-        <p className="text-xs text-muted-foreground mt-0.5">
-          Insights across your DTC network · click any chart to drill in
+    <div className="p-6 max-w-[1400px] mx-auto space-y-8">
+      {/* 01 Header */}
+      <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3">
+        <div>
+          <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">
+            Firm intelligence
+          </p>
+          <h1 className="text-xl font-bold text-foreground tracking-tight">Network Intelligence</h1>
+          <p className="text-xs text-muted-foreground mt-1">
+            What is happening inside the firm network ·{" "}
+            <span className="tabular-nums text-foreground/80">
+              {intelligence.networkCount.toLocaleString()}
+            </span>{" "}
+            relationships in view
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-3 text-[11px] text-muted-foreground">
+          <span>
+            <span className="font-semibold text-foreground tabular-nums">{intelligence.hotCount}</span>{" "}
+            Hot
+          </span>
+          <span className="text-border">·</span>
+          <span>
+            <span className="font-semibold text-foreground tabular-nums">
+              {intelligence.followUpCount}
+            </span>{" "}
+            follow-ups
+          </span>
+          <span className="text-border">·</span>
+          <span>
+            <span className="font-semibold text-foreground tabular-nums">
+              {intelligence.totalIntros}
+            </span>{" "}
+            intros
+          </span>
+        </div>
+      </div>
+
+      {/* 02 Pulse Island */}
+      <PulseIsland
+        pulse={intelligence.pulse}
+        onAct={handlePulseAct}
+        onFocusConstellation={scrollToConstellation}
+      />
+
+      {/* Intelligence summary */}
+      <div className="rounded-xl border border-border/80 bg-muted/20 px-4 py-3.5">
+        <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground mb-2">
+          Situational brief
         </p>
+        <ul className="space-y-1.5">
+          {intelligence.summaryLines.map((line, i) => (
+            <li key={i} className="text-sm text-foreground/90 leading-snug flex gap-2">
+              <span className="text-primary mt-1.5 h-1 w-1 shrink-0 rounded-full bg-primary" />
+              {line}
+            </li>
+          ))}
+        </ul>
       </div>
 
       <DrillChips filters={crossFilters} onClear={clear} onClearAll={clearAll} />
 
-      {/* KPI Cards */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <KpiCard icon={Users} label="Network Count" value={filtered.length} />
-        <KpiCard icon={Flame} label="Hot Leads" value={hotCount} />
-        <KpiCard icon={Bell} label="Follow-ups" value={followUpCount} />
-        <KpiCard icon={Link2} label="Total Intros" value={totalIntros} />
-      </div>
+      {/* 03 Living Network */}
+      <section ref={constellationRef} className="space-y-3">
+        <SectionLabel
+          eyebrow="03 · Living network"
+          title="Constellation"
+          hint="Time morph · Diff · Explore local / Ask AI · Pulse Trace · Orbit Focus"
+        />
+        <NetworkConstellation
+          contacts={filtered}
+          portfolioPortcos={portfolioPortcos}
+          focusContactId={focusContactId}
+          onSelectContact={openContact}
+          onSelectPortco={(name) => focus("portco", name)}
+        />
+        <div className="rounded-xl border border-border/80 bg-muted/20 px-4 py-3.5">
+          <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground mb-2">
+            How Constellation works
+          </p>
+          <div className="grid gap-3 sm:grid-cols-2 text-xs text-foreground/85 leading-relaxed">
+            <ul className="space-y-1.5">
+              <li className="flex gap-2">
+                <span className="text-primary mt-1.5 h-1 w-1 shrink-0 rounded-full bg-primary" />
+                <span>
+                  <span className="font-medium text-foreground">PortCos</span> come from the
+                  Google Sheets Portfolio Companies tab (e.g.{" "}
+                  <span className="font-medium text-foreground">ibex</span> maps to{" "}
+                  <span className="font-medium text-foreground">IBEX</span>). People orbit the
+                  company they are primarily introduced to. Halos show{" "}
+                  <span className="font-medium text-foreground">Influence</span>.
+                </span>
+              </li>
+              <li className="flex gap-2">
+                <span className="text-primary mt-1.5 h-1 w-1 shrink-0 rounded-full bg-primary" />
+                <span>
+                  <span className="font-medium text-foreground">Click</span> a person to focus;{" "}
+                  <span className="font-medium text-foreground">double-click</span> to open their
+                  file. Click a PortCo to filter the dashboard; double-click for Orbit Focus.
+                </span>
+              </li>
+              <li className="flex gap-2">
+                <span className="text-primary mt-1.5 h-1 w-1 shrink-0 rounded-full bg-primary" />
+                <span>
+                  <span className="font-medium text-foreground">Pulse Trace (T)</span> — pick two
+                  nodes to light the warmest intro path. Press{" "}
+                  <span className="font-medium text-foreground">P</span> for alternate routes.
+                </span>
+              </li>
+            </ul>
+            <ul className="space-y-1.5">
+              <li className="flex gap-2">
+                <span className="text-primary mt-1.5 h-1 w-1 shrink-0 rounded-full bg-primary" />
+                <span>
+                  <span className="font-medium text-foreground">Time</span> scrubber and{" "}
+                  <span className="font-medium text-foreground">Diff (D)</span> show how influence
+                  changed versus today. AI marks decay, opportunities, and under-connected
+                  PortCos.
+                </span>
+              </li>
+              <li className="flex gap-2">
+                <span className="text-primary mt-1.5 h-1 w-1 shrink-0 rounded-full bg-primary" />
+                <span>
+                  Press <span className="font-medium text-foreground">/</span> to ask the network
+                  (e.g. “bridges”, “cooling”, “connected to Acme”). Esc or F clears focus.
+                </span>
+              </li>
+              <li className="flex gap-2">
+                <span className="text-primary mt-1.5 h-1 w-1 shrink-0 rounded-full bg-primary" />
+                <span>
+                  <span className="font-medium text-foreground">Labels</span> default to{" "}
+                  <span className="font-medium text-foreground">Active</span> (PortCos with
+                  intros). Switch to All / None in the map chrome; hover always reveals a name.
+                  Double-click a PortCo for Orbit Focus when the ring is dense.
+                </span>
+              </li>
+              <li className="flex gap-2">
+                <span className="text-primary mt-1.5 h-1 w-1 shrink-0 rounded-full bg-primary" />
+                <span>
+                  The map follows your dashboard filters — change sector, temperature, or PortCo
+                  above and the constellation rebuilds live.
+                </span>
+              </li>
+            </ul>
+          </div>
+        </div>
+      </section>
 
-      {/* Charts */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-semibold">PortCo Intros by Prime</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <ResponsiveContainer width="100%" height={240}>
-              <BarChart
-                data={introsByPrime}
-                onClick={(s: { activeLabel?: string | number }) => focus("prime", s?.activeLabel)}
-                className="cursor-pointer"
-              >
-                <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" />
-                <XAxis dataKey="name" tick={{ fontSize: 11 }} />
-                <YAxis tick={{ fontSize: 11 }} allowDecimals={false} />
-                <Tooltip
-                  contentStyle={{ fontSize: 12 }}
-                  cursor={{ fill: "var(--color-accent)", opacity: 0.4 }}
-                />
-                <Bar dataKey="intros" fill={CHART_COLORS[0]} radius={[4, 4, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </CardContent>
-        </Card>
+      {/* 04 Executive instruments */}
+      <section className="space-y-3">
+        <SectionLabel
+          eyebrow="04 · Instruments"
+          title="Executive instruments"
+          hint="Health · momentum · velocity · coverage · freshness · influence"
+        />
+        <InstrumentStrip instruments={intelligence.instruments} />
+      </section>
 
-        <Card>
+      {/* 05 Relationship Analytics */}
+      <section className="space-y-3">
+        <SectionLabel
+          eyebrow="05 · Relationship analytics"
+          title="Primes, velocity & thesis exposure"
+          hint="Click any series to drill"
+        />
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <Card className="border-border/80 shadow-none">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-semibold">PortCo Intros by Prime</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <ResponsiveContainer width="100%" height={240}>
+                <BarChart
+                  data={introsByPrime}
+                  layout="vertical"
+                  margin={{ left: 4, right: 12 }}
+                  onClick={(s: { activeLabel?: string | number }) => focus("prime", s?.activeLabel)}
+                  className="cursor-pointer"
+                >
+                  <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" horizontal={false} />
+                  <XAxis type="number" tick={{ fontSize: 11 }} allowDecimals={false} />
+                  <YAxis dataKey="name" type="category" width={100} tick={{ fontSize: 10 }} />
+                  <Tooltip
+                    contentStyle={{ fontSize: 12 }}
+                    cursor={{ fill: "var(--color-accent)", opacity: 0.4 }}
+                  />
+                  <Bar dataKey="intros" fill={CHART_COLORS[0]} radius={[0, 4, 4, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            </CardContent>
+          </Card>
+
+          <Card className="border-border/80 shadow-none">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-semibold">
+                Intro Activity Velocity{" "}
+                <span className="font-normal text-muted-foreground">· last 12 mo</span>
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <ResponsiveContainer width="100%" height={240}>
+                <AreaChart
+                  data={velocityData}
+                  onClick={(s: { activeLabel?: string | number }) => focus("month", s?.activeLabel)}
+                  className="cursor-pointer"
+                >
+                  <defs>
+                    <linearGradient id="velFill" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0%" stopColor={CHART_COLORS[0]} stopOpacity={0.35} />
+                      <stop offset="100%" stopColor={CHART_COLORS[0]} stopOpacity={0.02} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" />
+                  <XAxis dataKey="month" tick={{ fontSize: 11 }} tickFormatter={monthTick} />
+                  <YAxis tick={{ fontSize: 11 }} allowDecimals={false} />
+                  <Tooltip contentStyle={{ fontSize: 12 }} labelFormatter={monthTick} />
+                  <Area
+                    type="monotone"
+                    dataKey="intros"
+                    stroke={CHART_COLORS[0]}
+                    strokeWidth={2}
+                    fill="url(#velFill)"
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            </CardContent>
+          </Card>
+
+          <Card className="border-border/80 shadow-none">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-semibold">
+                Temperature River{" "}
+                <span className="font-normal text-muted-foreground">· activity-weighted</span>
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <ResponsiveContainer width="100%" height={240}>
+                <AreaChart data={riverData}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" />
+                  <XAxis dataKey="month" tick={{ fontSize: 11 }} tickFormatter={monthTick} />
+                  <YAxis tick={{ fontSize: 11 }} allowDecimals={false} />
+                  <Tooltip contentStyle={{ fontSize: 12 }} labelFormatter={monthTick} />
+                  <Area
+                    type="monotone"
+                    dataKey="Hot"
+                    stackId="t"
+                    stroke="oklch(0.645 0.246 16)"
+                    fill="oklch(0.645 0.246 16)"
+                    fillOpacity={0.75}
+                    className="cursor-pointer"
+                    onClick={() => focus("temperature", "Hot")}
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="Warm"
+                    stackId="t"
+                    stroke="oklch(0.735 0.145 85)"
+                    fill="oklch(0.735 0.145 85)"
+                    fillOpacity={0.7}
+                    className="cursor-pointer"
+                    onClick={() => focus("temperature", "Warm")}
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="Cold"
+                    stackId="t"
+                    stroke="oklch(0.6 0.18 200)"
+                    fill="oklch(0.6 0.18 200)"
+                    fillOpacity={0.55}
+                    className="cursor-pointer"
+                    onClick={() => focus("temperature", "Cold")}
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            </CardContent>
+          </Card>
+
+          <Card className="border-border/80 shadow-none">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-semibold">
+                Thesis Intelligence{" "}
+                <span className="font-normal text-muted-foreground">
+                  · relationship capital by thesis
+                </span>
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <ThesisIntelligenceMap
+                contacts={filtered}
+                onSelectThesis={(name) => focus("sector", name)}
+              />
+            </CardContent>
+          </Card>
+        </div>
+      </section>
+
+      {/* 06 Investor Analytics */}
+      <section className="space-y-3">
+        <SectionLabel
+          eyebrow="06 · Investor analytics"
+          title="Lead investor leverage"
+          hint="Asana Lead Investor · click a bar to drill"
+        />
+        <Card className="border-border/80 shadow-none">
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-semibold">
-              Intro Activity Velocity{" "}
-              <span className="font-normal text-muted-foreground">· last 12 mo</span>
+            <CardTitle className="text-sm font-semibold flex items-center gap-1.5">
+              <Landmark className="h-4 w-4 text-primary" /> Reports by Lead Investor
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <ResponsiveContainer width="100%" height={240}>
-              <LineChart
-                data={velocityData}
-                onClick={(s: { activeLabel?: string | number }) => focus("month", s?.activeLabel)}
-                className="cursor-pointer"
-              >
-                <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" />
-                <XAxis dataKey="month" tick={{ fontSize: 11 }} tickFormatter={monthTick} />
-                <YAxis tick={{ fontSize: 11 }} allowDecimals={false} />
-                <Tooltip contentStyle={{ fontSize: 12 }} labelFormatter={monthTick} />
-                <Line
-                  type="monotone"
-                  dataKey="intros"
-                  stroke={CHART_COLORS[0]}
-                  strokeWidth={2}
-                  dot={{ r: 3 }}
-                  activeDot={{ r: 5 }}
-                />
-              </LineChart>
-            </ResponsiveContainer>
+            {investorExposure.length === 0 ? (
+              <div className="text-xs text-muted-foreground py-10 text-center">
+                No lead-investor data yet. Add a{" "}
+                <span className="font-medium text-foreground">“Lead Investor”</span> custom field to
+                your portfolio-company tasks in Asana to populate this chart.
+              </div>
+            ) : (
+              <ResponsiveContainer width="100%" height={Math.max(240, investorExposure.length * 34)}>
+                <BarChart data={investorExposure} layout="vertical" margin={{ left: 8, right: 16 }}>
+                  <CartesianGrid
+                    strokeDasharray="3 3"
+                    stroke="var(--color-border)"
+                    horizontal={false}
+                  />
+                  <XAxis type="number" tick={{ fontSize: 11 }} allowDecimals={false} />
+                  <YAxis dataKey="name" type="category" width={150} tick={{ fontSize: 10 }} />
+                  <Tooltip
+                    contentStyle={{ fontSize: 12 }}
+                    cursor={{ fill: "var(--color-accent)", opacity: 0.4 }}
+                    formatter={(v: number) => [v, "Portfolio companies"]}
+                  />
+                  <Bar
+                    dataKey="portcos"
+                    name="Portfolio companies"
+                    fill={CHART_COLORS[3]}
+                    radius={[0, 4, 4, 0]}
+                    className="cursor-pointer"
+                    onClick={(d: { name?: string | number }) =>
+                      d?.name != null && setSelectedInvestor(String(d.name))
+                    }
+                  />
+                </BarChart>
+              </ResponsiveContainer>
+            )}
           </CardContent>
         </Card>
+      </section>
 
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-semibold">Network Temperature Mix</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <ResponsiveContainer width="100%" height={240}>
-              <PieChart>
-                <Pie
-                  data={temperatureMix}
-                  dataKey="value"
-                  nameKey="name"
-                  cx="50%"
-                  cy="50%"
-                  outerRadius={80}
-                  label={(d: { name?: string; value?: number }) => `${d.name} (${d.value})`}
-                  className="cursor-pointer"
-                  onClick={(d: { name?: string; value?: number }) => focus("temperature", d?.name)}
-                >
-                  {temperatureMix.map((t) => (
-                    <Cell key={t.name} fill={TEMP_COLORS[t.name] ?? CHART_COLORS[0]} />
-                  ))}
-                </Pie>
-                <Tooltip contentStyle={{ fontSize: 12 }} />
-              </PieChart>
-            </ResponsiveContainer>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-semibold">Network Sector Exposure</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <ResponsiveContainer width="100%" height={240}>
-              <BarChart
-                data={sectorExposure}
-                layout="vertical"
-                onClick={(s: { activeLabel?: string | number }) => focus("sector", s?.activeLabel)}
-                className="cursor-pointer"
-              >
-                <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" />
-                <XAxis type="number" tick={{ fontSize: 11 }} allowDecimals={false} />
-                <YAxis dataKey="name" type="category" width={120} tick={{ fontSize: 10 }} />
-                <Tooltip
-                  contentStyle={{ fontSize: 12 }}
-                  cursor={{ fill: "var(--color-accent)", opacity: 0.4 }}
-                />
-                <Bar dataKey="count" fill={CHART_COLORS[1]} radius={[0, 4, 4, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-semibold">Events Activity Distribution</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <ResponsiveContainer width="100%" height={240}>
-              <PieChart>
-                <Pie
-                  data={eventsDistribution}
-                  dataKey="value"
-                  nameKey="name"
-                  cx="50%"
-                  cy="50%"
-                  outerRadius={80}
-                  labelLine={false}
-                  className="cursor-pointer"
-                  onClick={(d: { name?: string; value?: number }) => focus("event", d?.name)}
-                >
-                  {eventsDistribution.map((_, idx) => (
-                    <Cell key={idx} fill={CHART_COLORS[idx % CHART_COLORS.length]} />
-                  ))}
-                </Pie>
-                <Tooltip contentStyle={{ fontSize: 12 }} />
-              </PieChart>
-            </ResponsiveContainer>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-semibold">
-              Portfolio Company Exposure{" "}
-              <span className="font-normal text-muted-foreground">· top 12</span>
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <ResponsiveContainer width="100%" height={240}>
+      {/* 07 Portfolio Intelligence */}
+      <section className="space-y-3">
+        <SectionLabel
+          eyebrow="07 · Portfolio intelligence"
+          title="Portfolio company exposure"
+          hint="Top 12 by introductions"
+        />
+        <Card className="border-border/80 shadow-none">
+          <CardContent className="pt-5">
+            <ResponsiveContainer width="100%" height={260}>
               <BarChart
                 data={portCoExposure}
                 onClick={(s: { activeLabel?: string | number }) => focus("portco", s?.activeLabel)}
@@ -507,17 +826,46 @@ function DashboardPage() {
             </ResponsiveContainer>
           </CardContent>
         </Card>
-      </div>
+      </section>
 
-      <ChartBuilder
-        storageKey="venturepulse:dashboard-charts"
-        dims={CONTACT_DIMS}
-        metrics={CONTACT_METRICS}
-        items={filtered}
-        focus={focus}
-      />
+      {/* 08 Recommendations */}
+      <section className="space-y-3">
+        <SectionLabel
+          eyebrow="08 · Recommendations"
+          title="Where to act next"
+          hint="Decay · follow-ups · coverage gaps · concentration"
+        />
+        <RecommendationsBand items={intelligence.recommendations} onAct={handleRecAct} />
+        <NetworkInsights contacts={filtered} transitions={transitions} />
+      </section>
 
-      <NetworkInsights contacts={filtered} transitions={transitions} />
+      {/* 09 Custom Analytics */}
+      <section className="space-y-3">
+        <SectionLabel
+          eyebrow="09 · Custom analytics"
+          title="Build your own cuts"
+          hint="Power users · persisted locally"
+        />
+        <ChartBuilder
+          storageKey="venturepulse:dashboard-charts"
+          dims={CONTACT_DIMS}
+          metrics={CONTACT_METRICS}
+          items={filtered}
+          focus={focus}
+          aiRecommend
+          blockedCharts={[
+            // Curated charts already rendered above — never re-suggest these cuts.
+            { groupBy: "prime", metric: "intros", label: "PortCo Intros by Prime" },
+            { groupBy: "month", metric: "engagements", label: "Intro Activity Velocity" },
+            { groupBy: "month", metric: "intros", label: "Intro Activity Velocity (alt)" },
+            { groupBy: "temperature", metric: "count", label: "Temperature River / mix" },
+            { groupBy: "sector", metric: "count", label: "Thesis Intelligence / Sector Exposure" },
+            { groupBy: "portco", metric: "intros", label: "Portfolio Company Exposure" },
+            { groupBy: "event", metric: "count", label: "Events Activity Distribution" },
+            { groupBy: "event", metric: "events", label: "Events attended by event" },
+          ]}
+        />
+      </section>
 
       <DrillSheet
         open={drillOpen}
@@ -550,9 +898,7 @@ function DashboardPage() {
         }
       >
         {drillGroupBy === "none"
-          ? filtered.map((c) => (
-              <DrillContactRow key={c.id} c={c} onClick={() => openContact(c)} />
-            ))
+          ? filtered.map((c) => <DrillContactRow key={c.id} c={c} onClick={() => openContact(c)} />)
           : drillGroups.map((g) => (
               <div key={g.key} className="space-y-1.5">
                 <div className="flex items-center gap-1.5 px-0.5 pt-1">
@@ -576,12 +922,96 @@ function DashboardPage() {
         onOpenChange={setDetailOpen}
         onContactUpdate={(u) => setSelectedContact(u)}
       />
+
+      <Dialog
+        open={!!selectedRecord}
+        onOpenChange={(o) => {
+          if (!o) setSelectedInvestor(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-2xl">
+          {selectedRecord && (
+            <>
+              <DialogHeader>
+                <DialogTitle className="flex items-center gap-2">
+                  <Landmark className="h-4 w-4 text-primary" /> {selectedRecord.investor}
+                </DialogTitle>
+                <DialogDescription className="flex items-center gap-3 text-xs">
+                  <span>
+                    <b className="text-foreground">{selectedRecord.totalPortcos}</b> portfolio
+                    compan
+                    {selectedRecord.totalPortcos !== 1 ? "ies" : "y"}
+                  </span>
+                  <span>
+                    <b className="text-foreground">{selectedRecord.totalLeads}</b> lead
+                    {selectedRecord.totalLeads !== 1 ? "s" : ""}
+                  </span>
+                  <span>
+                    <b className="text-foreground">{selectedRecord.totalEvents}</b> event
+                    {selectedRecord.totalEvents !== 1 ? "s" : ""}
+                  </span>
+                </DialogDescription>
+              </DialogHeader>
+
+              <div className="max-h-[60vh] overflow-y-auto space-y-2 pr-1">
+                {[...selectedRecord.portcos]
+                  .sort((a, b) => b.leads - a.leads || a.name.localeCompare(b.name))
+                  .map((p) => {
+                    const recentEvents = [...p.events]
+                      .sort((a, b) => (b.date || "").localeCompare(a.date || ""))
+                      .slice(0, 4);
+                    return (
+                      <div key={p.key} className="rounded-lg border border-border p-3">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-sm font-semibold text-foreground truncate">
+                            {p.name}
+                          </span>
+                          <div className="flex items-center gap-2 text-[11px] text-muted-foreground shrink-0">
+                            <span>
+                              {p.leads} lead{p.leads !== 1 ? "s" : ""}
+                            </span>
+                            <span className="text-muted-foreground/40">·</span>
+                            <span>
+                              {p.events.length} event{p.events.length !== 1 ? "s" : ""}
+                            </span>
+                            {p.eventsThisMonth > 0 && (
+                              <>
+                                <span className="text-muted-foreground/40">·</span>
+                                <span className="text-primary font-medium">
+                                  {p.eventsThisMonth} this month
+                                </span>
+                              </>
+                            )}
+                          </div>
+                        </div>
+                        {recentEvents.length > 0 && (
+                          <div className="mt-2 space-y-1">
+                            {recentEvents.map((e) => (
+                              <div
+                                key={e.id}
+                                className="flex items-center gap-2 text-[11px] text-muted-foreground"
+                              >
+                                <Calendar className="h-3 w-3 shrink-0" />
+                                <span className="truncate">{e.name}</span>
+                                <span className="ml-auto shrink-0 text-muted-foreground/70">
+                                  {e.date}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+              </div>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
 
-// #9 — Network progression insights: deterministic transition + recent-add stats
-// always shown; a Claude narrative on demand. All data is Sheets-native.
 function NetworkInsights({
   contacts,
   transitions,
@@ -600,22 +1030,20 @@ function NetworkInsights({
   const { transitionRows, recentAdds, recentCount } = useMemo(() => {
     const cutoff = Date.now() - WINDOW_DAYS * 86_400_000;
 
-    // Aggregate rating transitions within the window.
     const tMap = new Map<string, number>();
     for (const t of transitions) {
       const ms = Date.parse(t.ts);
-      if (!Number.isNaN(ms) && ms < cutoff) continue; // keep within window (or undated)
+      if (!Number.isNaN(ms) && ms < cutoff) continue;
       const key = `${t.from}→${t.to}`;
       tMap.set(key, (tMap.get(key) || 0) + 1);
     }
     const transitionRows = [...tMap.entries()]
       .map(([k, count]) => {
         const [from, to] = k.split("→");
-        return { from, to, count, down: (RANK[to] ?? 0) < (RANK[from] ?? 0) };
+        return { from, to, count, down: (RANK[to!] ?? 0) < (RANK[from!] ?? 0) };
       })
       .sort((a, b) => b.count - a.count);
 
-    // Recently-added breakdown by title / sector / location.
     const recent = contacts.filter((c) => {
       const ms = Date.parse(c.dateAdded || "");
       return !Number.isNaN(ms) && ms >= cutoff;
@@ -671,7 +1099,7 @@ function NetworkInsights({
   const hasData = transitionRows.length > 0 || recentCount > 0;
 
   return (
-    <Card>
+    <Card className="border-border/80 shadow-none">
       <CardHeader className="pb-2 flex flex-row items-center justify-between space-y-0">
         <CardTitle className="text-sm font-semibold flex items-center gap-1.5">
           <TrendingUp className="h-4 w-4 text-primary" /> Network Progression{" "}
@@ -690,7 +1118,7 @@ function NetworkInsights({
             </>
           ) : (
             <>
-              <Sparkles className="h-3 w-3 mr-1" /> Generate insights
+              <Sparkles className="h-3 w-3 mr-1" /> Deepen brief
             </>
           )}
         </Button>
@@ -703,7 +1131,6 @@ function NetworkInsights({
           </p>
         ) : (
           <>
-            {/* Deterministic stats */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
                 <p className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1">
@@ -714,7 +1141,7 @@ function NetworkInsights({
                     {transitionRows.map((t, i) => (
                       <span
                         key={i}
-                        className={`text-[11px] rounded border px-1.5 py-0.5 ${t.down ? "border-red-200 bg-red-50 text-red-700" : "border-emerald-200 bg-emerald-50 text-emerald-700"}`}
+                        className={`text-[11px] rounded border px-1.5 py-0.5 ${t.down ? "border-red-200 bg-red-50 text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300" : "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300"}`}
                       >
                         {t.from}→{t.to}: <span className="font-semibold">{t.count}</span>
                       </span>
@@ -747,7 +1174,6 @@ function NetworkInsights({
               </div>
             </div>
 
-            {/* AI narrative */}
             {insight?.ok && (
               <div className="space-y-2 border-t border-border pt-2.5">
                 {insight.summary && <p className="text-xs text-foreground">{insight.summary}</p>}
@@ -779,34 +1205,6 @@ function NetworkInsights({
             )}
           </>
         )}
-      </CardContent>
-    </Card>
-  );
-}
-
-function KpiCard({
-  icon: Icon,
-  label,
-  value,
-}: {
-  icon: typeof Users;
-  label: string;
-  value: number;
-}) {
-  return (
-    <Card>
-      <CardContent className="p-5">
-        <div className="flex items-center gap-3">
-          <div className="h-9 w-9 rounded-lg bg-primary/10 flex items-center justify-center">
-            <Icon className="h-4 w-4 text-primary" />
-          </div>
-          <div>
-            <p className="text-[10px] uppercase tracking-widest font-semibold text-muted-foreground">
-              {label}
-            </p>
-            <p className="text-2xl font-bold text-foreground">{value}</p>
-          </div>
-        </div>
       </CardContent>
     </Card>
   );

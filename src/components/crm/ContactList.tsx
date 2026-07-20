@@ -2,6 +2,7 @@ import { useState, useMemo, useEffect, useRef } from "react";
 import type { Contact, ContactFilters as Filters } from "@/lib/types";
 import { seniorityOf, departmentOf } from "@/lib/people-classify";
 import { normalizeLocation } from "@/lib/location-utils";
+import { isMyContact, type TeamProfile } from "@/lib/user-ownership";
 import { ContactCard } from "./ContactCard";
 import { ContactTable } from "./ContactTable";
 import { ContactDetail } from "./ContactDetail";
@@ -15,9 +16,22 @@ interface ContactListProps {
   filters: Filters;
   /** When set (e.g. deep-linked from the home page), open this contact's detail. */
   focusEmail?: string;
+  /** Signed-in teammate profile; required when ownershipScope is "mine". */
+  teamProfile?: TeamProfile | null;
+  /** Activity GIDs owned by the signed-in user (from BD/GTM sheets). */
+  ownedGids?: Set<string>;
+  /** True while the ownership index is still loading. */
+  ownershipLoading?: boolean;
 }
 
-export function ContactList({ contacts, filters, focusEmail }: ContactListProps) {
+export function ContactList({
+  contacts,
+  filters,
+  focusEmail,
+  teamProfile: profile,
+  ownedGids,
+  ownershipLoading,
+}: ContactListProps) {
   const [view, setView] = useState<"cards" | "table">("cards");
   const [selectedContact, setSelectedContact] = useState<Contact | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
@@ -25,7 +39,12 @@ export function ContactList({ contacts, filters, focusEmail }: ContactListProps)
   const { setFilteredContacts, clearSelection, setOnBulkUpdate } = useSelection();
 
   const filtered = useMemo(() => {
+    const owned = ownedGids || new Set<string>();
     const result = localContacts.filter((c) => {
+      if (filters.ownershipScope === "mine") {
+        if (!profile) return false;
+        if (!isMyContact(c, owned, profile)) return false;
+      }
       if (filters.search) {
         const q = filters.search.toLowerCase();
         if (
@@ -91,11 +110,29 @@ export function ContactList({ contacts, filters, focusEmail }: ContactListProps)
       if (bt !== at) return bt - at;
       return a.name.localeCompare(b.name);
     });
-  }, [localContacts, filters]);
+  }, [localContacts, filters, profile, ownedGids]);
 
   useEffect(() => {
     setFilteredContacts(filtered);
   }, [filtered, setFilteredContacts]);
+
+  useEffect(() => {
+    setLocalContacts(contacts);
+    // Keep the open Interaction Trail in sync after Sync activity / loader refresh.
+    setSelectedContact((prev) => {
+      if (!prev) return prev;
+      const match = contacts.find(
+        (c) =>
+          c.id === prev.id ||
+          (!!c.urid && !!prev.urid && c.urid === prev.urid) ||
+          (!!c.email &&
+            !!prev.email &&
+            c.email.split(";")[0]?.trim().toLowerCase() ===
+              prev.email.split(";")[0]?.trim().toLowerCase()),
+      );
+      return match || prev;
+    });
+  }, [contacts]);
 
   useEffect(() => {
     setOnBulkUpdate((updatedContacts: Contact[]) => {
@@ -132,11 +169,18 @@ export function ContactList({ contacts, filters, focusEmail }: ContactListProps)
     setSelectedContact(updated);
   };
 
+  const mineEmpty =
+    filters.ownershipScope === "mine" &&
+    !ownershipLoading &&
+    filtered.length === 0 &&
+    localContacts.length > 0;
+
   return (
     <div className="space-y-5">
       <div className="flex items-center justify-between">
         <p className="text-xs text-muted-foreground">
           <span className="font-semibold text-foreground">{filtered.length}</span> contacts
+          {filters.ownershipScope === "mine" ? " in your book" : ""}
         </p>
         <div className="flex items-center gap-1">
           <Button
@@ -161,7 +205,15 @@ export function ContactList({ contacts, filters, focusEmail }: ContactListProps)
         </div>
       </div>
 
-      {view === "cards" ? (
+      {mineEmpty ? (
+        <div className="rounded-lg border border-dashed border-border px-6 py-12 text-center">
+          <p className="text-sm font-medium text-foreground">No contacts attributed to you yet</p>
+          <p className="text-xs text-muted-foreground mt-1.5 max-w-md mx-auto">
+            Run <span className="font-medium">Sync activity</span> so BD/GTM emails and Asana tasks
+            you own land on contacts — or switch the filter to Everyone.
+          </p>
+        </div>
+      ) : view === "cards" ? (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
           {filtered.map((contact) => (
             <ContactCard key={contact.id} contact={contact} onClick={() => handleSelect(contact)} />

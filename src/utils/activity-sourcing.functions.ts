@@ -10,6 +10,7 @@ import {
   fetchSheetTab,
   buildAppEvents,
   APP_EVENT_HEADERS,
+  logOpsEvent,
   TAB_NAMES,
   type InteractionRowInput,
 } from "./sheets.server";
@@ -143,6 +144,7 @@ export const sourceContactsFromActivities = createServerFn({ method: "POST" })
         let company = lp?.company || p.company || data.defaultCompany || "";
         let phone = "";
         let location = "";
+        let linkedin = "";
 
         if (!apolloOff) {
           try {
@@ -154,6 +156,7 @@ export const sourceContactsFromActivities = createServerFn({ method: "POST" })
               if (ap.title) role = ap.title;
               if (ap.company) company = ap.company;
               if (ap.phone) phone = ap.phone;
+              if (ap.linkedinUrl) linkedin = ap.linkedinUrl;
               const loc = [ap.city, ap.state, ap.country].filter(Boolean).join(", ");
               if (loc) location = loc;
               enrichedCount++;
@@ -172,6 +175,7 @@ export const sourceContactsFromActivities = createServerFn({ method: "POST" })
           email: p.email,
           phone,
           location,
+          linkedin,
           prime: "",
           sector: "",
           temperature: "Cold",
@@ -342,8 +346,8 @@ export const sourceContactsFromActivities = createServerFn({ method: "POST" })
         await appendSheetRows(TAB_NAMES.activityConnections, connectionRows);
       }
 
-      return {
-        found: true,
+      const result = {
+        found: true as const,
         peopleCount: people.length,
         createdCount: created.length,
         existingCount,
@@ -357,8 +361,43 @@ export const sourceContactsFromActivities = createServerFn({ method: "POST" })
         connectionsLogged: connectionRows.length,
         created,
       };
+      await logOpsEvent({
+        action: "enrich",
+        source: "activity_sourcing",
+        status: "ok",
+        summary:
+          `Sourced contacts from activities · +${result.createdCount} contacts · ${result.notesLogged} notes` +
+          (result.eventsCreated ? ` · +${result.eventsCreated} events` : ""),
+        records: result.createdCount + result.notesLogged,
+        details: {
+          people: result.peopleCount,
+          created: result.createdCount,
+          existing: result.existingCount,
+          enriched: result.enrichedCount,
+          notes: result.notesLogged,
+          eventsCreated: result.eventsCreated,
+          eventsTagged: result.eventsTagged,
+          connections: result.connectionsLogged,
+          apolloUnavailable: result.apolloUnavailable,
+        },
+        items: [
+          ...created.map((c) => `[contact] ${c}`),
+          ...noteRows.slice(0, 30).map(
+            (r) => `[note] ${r.email} ← ${(r.summary || "").slice(0, 80)}`,
+          ),
+        ],
+      });
+      return result;
     } catch (err) {
       console.error("[activity] sourceContactsFromActivities failed:", err);
-      return { found: false, error: err instanceof Error ? err.message : "Sourcing failed", ...empty };
+      const message = err instanceof Error ? err.message : "Sourcing failed";
+      await logOpsEvent({
+        action: "enrich",
+        source: "activity_sourcing",
+        status: "error",
+        summary: message,
+        records: 0,
+      });
+      return { found: false, error: message, ...empty };
     }
   });

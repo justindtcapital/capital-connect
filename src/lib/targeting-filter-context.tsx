@@ -7,6 +7,11 @@ const defaultFilters: TargetingFilters = {
   sector: "all",
   city: "all",
   origin: "all",
+  title: "",
+  seniority: [],
+  department: [],
+  dateFrom: "",
+  dateTo: "",
 };
 
 interface TargetingFilterContextType {

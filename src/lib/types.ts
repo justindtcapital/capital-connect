@@ -6,12 +6,14 @@ export type Temperature = "Council" | "Hot" | "Warm" | "Cold";
 export type EngagementSource =
   | "direct introduction"
   | "event exposure"
-  | "evangelized during network call";
+  | "evangelized during network call"
+  | "activity interaction";
 
 export const ENGAGEMENT_SOURCES: EngagementSource[] = [
   "direct introduction",
   "event exposure",
   "evangelized during network call",
+  "activity interaction",
 ];
 
 export interface PortCoEngagement {
@@ -110,8 +112,11 @@ export interface Interaction {
   summary: string;
   isFollowUp?: boolean;
   followUpComplete?: boolean;
-  /** e.g. "asana:<gid>" when mirrored from Asana activity sync. */
+  /** Provenance of a synced row: "asana:<gid>" (Asana activity) or
+   *  "gmail-<id>" (BD/GTM alias email). Absent for manual entries. */
   sourceRef?: string;
+  /** DTC teammate who owned the underlying BD/GTM activity (synced Notes). */
+  owner?: string;
 }
 
 /** An interaction synced from Asana (BD/GTM activity) is a read-only mirror. */
@@ -119,11 +124,42 @@ export function isAsanaSourced(i: Pick<Interaction, "sourceRef">): boolean {
   return !!i.sourceRef && i.sourceRef.startsWith("asana:");
 }
 
+/** An interaction synced from a BD/GTM Gmail alias is a read-only mirror. */
+export function isGmailSourced(i: Pick<Interaction, "sourceRef">): boolean {
+  const r = i.sourceRef || "";
+  return r.startsWith("gmail-") || r.startsWith("gmail:");
+}
+
+/** Any externally-synced interaction (Asana or Gmail) — read-only, not user-editable. */
+export function isExternallySourced(i: Pick<Interaction, "sourceRef">): boolean {
+  return isAsanaSourced(i) || isGmailSourced(i);
+}
+
 /** Build the Asana task permalink from an "asana:<gid>" source ref ("" if n/a). */
 export function asanaTaskUrl(sourceRef?: string): string {
   if (!sourceRef || !sourceRef.startsWith("asana:")) return "";
   const gid = sourceRef.slice("asana:".length).trim();
   return gid ? `https://app.asana.com/0/0/${gid}` : "";
+}
+
+/** Build the Gmail message permalink from a "gmail-<id>" / "gmail:<id>" ref ("" if n/a).
+ *  Mirrors the permalink shape produced in gmail.server.ts. */
+export function gmailMessageUrl(sourceRef?: string): string {
+  if (!sourceRef) return "";
+  let id = "";
+  if (sourceRef.startsWith("gmail-")) id = sourceRef.slice("gmail-".length).trim();
+  else if (sourceRef.startsWith("gmail:")) id = sourceRef.slice("gmail:".length).trim();
+  return id ? `https://mail.google.com/mail/u/0/#all/${id}` : "";
+}
+
+/** Provenance badge (label + permalink) for a synced interaction, or null when it's
+ *  a manual entry. Lets the trail label + link each row by where it came from. */
+export function interactionSource(
+  i: Pick<Interaction, "sourceRef">,
+): { label: string; url: string } | null {
+  if (isAsanaSourced(i)) return { label: "Asana", url: asanaTaskUrl(i.sourceRef) };
+  if (isGmailSourced(i)) return { label: "Gmail", url: gmailMessageUrl(i.sourceRef) };
+  return null;
 }
 
 const INTERACTION_TYPES: readonly InteractionType[] = [
@@ -190,7 +226,7 @@ export interface Contact {
   source?: RecordSource;
   /** V2: supporting "why surfaced" reasoning (Sumble technographic context). */
   sourceContext?: string;
-  /** Company tech stack (comma-separated), loaded from Sumble hiring signals. */
+  /** Company tech stack from Sumble — JSON (v1) or legacy comma-separated names. */
   techStack?: string;
 }
 
@@ -212,6 +248,11 @@ export interface ContactFilters {
   /** Geography / city (empty = no filter). */
   location: string[];
   followUpOnly: boolean;
+  /**
+   * When "mine", only show contacts attributed to the signed-in user via
+   * BD/GTM activity ownership. "everyone" is the full book.
+   */
+  ownershipScope: "mine" | "everyone";
   /** Which date the range filters on: when the contact was added, or last activity. */
   dateField: "added" | "activity";
   /** Inclusive lower bound (YYYY-MM-DD); "" = no bound. */
@@ -281,6 +322,15 @@ export interface TargetingFilters {
   sector: string;
   city: string;
   origin: string;
+  /** Title contains (free text). */
+  title: string;
+  /** Seniority levels derived from title (empty = no filter). */
+  seniority: string[];
+  /** Departments derived from title (empty = no filter). */
+  department: string[];
+  /** Date-added range (YYYY-MM-DD); "" = no bound. */
+  dateFrom: string;
+  dateTo: string;
 }
 
 export interface PortfolioEmployee {

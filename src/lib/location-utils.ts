@@ -114,3 +114,7 @@ export function normalizeLocation(raw?: string): string {
 export function canonicalLocations(raw: Array<string | undefined>): string[] {
   return [...new Set(raw.map((r) => normalizeLocation(r)).filter(Boolean))].sort();
 }
+
+/** Curated common metros, offered as suggestions in the location combobox. Free
+ *  text is always allowed — these just cover the duplicate-heavy places. */
+export const COMMON_LOCATIONS: string[] = [...new Set(Object.values(CITY_ALIASES))].sort();

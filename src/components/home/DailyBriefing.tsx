@@ -145,19 +145,14 @@ export function DailyBriefing({
 
   if (!briefing) {
     return (
-      <Card className="border-primary/30 bg-linear-to-br from-primary/5 to-transparent">
+      <Card className="ai-presence border-border">
         <CardContent className="p-5 flex items-center justify-between gap-4 flex-wrap">
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
             <Sparkles className="h-4 w-4 text-primary shrink-0" />
             Generate today's briefing for your prioritized signals, buying windows, and recommended
             actions.
           </div>
-          <Button
-            onClick={onGenerate}
-            disabled={busy}
-            size="sm"
-            className="text-xs bg-(image:--gradient-primary) shadow-(--shadow-elegant) hover:shadow-(--shadow-elegant) hover:brightness-110"
-          >
+          <Button onClick={onGenerate} disabled={busy} size="sm" className="text-xs">
             {busy ? (
               <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
             ) : (
@@ -181,15 +176,13 @@ export function DailyBriefing({
     <div className="space-y-4">
       <div className="flex items-center justify-between gap-3">
         <h2 className="text-sm font-semibold flex items-center gap-1.5">
-          <Sparkles className="h-4 w-4 text-primary" /> Your daily briefing
+          <span className="inline-block w-0.5 h-3.5 bg-primary rounded-full" aria-hidden />
+          Your daily briefing
           <span className="text-[11px] font-normal text-muted-foreground">
             · {relativeTime(Date.parse(briefing.generatedAt))}
           </span>
           {briefing.aiUsed && (
-            <Badge
-              variant="outline"
-              className="text-[9px] bg-primary/5 text-primary border-primary/20"
-            >
+            <Badge variant="outline" className="text-[9px] text-primary border-primary/25">
               AI
             </Badge>
           )}
@@ -210,18 +203,20 @@ export function DailyBriefing({
         </Button>
       </div>
 
-      {/* Executive summary + stats */}
-      <Card className="bg-(image:--gradient-primary) text-primary-foreground border-0 shadow-(--shadow-elegant)">
+      {/* Executive summary — editorial, not gradient theatre */}
+      <Card className="ai-presence border-border">
         <CardContent className="p-5">
-          <p className="text-base leading-relaxed font-medium">{briefing.summary}</p>
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-4">
+          <p className="text-base leading-relaxed text-foreground font-medium">{briefing.summary}</p>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-4 pt-4 border-t border-border">
             {stats.map((s) => (
-              <div key={s.label} className="rounded-lg bg-white/10 px-3 py-2">
-                <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider opacity-80">
+              <div key={s.label} className="px-1 py-1">
+                <div className="flex items-center gap-1.5 text-[10px] font-medium text-muted-foreground tracking-wide">
                   <s.icon className="h-3 w-3" />
                   {s.label}
                 </div>
-                <div className="text-xl font-bold tabular-nums leading-none mt-1">{s.value}</div>
+                <div className="text-xl font-semibold tabular-nums leading-none mt-1.5 text-foreground">
+                  {s.value}
+                </div>
               </div>
             ))}
           </div>

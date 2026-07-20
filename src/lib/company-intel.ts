@@ -144,12 +144,13 @@ function emailDomainOf(email?: string): string {
 }
 
 // Last-resort logo domain from the company name (e.g. "Salesforce" → salesforce.com).
-// Marked low-confidence: good enough to try Clearbit, never trusted for a favicon.
+// Marked low-confidence: good enough to try Logo.dev / DDG, never trusted alone.
 function guessDomain(name: string): string {
+  // Keep "labs" — brandlabs.com is common; stripping yields the wrong host.
   const slug = name
     .toLowerCase()
     .replace(/&/g, "and")
-    .replace(/\b(inc|llc|ltd|corp|co|company|technologies|labs?|holdings)\b/g, "")
+    .replace(/\b(inc|llc|ltd|corp|co|company|technologies|holdings)\b/g, "")
     .replace(/[^a-z0-9]/g, "");
   return slug ? `${slug}.com` : "";
 }
@@ -412,7 +413,7 @@ export function buildCompanyDirectory(input: CompanyDirectoryInput): CompanyInte
 
     // Backfill a logo domain so EVERY company gets a logo. Prefer a real
     // corporate email domain from a related person; else guess from the name
-    // (low-confidence → the UI only tries Clearbit, never a stray favicon).
+    // (low-confidence → cautious logo ladder in the UI).
     if (!e.logoDomain) {
       for (const p of e.people) {
         const d = emailDomainOf(p.email);

@@ -67,7 +67,9 @@ function norm(s?: string): string {
 // Local segment bucketer (mirrors signal-feed.bucketOf — duplicated to avoid a
 // circular import). Portfolio domains and inferred segments collapse to 4 buckets.
 function bucket(s: string): string {
-  return s === "AI" || s === "Data" || s === "Security" ? s : "Other";
+  if (s === "AI" || s === "Data" || s === "Security") return s;
+  if (s === "Supply Chain" || s === "Logistics") return "Supply Chain";
+  return "Other";
 }
 
 // Loose company-name match: normalized equality, or one clearly contains the
@@ -174,15 +176,20 @@ export function makeScorer(
       confLevel = "Low";
       confReason = "No verified source link — points to a web search.";
     } else if (
-      card.sourceType === "Public News Articles" ||
-      card.sourceType === "Press Release" ||
-      card.sourceType === "Email"
+      card.sourceType === "PortCo News" ||
+      card.sourceType === "Industry News" ||
+      card.sourceType === "PortCo Blogs"
     ) {
       confLevel = "High";
       confReason = `Grounded in a real ${card.sourceType.toLowerCase()} link.`;
     } else if (card.sourceType === "LinkedIn") {
       confLevel = "High";
       confReason = "First-party LinkedIn post.";
+    } else if (card.sourceType === "Industry Reports" && card.category === "Thought Leadership") {
+      // Blog/article cards (e.g. exploded from a link-digest email) carry a
+      // real first-party URL — sourceIsSearch was already ruled out above.
+      confLevel = "High";
+      confReason = "Grounded in a real blog/article link.";
     } else {
       confLevel = "Medium";
       confReason = "Secondary/analysis source.";

@@ -14,18 +14,27 @@
 // maxOutputTokens = answerTokens + thinkingBudget on every call (see genConfig).
 
 import { GoogleAuth } from "google-auth-library";
+import { getVertexProject, getVertexLocation, getServiceAccountJson } from "./google.server";
 
 export const GEMINI_MODEL = "gemini-2.5-flash";
 
-const VERTEX_PROJECT = process.env.GOOGLE_CLOUD_PROJECT || "";
-const VERTEX_LOCATION = process.env.GEMINI_LOCATION || "us-central1";
+const VERTEX_PROJECT = getVertexProject();
+const VERTEX_LOCATION = getVertexLocation();
 
 export function isGeminiConfigured(): boolean {
   return Boolean(VERTEX_PROJECT);
 }
 
 function vertexUrl(model: string): string {
-  return `https://${VERTEX_LOCATION}-aiplatform.googleapis.com/v1/projects/${VERTEX_PROJECT}/locations/${VERTEX_LOCATION}/publishers/google/models/${model}:generateContent`;
+  // GEMINI_LOCATION=global routes to Google's global endpoint (no region prefix
+  // on the host) — recommended for gemini-2.5 models: capacity is pooled across
+  // regions, which avoids the regional dynamic-shared-quota 429 storms a single
+  // region (e.g. us-central1) hits under load.
+  const host =
+    VERTEX_LOCATION === "global"
+      ? "aiplatform.googleapis.com"
+      : `${VERTEX_LOCATION}-aiplatform.googleapis.com`;
+  return `https://${host}/v1/projects/${VERTEX_PROJECT}/locations/${VERTEX_LOCATION}/publishers/google/models/${model}:generateContent`;
 }
 
 // Cached GoogleAuth client — discovers credentials via ADC and refreshes tokens
@@ -46,12 +55,33 @@ function parseServiceAccountJson(raw: string): Record<string, unknown> {
     let esc = false;
     for (const ch of trimmed) {
       if (inStr) {
-        if (esc) { out += ch; esc = false; continue; }
-        if (ch === "\\") { out += ch; esc = true; continue; }
-        if (ch === '"') { out += ch; inStr = false; continue; }
-        if (ch === "\n") { out += "\\n"; continue; }
-        if (ch === "\r") { out += "\\r"; continue; }
-        if (ch === "\t") { out += "\\t"; continue; }
+        if (esc) {
+          out += ch;
+          esc = false;
+          continue;
+        }
+        if (ch === "\\") {
+          out += ch;
+          esc = true;
+          continue;
+        }
+        if (ch === '"') {
+          out += ch;
+          inStr = false;
+          continue;
+        }
+        if (ch === "\n") {
+          out += "\\n";
+          continue;
+        }
+        if (ch === "\r") {
+          out += "\\r";
+          continue;
+        }
+        if (ch === "\t") {
+          out += "\\t";
+          continue;
+        }
         out += ch;
       } else {
         if (ch === '"') inStr = true;
@@ -64,7 +94,7 @@ function parseServiceAccountJson(raw: string): Record<string, unknown> {
 
 async function getVertexToken(): Promise<string> {
   if (!vertexAuth) {
-    const credsJson = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
+    const credsJson = getServiceAccountJson();
     const opts: ConstructorParameters<typeof GoogleAuth>[0] = {
       scopes: "https://www.googleapis.com/auth/cloud-platform",
     };
@@ -73,21 +103,29 @@ async function getVertexToken(): Promise<string> {
         const creds = parseServiceAccountJson(credsJson) as { private_key?: string };
         // Normalize literal "\n" sequences in the private_key that some UIs
         // strip newlines from — the PEM MUST have real newlines to decode.
-        if (creds.private_key && !creds.private_key.includes("\n") && creds.private_key.includes("\\n")) {
+        if (
+          creds.private_key &&
+          !creds.private_key.includes("\n") &&
+          creds.private_key.includes("\\n")
+        ) {
           creds.private_key = creds.private_key.replace(/\\n/g, "\n");
         }
         (opts as { credentials?: unknown }).credentials = creds;
       } catch (e) {
-        throw new Error(`GOOGLE_APPLICATION_CREDENTIALS_JSON is not valid JSON: ${e instanceof Error ? e.message : String(e)}`);
+        throw new Error(
+          `GOOGLE_APPLICATION_CREDENTIALS_JSON is not valid JSON: ${e instanceof Error ? e.message : String(e)}`,
+        );
       }
     }
     vertexAuth = new GoogleAuth(opts);
   }
   const token = await vertexAuth.getAccessToken();
-  if (!token) throw new Error("Could not obtain a Google Cloud access token — set GOOGLE_APPLICATION_CREDENTIALS_JSON to a service-account key JSON");
+  if (!token)
+    throw new Error(
+      "Could not obtain a Google Cloud access token — set GOOGLE_APPLICATION_CREDENTIALS_JSON to a service-account key JSON",
+    );
   return token;
 }
-
 
 // ── Wire types (subset of the Gemini REST shape we use) ──────────
 // JSON value type — kept serializable so GeminiContent can round-trip through a
@@ -116,7 +154,11 @@ export interface GeminiResponse {
 }
 
 // Size the output budget so thinking can't starve the visible answer.
-function genConfig(answerTokens: number, thinkingBudget = 1024, extra: Record<string, unknown> = {}) {
+function genConfig(
+  answerTokens: number,
+  thinkingBudget = 1024,
+  extra: Record<string, unknown> = {},
+) {
   return {
     maxOutputTokens: answerTokens + thinkingBudget,
     thinkingConfig: { thinkingBudget },
@@ -128,14 +170,103 @@ type GeminiCallResult =
   | { ok: true; data: GeminiResponse }
   | { ok: false; status: number; error: string };
 
-// Low-level call with transient-429 retry. Returns a result union (never throws
-// for HTTP errors) so JSON callers can degrade gracefully.
+// ── Global Vertex rate limiter ───────────────────────────────────
+// Every Gemini call funnels through callGeminiRaw. We serialize requests and
+// space them out so bursts (signals scan, smart-paste, Query agent loops)
+// cannot exhaust RPM/TPM quotas. Slow is fine; 429 storms are not.
+//
+// Env (optional):
+//   VERTEX_MIN_INTERVAL_MS — minimum gap between request *starts* (default 4000)
+//   VERTEX_MAX_RETRIES     — 429 retry attempts (default 8)
+
+function envInt(name: string, fallback: number, min: number, max: number): number {
+  const n = Number(process.env[name]);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(n)));
+}
+
+const VERTEX_MIN_INTERVAL_MS = envInt("VERTEX_MIN_INTERVAL_MS", 4000, 500, 120_000);
+const VERTEX_MAX_RETRIES = envInt("VERTEX_MAX_RETRIES", 8, 1, 20);
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Serial queue: one Vertex call at a time, with a minimum gap after each finishes.
+ *  After any 429 it enters an adaptive "slow mode": queued calls pre-space at a
+ *  wider interval for a few minutes (escalating on repeat 429s) so a burst like
+ *  the exec brief's 7 calls stops slamming into the same exhausted quota. */
+class VertexRateLimiter {
+  private tail: Promise<unknown> = Promise.resolve();
+  private lastEndMs = 0;
+  private slowUntilMs = 0;
+  private slowIntervalMs = 0;
+
+  /** Report a 429 — widens the pacing for the next few minutes. */
+  reportRateLimited(): void {
+    const base = Math.max(VERTEX_MIN_INTERVAL_MS, 15_000);
+    this.slowIntervalMs =
+      Date.now() < this.slowUntilMs
+        ? Math.min(60_000, Math.round(Math.max(this.slowIntervalMs, base) * 1.5))
+        : base;
+    this.slowUntilMs = Date.now() + 3 * 60_000;
+  }
+
+  private intervalMs(): number {
+    return Date.now() < this.slowUntilMs ? this.slowIntervalMs : VERTEX_MIN_INTERVAL_MS;
+  }
+
+  run<T>(fn: () => Promise<T>): Promise<T> {
+    const job = this.tail.then(async () => {
+      const wait = Math.max(0, this.intervalMs() - (Date.now() - this.lastEndMs));
+      if (wait > 0) await sleep(wait);
+      try {
+        return await fn();
+      } finally {
+        this.lastEndMs = Date.now();
+      }
+    });
+    // Keep the chain alive even when a job fails.
+    this.tail = job.then(
+      () => undefined,
+      () => undefined,
+    );
+    return job;
+  }
+}
+
+const vertexLimiter = new VertexRateLimiter();
+
+/** Backoff for 429: honor Retry-After when present, else grow aggressively. */
+function retryAfterMs(res: Response, attempt: number): number {
+  const header = res.headers.get("retry-after");
+  if (header) {
+    const sec = Number(header);
+    if (Number.isFinite(sec) && sec > 0) return Math.min(180_000, sec * 1000);
+    const when = Date.parse(header);
+    if (!Number.isNaN(when)) return Math.min(180_000, Math.max(0, when - Date.now()));
+  }
+  // 15s, 30s, 60s, 90s… capped at 120s
+  return Math.min(120_000, 15_000 * attempt);
+}
+
+// Low-level call with global pacing + generous 429 retry. Returns a result
+// union (never throws for HTTP errors) so JSON callers can degrade gracefully.
 async function callGeminiRaw(
   body: Record<string, unknown>,
   model = GEMINI_MODEL,
-  maxAttempts = 3,
+  maxAttempts = VERTEX_MAX_RETRIES,
 ): Promise<GeminiCallResult> {
-  if (!VERTEX_PROJECT) return { ok: false, status: 0, error: "GOOGLE_CLOUD_PROJECT is not configured" };
+  return vertexLimiter.run(() => callGeminiRawUngated(body, model, maxAttempts));
+}
+
+async function callGeminiRawUngated(
+  body: Record<string, unknown>,
+  model: string,
+  maxAttempts: number,
+): Promise<GeminiCallResult> {
+  if (!VERTEX_PROJECT)
+    return { ok: false, status: 0, error: "GOOGLE_CLOUD_PROJECT is not configured" };
 
   let token: string;
   try {
@@ -164,7 +295,11 @@ async function callGeminiRaw(
         body: JSON.stringify(body),
       });
     } catch (err) {
-      return { ok: false, status: 0, error: err instanceof Error ? err.message : "Request to Vertex AI failed" };
+      return {
+        ok: false,
+        status: 0,
+        error: err instanceof Error ? err.message : "Request to Vertex AI failed",
+      };
     }
 
     if (res.ok) {
@@ -183,11 +318,30 @@ async function callGeminiRaw(
       /* ignore */
     }
 
-    // 429 = RESOURCE_EXHAUSTED (quota / rate limit). Back off and retry.
+    // 429 = RESOURCE_EXHAUSTED. Wait longer and retry — prefer delay over failure.
     if (res.status === 429 && attempt < maxAttempts) {
-      const retryAfter = Number(res.headers.get("retry-after")) || attempt * 15;
-      await new Promise((r) => setTimeout(r, Math.min(60, retryAfter) * 1000));
+      // A per-day/exhausted-billing quota will not clear on retry — fail fast
+      // with the quota name instead of hanging through 8 backoffs.
+      if (/per day|daily/i.test(detail)) {
+        console.error(`[vertex] daily quota exhausted — not retrying: ${detail}`);
+        return { ok: false, status: 429, error: detail };
+      }
+      vertexLimiter.reportRateLimited();
+      const waitMs = retryAfterMs(res, attempt);
+      // Include Vertex's own message — it names WHICH quota was hit (project
+      // RPM/TPM vs regional shared capacity), which decides the right fix.
+      console.warn(
+        `[vertex] rate limited (429), backing off ${Math.round(waitMs / 1000)}s ` +
+          `(attempt ${attempt}/${maxAttempts}) — ${detail}`,
+      );
+      await sleep(waitMs);
       lastError = detail;
+      // Refresh token in case the wait was long.
+      try {
+        token = await getVertexToken();
+      } catch {
+        /* keep previous token */
+      }
       continue;
     }
     return { ok: false, status: res.status, error: lastError || detail };
@@ -278,7 +432,9 @@ function buildPrompt(input: EmailDraftInput): string {
     for (const h of input.history.slice(0, 6)) lines.push(`- ${h}`);
   }
   lines.push("");
-  lines.push(`Sender: ${input.senderName || "[Your name]"}${input.senderOrg ? `, ${input.senderOrg}` : ""}`);
+  lines.push(
+    `Sender: ${input.senderName || "[Your name]"}${input.senderOrg ? `, ${input.senderOrg}` : ""}`,
+  );
   return lines.join("\n");
 }
 
@@ -295,7 +451,8 @@ Rules:
 The body should use real newlines (\\n) between paragraphs.`;
 
 export async function draftEmail(input: EmailDraftInput): Promise<EmailDraftResult> {
-  if (!isGeminiConfigured()) return { found: false, error: "GOOGLE_CLOUD_PROJECT is not configured" };
+  if (!isGeminiConfigured())
+    return { found: false, error: "GOOGLE_CLOUD_PROJECT is not configured" };
 
   const r = await callGeminiRaw({
     systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
@@ -307,10 +464,17 @@ export async function draftEmail(input: EmailDraftInput): Promise<EmailDraftResu
   const text = responseText(r.data);
   if (!text) return { found: false, error: "Gemini returned an empty response" };
 
-  const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+  const cleaned = text
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "")
+    .trim();
   try {
     const parsed = JSON.parse(cleaned) as { subject?: string; body?: string };
-    return { found: true, subject: (parsed.subject || "").trim(), body: (parsed.body || "").trim() };
+    return {
+      found: true,
+      subject: (parsed.subject || "").trim(),
+      body: (parsed.body || "").trim(),
+    };
   } catch {
     return { found: true, subject: "", body: text };
   }
@@ -329,14 +493,20 @@ export async function callGeminiJSON<T>(
   system: string,
   user: string,
   maxTokens = 2000,
+  opts?: { maxAttempts?: number },
 ): Promise<GeminiJSONResult<T>> {
-  if (!isGeminiConfigured()) return { ok: false, error: "GOOGLE_CLOUD_PROJECT is not configured", errorCode: "no_key" };
+  if (!isGeminiConfigured())
+    return { ok: false, error: "GOOGLE_CLOUD_PROJECT is not configured", errorCode: "no_key" };
 
-  const r = await callGeminiRaw({
-    systemInstruction: { parts: [{ text: system }] },
-    contents: [{ role: "user", parts: [{ text: user }] }],
-    generationConfig: genConfig(maxTokens, 1024, { responseMimeType: "application/json" }),
-  });
+  const r = await callGeminiRaw(
+    {
+      systemInstruction: { parts: [{ text: system }] },
+      contents: [{ role: "user", parts: [{ text: user }] }],
+      generationConfig: genConfig(maxTokens, 1024, { responseMimeType: "application/json" }),
+    },
+    GEMINI_MODEL,
+    opts?.maxAttempts ?? VERTEX_MAX_RETRIES,
+  );
   if (!r.ok) return { ok: false, error: r.error, errorCode: codeFor(r.status) };
 
   const text = responseText(r.data);
@@ -419,6 +589,14 @@ export interface SignalRecommendation {
   timing: string;
   /** Date this signal was stored (YYYY-MM-DD), for the feed's relative time. */
   dateFound?: string;
+  /** Persisted source-type bucket (from the taxonomy) — set on stored signals. */
+  sourceType?: string;
+  /** Durable link to a saved Drive doc/PDF for this signal, when one exists. */
+  docUrl?: string;
+  /** Stored-signal ID, for lazy-loading the Body via fetchSignalBody. */
+  storedId?: string;
+  /** Whether a (possibly elided) Body exists for this signal. */
+  hasBody?: boolean;
 }
 
 export interface SignalAwarenessItem {
@@ -426,9 +604,16 @@ export interface SignalAwarenessItem {
   person?: string;
   category: string;
   summary: string;
+  /** Article/post title when the signal is a specific piece (e.g. a digest-email
+   *  blog link) — the feed uses it as the card headline instead of company—category. */
+  title?: string;
   sourceUrl?: string;
   /** Date this signal was stored (YYYY-MM-DD), for the feed's relative time. */
   dateFound?: string;
+  /** Persisted source-type bucket (from the taxonomy) — set on stored signals. */
+  sourceType?: string;
+  /** Durable link to a saved Drive doc/PDF for this signal, when one exists. */
+  docUrl?: string;
 }
 
 export interface SignalScanResult {
@@ -464,7 +649,9 @@ Sort recommendations by relevance then urgency (highest first) and include at mo
 
 function buildSignalPrompt(input: SignalScanInput): string {
   const lines: string[] = [];
-  lines.push(`News window: the last ${input.windowDays} days. Today's context: treat anything older as stale.`);
+  lines.push(
+    `News window: the last ${input.windowDays} days. Today's context: treat anything older as stale.`,
+  );
   lines.push("");
   lines.push("PORTFOLIO COMPANIES (primary search targets):");
   for (const p of input.portcos) {
@@ -482,16 +669,20 @@ function buildSignalPrompt(input: SignalScanInput): string {
   lines.push("");
   lines.push("NETWORK PEOPLE (attribution pool — Name | Company | sector | email):");
   for (const person of input.people) {
-    lines.push(`- ${person.name} | ${person.company || ""} | ${person.sector || ""} | ${person.email || ""}`);
+    lines.push(
+      `- ${person.name} | ${person.company || ""} | ${person.sector || ""} | ${person.email || ""}`,
+    );
   }
   if (input.documents && input.documents.length > 0) {
     lines.push("");
-    lines.push("INTERNAL DOCUMENTS (attached PDFs from the team's shared drive — trusted first-party context):");
+    lines.push(
+      "INTERNAL DOCUMENTS (attached PDFs from the team's shared drive — trusted first-party context):",
+    );
     for (const d of input.documents) {
       lines.push(`- ${d.name}${d.link ? ` (link: ${d.link})` : ""}`);
     }
     lines.push(
-      "When a signal is grounded in one of these documents rather than a web result, set its sourceUrl to the document's link above (or leave it blank if none).",
+      "These documents are ALREADY attached to this message as inline PDFs — read them from the attachments. Do NOT attempt to fetch/browse the Drive links; they require authentication and are provided ONLY for citation. When a signal is grounded in one of these documents rather than a web result, set its sourceUrl to the document's link above (or leave it blank if none).",
     );
   }
   if (input.articles && input.articles.length > 0) {
@@ -500,7 +691,9 @@ function buildSignalPrompt(input: SignalScanInput): string {
       "REAL NEWS ARTICLES — these are your ONLY allowed web sources. Do NOT perform web search and do NOT invent URLs. Every signal you report MUST be grounded in one of these articles, and its sourceUrl MUST be that article's EXACT url copied verbatim from the list. Ignore articles that aren't genuinely relevant.",
     );
     for (const a of input.articles) {
-      lines.push(`- [${a.company}] "${a.title}"${a.source ? ` — ${a.source}` : ""}${a.publishedAt ? ` (${a.publishedAt.slice(0, 10)})` : ""}\n  url: ${a.url}\n  ${a.description}`);
+      lines.push(
+        `- [${a.company}] "${a.title}"${a.source ? ` — ${a.source}` : ""}${a.publishedAt ? ` (${a.publishedAt.slice(0, 10)})` : ""}\n  url: ${a.url}\n  ${a.description}`,
+      );
     }
   }
   if (input.emailLinks && input.emailLinks.length > 0) {
@@ -600,7 +793,8 @@ function repairJson(raw: string): string | null {
 
 export async function scanSignals(input: SignalScanInput): Promise<SignalScanResult> {
   const empty = { recommendations: [], otherSignals: [], compliance: [] };
-  if (!isGeminiConfigured()) return { found: false, error: "GOOGLE_CLOUD_PROJECT is not configured", ...empty };
+  if (!isGeminiConfigured())
+    return { found: false, error: "GOOGLE_CLOUD_PROJECT is not configured", ...empty };
 
   // User parts: the text prompt + any shared-drive PDFs as inline document parts.
   const docs = input.documents ?? [];
@@ -651,7 +845,8 @@ export async function scanSignals(input: SignalScanInput): Promise<SignalScanRes
   }
 
   const candidate = extractJsonObject(text);
-  if (!candidate) return { found: false, error: "Gemini did not return parseable JSON", raw: text, ...empty };
+  if (!candidate)
+    return { found: false, error: "Gemini did not return parseable JSON", raw: text, ...empty };
   // Prefer a clean parse; if the payload was truncated/malformed, repair it
   // (close open braces, drop the half-written trailing element) before giving up.
   const json = (() => {
@@ -680,14 +875,20 @@ export async function scanSignals(input: SignalScanInput): Promise<SignalScanRes
     // (and grounding redirects expire), so blank them — the UI uses a search link.
     // Real URLs we supplied (NewsAPI articles + email links) may be cited; anything
     // else the model writes is treated as fabricated and blanked (UI search fallback).
-    const allowed = new Set<string>([...(input.articles || []).map((a) => a.url), ...(input.emailLinks || []).map((l) => l.url)]);
+    const allowed = new Set<string>([
+      ...(input.articles || []).map((a) => a.url),
+      ...(input.emailLinks || []).map((l) => l.url),
+    ]);
     const fixUrl = (u?: string) => (u && allowed.has(u) ? u : "");
     const recommendations = (parsed.recommendations || [])
       .filter((rec) => (rec.relevance ?? 0) >= 7)
       .sort((a, b) => (b.relevance ?? 0) - (a.relevance ?? 0))
       .slice(0, 10)
       .map((rec) => ({ ...rec, sourceUrl: fixUrl(rec.sourceUrl) }));
-    const otherSignals = (parsed.otherSignals || []).map((s) => ({ ...s, sourceUrl: fixUrl(s.sourceUrl) }));
+    const otherSignals = (parsed.otherSignals || []).map((s) => ({
+      ...s,
+      sourceUrl: fixUrl(s.sourceUrl),
+    }));
     return {
       found: true,
       recommendations,

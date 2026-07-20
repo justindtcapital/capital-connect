@@ -1,0 +1,25 @@
+# Credentials — never commit these.
+#
+# Nothing here is read by Apps Script at runtime (it has no filesystem).
+# The Vertex service account key belongs in Script Properties as
+# VERTEX_SA_KEY. If you keep a local copy of the key file, these patterns
+# stop it reaching a remote.
+.env
+.env.*
+*-key.json
+*key*.json
+*credentials*.json
+*service-account*.json
+*-sa.json
+client_secret*.json
+
+# The Apps Script manifest is not a secret and must be pushed.
+!appsscript.json
+
+# clasp
+.clasp.json
+.clasprc.json
+
+# Python leftovers
+.venv/
+__pycache__/

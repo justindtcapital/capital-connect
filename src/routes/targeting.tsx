@@ -1,4 +1,4 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, useRouter } from "@tanstack/react-router";
 import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import { useFilterOptions } from "@/lib/filter-options-context";
 import { enrichContact } from "@/utils/apollo.functions";
@@ -35,6 +35,7 @@ import {
   Copy,
   CheckCircle2,
   Trash2,
+  Wrench,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -44,6 +45,7 @@ import {
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -95,11 +97,19 @@ import {
   logTargetOutreach,
   saveTargetConnectionStrategy,
   updateTargetFields,
+  bulkUpdateTargetFields,
+  bulkResearchTargets,
   bulkDeleteTargets,
+  repairTargetUrids,
+  addTarget,
 } from "@/utils/sheets.functions";
+import { promoteTargetsToCrm } from "@/utils/target-crm.functions";
 import { NetworkBuilderDialog } from "@/components/crm/NetworkBuilderDialog";
 import { NetworkFinderDialog } from "@/components/crm/NetworkFinderDialog";
 import { TargetAccountsDialog } from "@/components/crm/TargetAccountsDialog";
+import { FindCompaniesDialog } from "@/components/crm/FindCompaniesDialog";
+import { TargetPasteDialog } from "@/components/crm/TargetPasteDialog";
+import { TargetUploadDialog } from "@/components/crm/TargetUploadDialog";
 import { EmailDraftDialog } from "@/components/crm/EmailDraftDialog";
 import {
   type TargetLead,
@@ -112,6 +122,7 @@ import {
   RECORD_SOURCES,
 } from "@/lib/types";
 import { useTargetingFilters } from "@/lib/targeting-filter-context";
+import { seniorityOf, departmentOf } from "@/lib/people-classify";
 import { useTargetSelection } from "@/lib/target-selection-context";
 import { connectionStrategy, type ConnectionStrategy } from "@/utils/insights.functions";
 
@@ -200,7 +211,16 @@ function targetToContact(target: TargetLead): Contact {
 }
 
 // Sortable target columns (mirrors the Network table's sortable headers).
-type TSortKey = "name" | "company" | "stage" | "location" | "intel";
+type TSortKey =
+  | "name"
+  | "title"
+  | "company"
+  | "stage"
+  | "location"
+  | "sector"
+  | "source"
+  | "dateAdded"
+  | "intel";
 const STAGE_RANK: Record<PipelineStage, number> = {
   Prospecting: 1,
   Researching: 2,
@@ -209,21 +229,33 @@ const STAGE_RANK: Record<PipelineStage, number> = {
 };
 const TARGET_COLUMNS: { key: TSortKey; label: string }[] = [
   { key: "name", label: "Target Name" },
+  { key: "title", label: "Title" },
   { key: "company", label: "Company" },
   { key: "stage", label: "Stage" },
   { key: "location", label: "Location" },
+  { key: "sector", label: "Sector" },
+  { key: "source", label: "Source" },
+  { key: "dateAdded", label: "Date Added" },
   { key: "intel", label: "Intel" },
 ];
 function targetSortValue(t: TargetLead, key: TSortKey): string | number {
   switch (key) {
     case "name":
       return t.name.toLowerCase();
+    case "title":
+      return (t.title || "").toLowerCase();
     case "company":
       return t.company.toLowerCase();
     case "stage":
       return STAGE_RANK[t.stage] ?? 0;
     case "location":
       return (t.location || "").toLowerCase();
+    case "sector":
+      return (t.sector || "").toLowerCase();
+    case "source":
+      return (t.originSource || "").toLowerCase();
+    case "dateAdded":
+      return Date.parse(t.dateAdded || "") || 0;
     case "intel":
       return t.outreach.length;
   }
@@ -235,13 +267,20 @@ function TargetCard({ target, onClick }: { target: TargetLead; onClick: () => vo
   const primaryEmail = target.email?.split(";")[0]?.trim() || target.email;
   return (
     <Card
-      className="cursor-pointer transition-all duration-200 hover:-translate-y-0.5 hover:shadow-(--shadow-elegant) hover:border-primary/40 border-border h-full flex flex-col"
+      className="cursor-pointer surface-hover border-border h-full flex flex-col"
       onClick={onClick}
     >
       <CardContent className="p-5 flex flex-col flex-1">
         <div className="flex items-start justify-between gap-2 mb-3">
           <div className="flex items-center gap-3 min-w-0">
-            <ContactAvatar contact={{ name: target.name, email: target.email }} size="md" />
+            <ContactAvatar
+              contact={{
+                name: target.name,
+                email: target.email,
+                company: target.company,
+              }}
+              size="md"
+            />
             <div className="min-w-0">
               <h3 className="text-sm font-semibold text-foreground truncate">{target.name}</h3>
               <div className="flex items-center gap-1 text-xs text-muted-foreground">
@@ -325,13 +364,23 @@ function TargetingPage() {
     clearSelection,
     setFilteredTargets,
     setOnBulkUpdate,
+    setOnBulkResearch,
+    researching,
+    setResearching,
   } = useTargetSelection();
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [deletingTargets, setDeletingTargets] = useState(false);
+  const [promotingCrm, setPromotingCrm] = useState(false);
   const { updateOptions } = useFilterOptions();
+  const router = useRouter();
   const loaderData = Route.useLoaderData();
   const [targets, setTargets] = useState<TargetLead[]>(loaderData.targets);
   const companies = loaderData.companies;
+
+  // Keep local list in sync when the loader refreshes after sheet writes.
+  useEffect(() => {
+    setTargets(loaderData.targets);
+  }, [loaderData.targets]);
 
   useEffect(() => {
     const targetSectors = [...new Set(targets.map((t) => t.sector).filter(Boolean))].sort();
@@ -345,7 +394,10 @@ function TargetingPage() {
   const [networkBuilderOpen, setNetworkBuilderOpen] = useState(false);
   const [finderOpen, setFinderOpen] = useState(false);
   const [accountsOpen, setAccountsOpen] = useState(false);
+  const [findCompaniesOpen, setFindCompaniesOpen] = useState(false);
   const [bulkImportOpen, setBulkImportOpen] = useState(false);
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [uploadOpen, setUploadOpen] = useState(false);
   const [logAttemptOpen, setLogAttemptOpen] = useState(false);
   const [emailDraftOpen, setEmailDraftOpen] = useState(false);
   const [editing, setEditing] = useState(false);
@@ -358,6 +410,7 @@ function TargetingPage() {
   const [newLocation, setNewLocation] = useState("");
   // New targets are manual by default; source is a constrained enum.
   const [newOrigin, setNewOrigin] = useState<string>("Manual Entry");
+  const [newTargetSaving, setNewTargetSaving] = useState(false);
 
   // Bulk import — defaults to the canonical "CSV Import" source.
   const [bulkText, setBulkText] = useState("");
@@ -393,6 +446,25 @@ function TargetingPage() {
       if (filters.sector !== "all" && t.sector !== filters.sector) return false;
       if (filters.city !== "all" && t.location !== filters.city) return false;
       if (filters.origin !== "all" && t.originSource !== filters.origin) return false;
+      if (filters.title && !t.title.toLowerCase().includes(filters.title.toLowerCase()))
+        return false;
+      if (filters.seniority.length && !filters.seniority.includes(seniorityOf(t.title)))
+        return false;
+      if (filters.department.length && !filters.department.includes(departmentOf(t.title)))
+        return false;
+      if (filters.dateFrom || filters.dateTo) {
+        const value = Date.parse(t.dateAdded || "");
+        if (Number.isNaN(value)) return false; // no usable date → exclude when a bound is set
+        if (filters.dateFrom) {
+          const from = Date.parse(filters.dateFrom);
+          if (!Number.isNaN(from) && value < from) return false;
+        }
+        if (filters.dateTo) {
+          // Include the whole "to" day by pushing the bound to end-of-day.
+          const to = Date.parse(filters.dateTo);
+          if (!Number.isNaN(to) && value > to + 86_399_999) return false;
+        }
+      }
       return true;
     });
   }, [targets, filters]);
@@ -412,6 +484,33 @@ function TargetingPage() {
     }
   }, []);
 
+  const [repairing, setRepairing] = useState(false);
+
+  // Backfill missing / de-duplicate stable URIDs on the Targets sheet, then re-pull
+  // so every row is uniquely keyable (fixes selection/edit/delete on legacy rows).
+  const handleRepairIds = useCallback(async () => {
+    if (repairing) return;
+    setRepairing(true);
+    try {
+      const res = await repairTargetUrids();
+      if (res.filled === 0 && res.deduped === 0) {
+        toast.success(`All ${res.total} target IDs are healthy — nothing to repair.`);
+      } else {
+        const parts: string[] = [];
+        if (res.filled) parts.push(`${res.filled} missing ID${res.filled !== 1 ? "s" : ""} filled`);
+        if (res.deduped)
+          parts.push(`${res.deduped} duplicate${res.deduped !== 1 ? "s" : ""} regenerated`);
+        toast.success(`Repaired target IDs — ${parts.join(", ")} (of ${res.total}).`);
+        await refreshTargets();
+      }
+    } catch (e) {
+      console.error("repairTargetUrids failed", e);
+      toast.error("Couldn't repair target IDs — see console.");
+    } finally {
+      setRepairing(false);
+    }
+  }, [repairing, refreshTargets]);
+
   const handleBulkTargetUpdate = useCallback((updatedTargets: TargetLead[]) => {
     setTargets((prev) => {
       const updatedMap = new Map(updatedTargets.map((t) => [t.id, t]));
@@ -423,6 +522,57 @@ function TargetingPage() {
     setOnBulkUpdate(handleBulkTargetUpdate);
     return () => setOnBulkUpdate(undefined);
   }, [handleBulkTargetUpdate, setOnBulkUpdate]);
+
+  // The context recomputes `selectedTargets` into a fresh array every render, so a
+  // handler that closes over it can't be stable. Mirror it into a ref and read that
+  // at call-time — keeps runBulkResearch identity-stable so the registration effect
+  // below runs once instead of looping (setState-in-effect → re-render → repeat).
+  const selectedTargetsRef = useRef(selectedTargets);
+  selectedTargetsRef.current = selectedTargets;
+  const researchingRef = useRef(false);
+
+  // Mass Apollo research: enrich every selected target and fill-only-persist the
+  // results to the Targets sheet, then re-pull. Shared by the in-page banner
+  // "Research (Apollo)" button and the sidebar "Update with Apollo" button.
+  const runBulkResearch = useCallback(async () => {
+    const chosen = selectedTargetsRef.current;
+    if (chosen.length === 0 || researchingRef.current) return;
+    researchingRef.current = true;
+    setResearching(true);
+    try {
+      const payload = chosen.map((t) => ({
+        key: targetKeyOf(t),
+        urid: t.urid,
+        name: t.name,
+        email: t.email,
+        company: t.company,
+        linkedinUrl: t.linkedinUrl,
+      }));
+      const res = await bulkResearchTargets({ data: { targets: payload } });
+      const parts = [`Apollo: matched ${res.matched} of ${chosen.length}`];
+      if (res.updated) parts.push(`${res.updated} updated`);
+      if (res.notFound) parts.push(`${res.notFound} no match`);
+      if (res.failed) parts.push(`${res.failed} failed`);
+      if (res.updated > 0) {
+        await refreshTargets();
+        toast.success(parts.join(" · "));
+      } else {
+        toast.info(parts.join(" · ") + " — nothing new to fill.");
+      }
+      clearSelection();
+    } catch (e) {
+      console.error("bulkResearchTargets failed", e);
+      toast.error("Apollo research failed — see console.");
+    } finally {
+      researchingRef.current = false;
+      setResearching(false);
+    }
+  }, [setResearching, refreshTargets, clearSelection]);
+
+  useEffect(() => {
+    setOnBulkResearch(runBulkResearch);
+    return () => setOnBulkResearch(undefined);
+  }, [runBulkResearch, setOnBulkResearch]);
 
   const allSelected = filtered.length > 0 && filtered.every((t) => selectedIds.has(t.id));
 
@@ -506,7 +656,9 @@ function TargetingPage() {
       const urid = activeTarget.urid;
       const [saveRes] = await Promise.all([
         saveTargetConnectionStrategy({ data: { targetKey: key, plan, urid } }),
-        logTargetOutreach({ data: { targetKey: key, id, date, method: "Strategy", summary, urid } }),
+        logTargetOutreach({
+          data: { targetKey: key, id, date, method: "Strategy", summary, urid },
+        }),
       ]);
       const savedPlan: ConnectionPlan = { ...plan, savedAt: saveRes.savedAt || date };
       const attempt: OutreachAttempt = { id, date, method: "Strategy", summary };
@@ -531,30 +683,43 @@ function TargetingPage() {
     setActiveTarget(updated);
   };
 
-  const handleNewTarget = () => {
-    if (!newName.trim()) return;
-    const lead: TargetLead = {
-      id: `t-${Date.now()}`,
-      name: newName.trim(),
-      title: "",
-      company: "",
-      linkedinUrl: newLinkedin.trim(),
-      email: "",
-      phone: "",
-      location: newLocation.trim(),
-      sector: "",
-      stage: "Prospecting",
-      originSource: newOrigin || "Manual Entry",
-      dateAdded: new Date().toISOString().split("T")[0],
-      outreach: [],
-      notes: "",
-    };
-    setTargets((prev) => [lead, ...prev]);
-    setNewTargetOpen(false);
-    setNewName("");
-    setNewLinkedin("");
-    setNewLocation("");
-    setNewOrigin("Manual Entry");
+  const handleNewTarget = async () => {
+    if (!newName.trim() || newTargetSaving) return;
+    setNewTargetSaving(true);
+    const fullName = newName.trim();
+    const parts = fullName.split(/\s+/);
+    const firstName = parts[0] || fullName;
+    const lastName = parts.slice(1).join(" ");
+    try {
+      await addTarget({
+        data: {
+          firstName,
+          lastName,
+          company: "",
+          role: "",
+          linkedin: newLinkedin.trim(),
+          email: "",
+          phone: "",
+          location: newLocation.trim(),
+          sector: "",
+          stage: "Prospecting",
+          source: newOrigin || "Manual Entry",
+          researchPurpose: "",
+        },
+      });
+      setNewTargetOpen(false);
+      setNewName("");
+      setNewLinkedin("");
+      setNewLocation("");
+      setNewOrigin("Manual Entry");
+      toast.success(`Saved ${fullName} to Targets.`);
+      await router.invalidate();
+    } catch (e) {
+      console.error("addTarget failed", e);
+      toast.error("Couldn't save target to the sheet — see console.");
+    } finally {
+      setNewTargetSaving(false);
+    }
   };
 
   const handleBulkImport = () => {
@@ -810,9 +975,12 @@ function TargetingPage() {
     updateTarget({ ...activeTarget, ...updates });
     const count = Object.keys(updates).length;
     if (count > 0) {
-      void updateTargetFields({ data: { targetKey: key, fields: updates as Record<string, string>, urid } })
+      void updateTargetFields({
+        data: { targetKey: key, fields: updates as Record<string, string>, urid },
+      })
         .then((res) => {
-          if (!res.success) toast.warning("Applied locally, but couldn't find the row to save to the sheet.");
+          if (!res.success)
+            toast.warning("Applied locally, but couldn't find the row to save to the sheet.");
         })
         .catch((e) => {
           console.error("updateTargetFields failed", e);
@@ -826,14 +994,102 @@ function TargetingPage() {
   };
 
   const updateStage = (id: string, stage: PipelineStage) => {
+    const target = targets.find((t) => t.id === id);
     setTargets((prev) => prev.map((t) => (t.id === id ? { ...t, stage } : t)));
     if (activeTarget?.id === id) setActiveTarget((prev) => (prev ? { ...prev, stage } : prev));
+    if (!target) return;
+    void updateTargetFields({
+      data: {
+        targetKey: targetKeyOf(target),
+        urid: target.urid,
+        fields: { stage },
+      },
+    }).catch((e) => {
+      console.error("updateStage persist failed", e);
+      toast.error("Stage updated locally, but saving failed — see console.");
+    });
   };
 
-  const promoteSelected = () => {
+  const toPromoteInput = (t: TargetLead) => ({
+    urid: t.urid,
+    key: targetKeyOf(t),
+    name: t.name,
+    title: t.title,
+    company: t.company,
+    email: t.email,
+    phone: t.phone,
+    location: t.location,
+    linkedinUrl: t.linkedinUrl,
+    sector: t.sector,
+    originSource: t.originSource,
+    reasonSurfaced: t.reasonSurfaced,
+    notes: t.notes,
+    outreach: t.outreach,
+  });
+
+  // Promote selection into Network CRM contacts (+ Ready to Promote stage + note).
+  const promoteSelected = async () => {
+    const chosen = selectedTargets;
+    if (chosen.length === 0) return;
+    setPromotingCrm(true);
+    const chosenIds = new Set(chosen.map((t) => t.id));
     setTargets((prev) =>
-      prev.map((t) => (selectedIds.has(t.id) ? { ...t, stage: "Ready to Promote" } : t)),
+      prev.map((t) => (chosenIds.has(t.id) ? { ...t, stage: "Ready to Promote" } : t)),
     );
+    if (activeTarget && chosenIds.has(activeTarget.id)) {
+      setActiveTarget((prev) => (prev ? { ...prev, stage: "Ready to Promote" } : prev));
+    }
+    try {
+      const res = await promoteTargetsToCrm({ data: { targets: chosen.map(toPromoteInput) } });
+      if (!res.ok && res.added === 0 && res.duplicates === 0) {
+        toast.error(res.error || "Promote to CRM failed.");
+        return;
+      }
+      const parts = [
+        res.added > 0 ? `+${res.added} contact${res.added !== 1 ? "s" : ""}` : null,
+        res.duplicates > 0 ? `${res.duplicates} already in CRM` : null,
+        res.notesLogged > 0 ? `${res.notesLogged} note${res.notesLogged !== 1 ? "s" : ""}` : null,
+      ].filter(Boolean);
+      toast.success(
+        parts.length
+          ? `Promoted to CRM · ${parts.join(" · ")}`
+          : "Targets marked Ready to Promote.",
+      );
+    } catch (e) {
+      console.error("promoteSelected failed", e);
+      toast.error("Promote to CRM failed — see console.");
+    } finally {
+      setPromotingCrm(false);
+    }
+  };
+
+  const promoteOneToCrm = async (t: TargetLead) => {
+    setPromotingCrm(true);
+    setTargets((prev) =>
+      prev.map((x) => (x.id === t.id ? { ...x, stage: "Ready to Promote" } : x)),
+    );
+    if (activeTarget?.id === t.id) {
+      setActiveTarget((prev) => (prev ? { ...prev, stage: "Ready to Promote" } : prev));
+    }
+    try {
+      const res = await promoteTargetsToCrm({ data: { targets: [toPromoteInput(t)] } });
+      if (!res.ok && res.added === 0 && res.duplicates === 0) {
+        toast.error(res.error || "Promote to CRM failed.");
+        return;
+      }
+      if (res.added > 0) {
+        toast.success(`Added ${t.name || t.email} to the Network CRM.`);
+      } else if (res.duplicates > 0) {
+        toast.success(`${t.name || t.email} is already in the CRM · marked Ready to Promote.`);
+      } else {
+        toast.success("Marked Ready to Promote.");
+      }
+    } catch (e) {
+      console.error("promoteOneToCrm failed", e);
+      toast.error("Promote to CRM failed — see console.");
+    } finally {
+      setPromotingCrm(false);
+    }
   };
 
   // Hard-delete the selected targets from the Targets sheet (confirmed first),
@@ -887,9 +1143,12 @@ function TargetingPage() {
     updateTarget({ ...activeTarget, ...editData });
     setEditing(false);
     if (Object.keys(editData).length > 0) {
-      void updateTargetFields({ data: { targetKey: key, fields: editData as Record<string, string>, urid } })
+      void updateTargetFields({
+        data: { targetKey: key, fields: editData as Record<string, string>, urid },
+      })
         .then((res) => {
-          if (!res.success) toast.warning("Saved locally, but couldn't find the row to save to the sheet.");
+          if (!res.success)
+            toast.warning("Saved locally, but couldn't find the row to save to the sheet.");
         })
         .catch((e) => {
           console.error("updateTargetFields failed", e);
@@ -933,6 +1192,14 @@ function TargetingPage() {
                   <UserSearch className="h-3.5 w-3.5 mr-2" />
                   Find People
                 </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setFindCompaniesOpen(true)}>
+                  <Building2 className="h-3.5 w-3.5 mr-2" />
+                  Find Companies
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setFindCompaniesOpen(true)}>
+                  <Search className="h-3.5 w-3.5 mr-2" />
+                  Find
+                </DropdownMenuItem>
                 <DropdownMenuItem onClick={() => setAccountsOpen(true)}>
                   <Building2 className="h-3.5 w-3.5 mr-2" />
                   Target Accounts
@@ -940,19 +1207,41 @@ function TargetingPage() {
               </DropdownMenuContent>
             </DropdownMenu>
 
-            <Button
-              variant="outline"
-              size="sm"
-              className="text-xs"
-              onClick={() => setBulkImportOpen(true)}
-            >
-              <Upload className="h-3.5 w-3.5 mr-1.5" />
-              Import
-            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="sm" className="text-xs">
+                  <Upload className="h-3.5 w-3.5 mr-1.5" />
+                  Import
+                  <ChevronDown className="h-3.5 w-3.5 ml-1.5" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-44">
+                <DropdownMenuItem onClick={() => setPasteOpen(true)}>
+                  <Copy className="h-3.5 w-3.5 mr-2" />
+                  Paste targets
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setUploadOpen(true)}>
+                  <FileUp className="h-3.5 w-3.5 mr-2" />
+                  Upload CSV
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  onClick={() => void handleRepairIds()}
+                  disabled={repairing}
+                >
+                  {repairing ? (
+                    <Loader2 className="h-3.5 w-3.5 mr-2 animate-spin" />
+                  ) : (
+                    <Wrench className="h-3.5 w-3.5 mr-2" />
+                  )}
+                  Repair IDs
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
 
             <Button
               size="sm"
-              className="text-xs bg-(image:--gradient-primary) shadow-(--shadow-elegant) hover:shadow-(--shadow-elegant) hover:brightness-110"
+              className="text-xs"
               onClick={() => setNewTargetOpen(true)}
             >
               <Plus className="h-3.5 w-3.5 mr-1.5" />
@@ -974,13 +1263,32 @@ function TargetingPage() {
               <span className="text-xs text-muted-foreground">
                 <span className="font-semibold text-foreground">{selectedIds.size}</span> selected
               </span>
-              <Button variant="outline" size="sm" className={actionBtnClass}>
-                <Search className="h-3 w-3 mr-1" />
-                Research (Apollo)
+              <Button
+                variant="outline"
+                size="sm"
+                className={actionBtnClass}
+                onClick={() => void runBulkResearch()}
+                disabled={researching || deletingTargets}
+              >
+                {researching ? (
+                  <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                ) : (
+                  <Search className="h-3 w-3 mr-1" />
+                )}
+                {researching ? "Researching…" : "Research (Apollo)"}
               </Button>
-              <Button size="sm" className={actionBtnClass} onClick={promoteSelected}>
-                <ArrowUpRight className="h-3 w-3 mr-1" />
-                Promote All
+              <Button
+                size="sm"
+                className={actionBtnClass}
+                onClick={() => void promoteSelected()}
+                disabled={researching || deletingTargets || promotingCrm}
+              >
+                {promotingCrm ? (
+                  <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                ) : (
+                  <ArrowUpRight className="h-3 w-3 mr-1" />
+                )}
+                {promotingCrm ? "Promoting…" : "Promote All"}
               </Button>
               <Button
                 variant="outline"
@@ -1077,7 +1385,14 @@ function TargetingPage() {
                   </TableCell>
                   <TableCell className="font-medium text-sm">
                     <div className="flex items-center gap-2.5">
-                      <ContactAvatar contact={{ name: t.name, email: t.email }} size="sm" />
+                      <ContactAvatar
+                        contact={{
+                          name: t.name,
+                          email: t.email,
+                          company: t.company,
+                        }}
+                        size="sm"
+                      />
                       <div className="min-w-0">
                         <div className="flex items-center gap-1.5">
                           <span>{t.name}</span>
@@ -1102,7 +1417,14 @@ function TargetingPage() {
                     </div>
                   </TableCell>
                   <TableCell className="text-sm text-muted-foreground">
-                    <div className="max-w-[160px] truncate" title={t.company}>{t.company || "—"}</div>
+                    <div className="max-w-[160px] truncate" title={t.title}>
+                      {t.title || "—"}
+                    </div>
+                  </TableCell>
+                  <TableCell className="text-sm text-muted-foreground">
+                    <div className="max-w-[160px] truncate" title={t.company}>
+                      {t.company || "—"}
+                    </div>
                   </TableCell>
                   <TableCell>
                     <Badge
@@ -1113,7 +1435,20 @@ function TargetingPage() {
                     </Badge>
                   </TableCell>
                   <TableCell className="text-sm text-muted-foreground">
-                    <div className="max-w-[150px] truncate" title={t.location}>{t.location || "—"}</div>
+                    <div className="max-w-[150px] truncate" title={t.location}>
+                      {t.location || "—"}
+                    </div>
+                  </TableCell>
+                  <TableCell className="text-sm text-muted-foreground">
+                    <div className="max-w-[130px] truncate" title={t.sector}>
+                      {t.sector || "—"}
+                    </div>
+                  </TableCell>
+                  <TableCell className="text-sm text-muted-foreground whitespace-nowrap">
+                    {t.originSource || "—"}
+                  </TableCell>
+                  <TableCell className="text-sm text-muted-foreground whitespace-nowrap">
+                    {t.dateAdded || "—"}
                   </TableCell>
                   <TableCell className="whitespace-nowrap">
                     <span className="text-xs text-muted-foreground">
@@ -1125,7 +1460,7 @@ function TargetingPage() {
               {filtered.length === 0 && (
                 <TableRow>
                   <TableCell
-                    colSpan={6}
+                    colSpan={10}
                     className="text-center py-12 text-muted-foreground text-sm"
                   >
                     No targets match your filters.
@@ -1660,11 +1995,15 @@ function TargetingPage() {
                     <Button
                       className={`w-full ${actionBtnClass}`}
                       variant="outline"
-                      onClick={() => updateStage(activeTarget.id, "Ready to Promote")}
-                      disabled={activeTarget.stage === "Ready to Promote"}
+                      onClick={() => activeTarget && void promoteOneToCrm(activeTarget)}
+                      disabled={!activeTarget || promotingCrm}
                     >
-                      <ArrowUpRight className="h-3 w-3 mr-1" />
-                      Promote to CRM
+                      {promotingCrm ? (
+                        <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                      ) : (
+                        <ArrowUpRight className="h-3 w-3 mr-1" />
+                      )}
+                      {promotingCrm ? "Promoting…" : "Promote to CRM"}
                     </Button>
                   </section>
                 </div>
@@ -1689,10 +2028,32 @@ function TargetingPage() {
         companies={companies}
       />
 
+      {/* Find Companies — install-tech company search → people → Prospecting targets */}
+      <FindCompaniesDialog
+        open={findCompaniesOpen}
+        onOpenChange={setFindCompaniesOpen}
+        onImported={refreshTargets}
+        companies={companies}
+      />
+
       {/* Target Accounts — find people at specific accounts */}
       <TargetAccountsDialog
         open={accountsOpen}
         onOpenChange={setAccountsOpen}
+        onImported={refreshTargets}
+      />
+
+      {/* Paste / Upload — Network-parity target import (mapping + enrich + dedupe) */}
+      <TargetPasteDialog
+        open={pasteOpen}
+        onOpenChange={setPasteOpen}
+        existingKeys={targets.map((t) => targetKeyOf(t))}
+        onImported={refreshTargets}
+      />
+      <TargetUploadDialog
+        open={uploadOpen}
+        onOpenChange={setUploadOpen}
+        existingKeys={targets.map((t) => targetKeyOf(t))}
         onImported={refreshTargets}
       />
 
@@ -1830,8 +2191,14 @@ function TargetingPage() {
             <Button variant="outline" onClick={() => setNewTargetOpen(false)}>
               Cancel
             </Button>
-            <Button onClick={handleNewTarget} disabled={!newName.trim()}>
-              Begin Research
+            <Button onClick={() => void handleNewTarget()} disabled={!newName.trim() || newTargetSaving}>
+              {newTargetSaving ? (
+                <>
+                  <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" /> Saving…
+                </>
+              ) : (
+                "Begin Research"
+              )}
             </Button>
           </DialogFooter>
         </DialogContent>

@@ -24,12 +24,15 @@ export function LoginScreen() {
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-background px-4">
-      <Card className="w-full max-w-sm">
-        <CardHeader className="text-center">
-          <CardTitle className="text-2xl">VenturePulse</CardTitle>
-          <CardDescription>
-            Sign in with your email to continue.
+      <Card className="w-full max-w-sm border-border">
+        <CardHeader className="text-center space-y-1">
+          <CardTitle className="font-display text-2xl font-semibold tracking-tight">
+            VenturePulse
+          </CardTitle>
+          <CardDescription className="text-xs tracking-wide uppercase text-muted-foreground">
+            Network Intelligence
           </CardDescription>
+          <CardDescription className="pt-2">Sign in with your email to continue.</CardDescription>
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmit} className="space-y-4">

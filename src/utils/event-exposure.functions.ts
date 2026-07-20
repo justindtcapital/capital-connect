@@ -8,6 +8,7 @@ import {
   appendSheetRows,
   ensureTab,
   ensureColumn,
+  logOpsEvent,
   TAB_NAMES,
   PORTCO_EXPOSURE_HEADERS,
 } from "./sheets.server";
@@ -53,107 +54,147 @@ export const fetchPortcoExposures = createServerFn({ method: "GET" }).handler(
 // Idempotent: company exposures dedupe on company|event; attendee engagements
 // dedupe on email|portco (an existing event-exposure engagement to that company
 // is never re-written). No Asana write-back — Asana stays the source of truth.
-export const syncEventExposure = createServerFn({ method: "POST" }).handler(
-  async (): Promise<SyncExposureResult> => {
-    try {
-      const [asanaEvents, appEvents, contacts] = await Promise.all([
-        fetchAllAsanaEvents().catch(() => [] as AsanaEvent[]),
-        buildAppEvents().catch(() => [] as AsanaEvent[]),
-        buildContacts(),
-      ]);
+export async function runSyncEventExposure(): Promise<SyncExposureResult> {
+  try {
+    const [asanaEvents, appEvents, contacts] = await Promise.all([
+      fetchAllAsanaEvents().catch(() => [] as AsanaEvent[]),
+      buildAppEvents().catch(() => [] as AsanaEvent[]),
+      buildContacts(),
+    ]);
 
-      const events = [
-        ...asanaEvents.map((e) => ({ e, src: "Asana" })),
-        ...appEvents.map((e) => ({ e, src: "App" })),
-      ].filter(({ e }) => e.status === "completed" && e.portcos.length > 0);
+    const events = [
+      ...asanaEvents.map((e) => ({ e, src: "Asana" })),
+      ...appEvents.map((e) => ({ e, src: "App" })),
+    ].filter(({ e }) => e.status === "completed" && e.portcos.length > 0);
 
-      if (events.length === 0) return EMPTY;
-
-      // Existing company exposures (dedupe on company|event).
-      await ensureTab(TAB_NAMES.portcoExposure, PORTCO_EXPOSURE_HEADERS);
-      const exposureRows = await fetchSheetTab(TAB_NAMES.portcoExposure).catch(
-        () => [] as string[][],
-      );
-      const existingExposure = new Set<string>();
-      for (const r of exposureRows.slice(1)) {
-        const company = norm(r[0] || "");
-        const event = norm(r[1] || "");
-        if (company && event) existingExposure.add(`${company}|${event}`);
-      }
-
-      // Existing event-exposure engagements (dedupe on email|portco).
-      const introRows = await fetchSheetTab(TAB_NAMES.portcoIntros).catch(
-        () => [] as string[][],
-      );
-      const existingEngagement = new Set<string>();
-      if (introRows.length > 0) {
-        const header = (introRows[0] || []).map((h) => norm(h));
-        const emailIdx = header.indexOf("contact email");
-        const portcoIdx = header.indexOf("portco name");
-        const srcIdx = header.indexOf("engagement source");
-        for (const r of introRows.slice(1)) {
-          if (srcIdx === -1 || norm(r[srcIdx] || "") !== "event exposure") continue;
-          const email = emailIdx === -1 ? "" : norm(r[emailIdx] || "");
-          const portco = portcoIdx === -1 ? "" : norm(r[portcoIdx] || "");
-          if (email && portco) existingEngagement.add(`${email}|${portco}`);
-        }
-      }
-
-      const today = new Date().toISOString().slice(0, 10);
-      const newExposures: string[][] = [];
-      const newEngagements: string[][] = [];
-      const queuedExp = new Set<string>();
-      const queuedEng = new Set<string>();
-      let skipped = 0;
-
-      for (const { e, src } of events) {
-        const eventKeyName = norm(e.name);
-        const attendees = contacts.filter((c) =>
-          c.eventsAttended.some((n) => norm(n) === eventKeyName),
-        );
-        for (const portco of e.portcos) {
-          const pKey = norm(portco);
-          if (!pKey) continue;
-
-          const expKey = `${pKey}|${eventKeyName}`;
-          if (existingExposure.has(expKey)) {
-            skipped++;
-          } else if (!queuedExp.has(expKey)) {
-            queuedExp.add(expKey);
-            // Order matches PORTCO_EXPOSURE_HEADERS.
-            newExposures.push([portco, e.name, e.date || today, e.format || "", src, today]);
-          }
-
-          for (const c of attendees) {
-            const email = (c.email || "").split(";")[0]?.trim() || "";
-            if (!email) continue;
-            const engKey = `${norm(email)}|${pKey}`;
-            if (existingEngagement.has(engKey) || queuedEng.has(engKey)) continue;
-            queuedEng.add(engKey);
-            // Order mirrors addPortcoIntro: email, portco, date, engagement source.
-            newEngagements.push([email, portco, e.date || today, "event exposure"]);
-          }
-        }
-      }
-
-      if (newExposures.length > 0) {
-        await appendSheetRows(TAB_NAMES.portcoExposure, newExposures);
-      }
-      if (newEngagements.length > 0) {
-        await ensureColumn(TAB_NAMES.portcoIntros, "Engagement Source");
-        await appendSheetRows(TAB_NAMES.portcoIntros, newEngagements);
-      }
-
-      return {
-        ok: true,
-        events: events.length,
-        exposuresLogged: newExposures.length,
-        engagementsLogged: newEngagements.length,
-        skipped,
-      };
-    } catch (err) {
-      console.error("[exposure] syncEventExposure failed:", err);
-      return { ...EMPTY, ok: false, error: err instanceof Error ? err.message : "Sync failed" };
+    if (events.length === 0) {
+      await logOpsEvent({
+        action: "sync",
+        source: "event_exposure",
+        status: "ok",
+        summary: "No completed portco-tagged events to sync",
+        records: 0,
+      });
+      return EMPTY;
     }
-  },
+
+    // Existing company exposures (dedupe on company|event).
+    await ensureTab(TAB_NAMES.portcoExposure, PORTCO_EXPOSURE_HEADERS);
+    const exposureRows = await fetchSheetTab(TAB_NAMES.portcoExposure).catch(
+      () => [] as string[][],
+    );
+    const existingExposure = new Set<string>();
+    for (const r of exposureRows.slice(1)) {
+      const company = norm(r[0] || "");
+      const event = norm(r[1] || "");
+      if (company && event) existingExposure.add(`${company}|${event}`);
+    }
+
+    // Existing event-exposure engagements (dedupe on email|portco).
+    const introRows = await fetchSheetTab(TAB_NAMES.portcoIntros).catch(
+      () => [] as string[][],
+    );
+    const existingEngagement = new Set<string>();
+    if (introRows.length > 0) {
+      const header = (introRows[0] || []).map((h) => norm(h));
+      const emailIdx = header.indexOf("contact email");
+      const portcoIdx = header.indexOf("portco name");
+      const srcIdx = header.indexOf("engagement source");
+      for (const r of introRows.slice(1)) {
+        if (srcIdx === -1 || norm(r[srcIdx] || "") !== "event exposure") continue;
+        const email = emailIdx === -1 ? "" : norm(r[emailIdx] || "");
+        const portco = portcoIdx === -1 ? "" : norm(r[portcoIdx] || "");
+        if (email && portco) existingEngagement.add(`${email}|${portco}`);
+      }
+    }
+
+    const today = new Date().toISOString().slice(0, 10);
+    const newExposures: string[][] = [];
+    const newEngagements: string[][] = [];
+    const queuedExp = new Set<string>();
+    const queuedEng = new Set<string>();
+    let skipped = 0;
+
+    for (const { e, src } of events) {
+      const eventKeyName = norm(e.name);
+      const attendees = contacts.filter((c) =>
+        c.eventsAttended.some((n) => norm(n) === eventKeyName),
+      );
+      for (const portco of e.portcos) {
+        const pKey = norm(portco);
+        if (!pKey) continue;
+
+        const expKey = `${pKey}|${eventKeyName}`;
+        if (existingExposure.has(expKey)) {
+          skipped++;
+        } else if (!queuedExp.has(expKey)) {
+          queuedExp.add(expKey);
+          // Order matches PORTCO_EXPOSURE_HEADERS.
+          newExposures.push([portco, e.name, e.date || today, e.format || "", src, today]);
+        }
+
+        for (const c of attendees) {
+          const email = (c.email || "").split(";")[0]?.trim() || "";
+          if (!email) continue;
+          const engKey = `${norm(email)}|${pKey}`;
+          if (existingEngagement.has(engKey) || queuedEng.has(engKey)) continue;
+          queuedEng.add(engKey);
+          // Order mirrors addPortcoIntro: email, portco, date, engagement source.
+          newEngagements.push([email, portco, e.date || today, "event exposure"]);
+        }
+      }
+    }
+
+    if (newExposures.length > 0) {
+      await appendSheetRows(TAB_NAMES.portcoExposure, newExposures);
+    }
+    if (newEngagements.length > 0) {
+      await ensureColumn(TAB_NAMES.portcoIntros, "Engagement Source");
+      await appendSheetRows(TAB_NAMES.portcoIntros, newEngagements);
+    }
+
+    const result = {
+      ok: true as const,
+      events: events.length,
+      exposuresLogged: newExposures.length,
+      engagementsLogged: newEngagements.length,
+      skipped,
+    };
+    const items = [
+      ...newExposures.map(
+        (r) => `[exposure] ${r[0]} ← ${r[1]}${r[2] ? ` · ${r[2]}` : ""}${r[4] ? ` · via ${r[4]}` : ""}`,
+      ),
+      ...newEngagements.map((r) => `[attendee] ${r[0]} ← ${r[1]}${r[2] ? ` · ${r[2]}` : ""}`),
+    ];
+    await logOpsEvent({
+      action: "sync",
+      source: "event_exposure",
+      status: "ok",
+      summary: `Event exposure sync · ${result.exposuresLogged} companies · ${result.engagementsLogged} attendees`,
+      records: result.exposuresLogged + result.engagementsLogged,
+      details: {
+        events: result.events,
+        exposuresLogged: result.exposuresLogged,
+        engagementsLogged: result.engagementsLogged,
+        skipped: result.skipped,
+      },
+      items,
+    });
+    return result;
+  } catch (err) {
+    console.error("[exposure] syncEventExposure failed:", err);
+    const message = err instanceof Error ? err.message : "Sync failed";
+    await logOpsEvent({
+      action: "sync",
+      source: "event_exposure",
+      status: "error",
+      summary: message,
+      records: 0,
+    });
+    return { ...EMPTY, ok: false, error: message };
+  }
+}
+
+export const syncEventExposure = createServerFn({ method: "POST" }).handler(
+  async (): Promise<SyncExposureResult> => runSyncEventExposure(),
 );

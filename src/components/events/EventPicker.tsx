@@ -18,6 +18,7 @@ import {
 import { cn } from "@/lib/utils";
 import type { AsanaEvent } from "@/lib/types";
 import { fetchAsanaEvents } from "@/utils/asana.functions";
+import { fetchAppEvents } from "@/utils/sheets.functions";
 
 interface EventPickerProps {
   value: string;
@@ -32,15 +33,31 @@ interface EventPickerProps {
 let cachedEvents: AsanaEvent[] | null = null;
 let inflight: Promise<AsanaEvent[]> | null = null;
 
+function mergeEventCatalogs(asana: AsanaEvent[], app: AsanaEvent[]): AsanaEvent[] {
+  const byName = new Map<string, AsanaEvent>();
+  // App Events first so in-app catalog wins on name collisions, then fill from Asana.
+  for (const e of app) {
+    const key = e.name.trim().toLowerCase();
+    if (key) byName.set(key, e);
+  }
+  for (const e of asana) {
+    const key = e.name.trim().toLowerCase();
+    if (key && !byName.has(key)) byName.set(key, e);
+  }
+  return [...byName.values()];
+}
+
 async function loadEvents(): Promise<AsanaEvent[]> {
   if (cachedEvents) return cachedEvents;
   if (inflight) return inflight;
-  inflight = fetchAsanaEvents()
-    .then((evts: AsanaEvent[]) => {
-      cachedEvents = evts;
-      return evts;
+  inflight = Promise.all([
+    fetchAsanaEvents().catch((): AsanaEvent[] => []),
+    fetchAppEvents().catch((): AsanaEvent[] => []),
+  ])
+    .then(([asana, app]) => {
+      cachedEvents = mergeEventCatalogs(asana, app);
+      return cachedEvents;
     })
-    .catch((): AsanaEvent[] => [])
     .finally(() => {
       inflight = null;
     });
@@ -53,7 +70,10 @@ export function EventPicker({ value, onChange, placeholder = "Select or type eve
   const [loaded, setLoaded] = useState<AsanaEvent[]>(() => events ?? cachedEvents ?? []);
 
   useEffect(() => {
-    if (events) return;
+    if (events) {
+      setLoaded(events);
+      return;
+    }
     if (cachedEvents) {
       setLoaded(cachedEvents);
       return;
@@ -72,12 +92,12 @@ export function EventPicker({ value, onChange, placeholder = "Select or type eve
     const up: AsanaEvent[] = [];
     const ps: AsanaEvent[] = [];
     for (const e of loaded) {
-      if (e.date >= today) up.push(e);
+      if ((e.date || "") >= today) up.push(e);
       else ps.push(e);
     }
     // Upcoming: soonest first. Past: most recent first.
-    up.sort((a, b) => a.date.localeCompare(b.date));
-    ps.sort((a, b) => b.date.localeCompare(a.date));
+    up.sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+    ps.sort((a, b) => (b.date || "").localeCompare(a.date || ""));
     return { upcoming: up, past: ps };
   }, [loaded]);
 
@@ -106,13 +126,13 @@ export function EventPicker({ value, onChange, placeholder = "Select or type eve
       </PopoverTrigger>
       <PopoverContent className="w-[--radix-popover-trigger-width] p-0" align="start">
         <Command shouldFilter>
-          <CommandInput placeholder="Search Asana events…" value={query} onValueChange={setQuery} />
+          <CommandInput placeholder="Search events…" value={query} onValueChange={setQuery} />
           <CommandList>
             <CommandEmpty>No events found.</CommandEmpty>
             {upcoming.length > 0 && (
               <CommandGroup heading="Upcoming">
                 {upcoming.map((e) => (
-                  <CommandItem key={e.gid} value={e.name} onSelect={() => handleSelect(e.name)}>
+                  <CommandItem key={e.gid || `up-${e.name}`} value={e.name} onSelect={() => handleSelect(e.name)}>
                     <Check className={cn("mr-2 h-3.5 w-3.5", value === e.name ? "opacity-100" : "opacity-0")} />
                     <div className="flex-1 min-w-0">
                       <div className="text-sm truncate">{e.name}</div>
@@ -127,7 +147,7 @@ export function EventPicker({ value, onChange, placeholder = "Select or type eve
                 <CommandSeparator />
                 <CommandGroup heading="Past">
                   {past.map((e) => (
-                    <CommandItem key={e.gid} value={e.name} onSelect={() => handleSelect(e.name)}>
+                    <CommandItem key={e.gid || `past-${e.name}`} value={e.name} onSelect={() => handleSelect(e.name)}>
                       <Check className={cn("mr-2 h-3.5 w-3.5", value === e.name ? "opacity-100" : "opacity-0")} />
                       <div className="flex-1 min-w-0">
                         <div className="text-sm truncate">{e.name}</div>

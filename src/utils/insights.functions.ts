@@ -301,6 +301,239 @@ export const connectionStrategy = createServerFn({ method: "POST" })
     };
   });
 
+// Recommend a ChartBuilder ChartSpec from aggregate network stats + optional
+// natural-language ask. Returns only keys from the caller's allow-lists.
+export interface ChartRecommendation {
+  ok: boolean;
+  error?: string;
+  errorCode?: string;
+  groupBy?: string;
+  metric?: string;
+  style?: "bar" | "hbar" | "line" | "pie";
+  splitBy?: string;
+  compare?: string;
+  title?: string;
+  rationale?: string;
+}
+
+/** Signature used to detect duplicates of curated / already-added charts. */
+function chartComboKey(groupBy: string, metric: string, splitBy?: string, compare?: string): string {
+  return [groupBy, metric, splitBy || "", compare || ""].join("|");
+}
+
+export const recommendDashboardChart = createServerFn({ method: "POST" })
+  .inputValidator(
+    (data: {
+      /** Optional user ask, e.g. "show intros by sector as a horizontal bar". */
+      prompt?: string;
+      dims: { key: string; label: string }[];
+      metrics: { key: string; label: string }[];
+      styles: string[];
+      /** Compact top-N distributions — Sheets-native aggregates only. */
+      distributions: { dim: string; label: string; top: { value: string; count: number }[] }[];
+      metricTotals: { key: string; label: string; total: number }[];
+      recordCount: number;
+      /** Titles of charts the user already has, so we avoid duplicates. */
+      existingTitles?: string[];
+      /**
+       * Hardcoded / curated page charts — never recommend the same groupBy+metric
+       * (optional splitBy/compare). Matched regardless of style.
+       */
+      blockedCharts?: {
+        groupBy: string;
+        metric: string;
+        splitBy?: string;
+        compare?: string;
+        label?: string;
+      }[];
+      /** Custom charts already on the page (same signature rules as blockedCharts). */
+      existingCharts?: {
+        groupBy: string;
+        metric: string;
+        splitBy?: string;
+        compare?: string;
+      }[];
+    }) => data,
+  )
+  .handler(async ({ data }): Promise<ChartRecommendation> => {
+    const dims = (data.dims || []).filter((d) => d.key);
+    const metrics = (data.metrics || []).filter((m) => m.key);
+    const styles = new Set(
+      (data.styles || ["bar", "hbar", "line", "pie"]).filter((s) =>
+        ["bar", "hbar", "line", "pie"].includes(s),
+      ),
+    );
+    if (dims.length === 0 || metrics.length === 0) {
+      return { ok: false, error: "No chart dimensions available." };
+    }
+
+    const blocked = [...(data.blockedCharts || []), ...(data.existingCharts || [])];
+    // Block on groupBy+metric even when split/compare differ for curated charts
+    // that are the same analytical question (e.g. intros by prime).
+    const blockedExact = new Set(
+      blocked.map((b) => chartComboKey(b.groupBy, b.metric, b.splitBy, b.compare)),
+    );
+    const blockedPair = new Set(
+      (data.blockedCharts || []).map((b) => `${b.groupBy}|${b.metric}`),
+    );
+
+    const dimList = dims.map((d) => `${d.key} (${d.label})`).join(", ");
+    const metricList = metrics.map((m) => `${m.key} (${m.label})`).join(", ");
+    const styleList = [...styles].join(", ");
+
+    const distBlock = (data.distributions || [])
+      .map((d) => {
+        const tops = (d.top || [])
+          .slice(0, 8)
+          .map((t) => `${t.value}: ${t.count}`)
+          .join("; ");
+        return `- ${d.label} [${d.dim}]: ${tops || "empty"}`;
+      })
+      .join("\n");
+    const totalsBlock = (data.metricTotals || [])
+      .map((m) => `- ${m.label} [${m.key}]: ${m.total}`)
+      .join("\n");
+    const existing =
+      (data.existingTitles || []).filter(Boolean).slice(0, 12).join(" · ") || "none yet";
+    const blockedBlock =
+      (data.blockedCharts || [])
+        .map(
+          (b) =>
+            `- DO NOT USE groupBy=${b.groupBy} + metric=${b.metric}` +
+            (b.label ? ` (already on page: ${b.label})` : ""),
+        )
+        .join("\n") || "none";
+
+    const ask = (data.prompt || "").trim();
+    const system =
+      "You are the analytics co-pilot for VenturePulse, a VC network intelligence product. " +
+      "Recommend ONE custom chart the firm should add next. You MUST pick only from the allowed " +
+      "dimension keys, metric keys, and chart styles. " +
+      "CRITICAL: Never recommend a chart that duplicates a built-in / hardcoded dashboard chart. " +
+      "If a groupBy+metric pair is listed under BLOCKED, you must choose a different combination " +
+      "(different groupBy and/or metric). Also avoid duplicating existing custom charts. " +
+      "Prefer novel cuts: stacked splits, compare measures, or underused dimensions. " +
+      "If the user asks for a blocked chart, refuse that exact combo and suggest the closest " +
+      "allowed alternative in title/rationale. " +
+      "For pie charts leave splitBy and compare empty. splitBy and compare are mutually exclusive. " +
+      "Respond ONLY as JSON: " +
+      '{"groupBy":"<dim key>","metric":"<metric key>","style":"bar|hbar|line|pie",' +
+      '"splitBy":"<dim key or empty>","compare":"<metric key or empty>",' +
+      '"title":"short chart title","rationale":"1 sentence why this chart matters"}.';
+
+    const userBase =
+      `Records in view: ${data.recordCount}\n` +
+      `Allowed dimensions: ${dimList}\n` +
+      `Allowed metrics: ${metricList}\n` +
+      `Allowed styles: ${styleList}\n` +
+      `BLOCKED (hardcoded page charts — never recommend these groupBy+metric pairs):\n${blockedBlock}\n` +
+      `Existing custom charts: ${existing}\n` +
+      `Distributions (top values):\n${distBlock || "n/a"}\n` +
+      `Metric totals:\n${totalsBlock || "n/a"}\n`;
+
+    const parseAndValidate = async (
+      user: string,
+    ): Promise<ChartRecommendation> => {
+      const res = await callGeminiJSON<{
+        groupBy?: string;
+        metric?: string;
+        style?: string;
+        splitBy?: string;
+        compare?: string;
+        title?: string;
+        rationale?: string;
+      }>(system, user, 700);
+
+      if (!res.ok || !res.data) {
+        return {
+          ok: false,
+          error: res.error || "Couldn't recommend a chart.",
+          errorCode: res.errorCode,
+        };
+      }
+
+      const allowedDims = new Set(dims.map((d) => d.key));
+      const allowedMetrics = new Set(metrics.map((m) => m.key));
+      const groupBy = String(res.data.groupBy || "").trim();
+      const metric = String(res.data.metric || "").trim();
+      let style = String(res.data.style || "bar").trim() as ChartRecommendation["style"];
+      if (!styles.has(style || "")) style = "bar";
+      if (!allowedDims.has(groupBy) || !allowedMetrics.has(metric)) {
+        return {
+          ok: false,
+          error: "Gemini returned a chart outside the allowed fields. Try again with a clearer ask.",
+        };
+      }
+
+      let splitBy = String(res.data.splitBy || "").trim() || undefined;
+      let compare = String(res.data.compare || "").trim() || undefined;
+      if (style === "pie") {
+        splitBy = undefined;
+        compare = undefined;
+      }
+      if (splitBy && !allowedDims.has(splitBy)) splitBy = undefined;
+      if (splitBy === groupBy) splitBy = undefined;
+      if (compare && !allowedMetrics.has(compare)) compare = undefined;
+      if (compare === metric) compare = undefined;
+      if (splitBy) compare = undefined;
+
+      const exact = chartComboKey(groupBy, metric, splitBy, compare);
+      const pair = `${groupBy}|${metric}`;
+      if (blockedPair.has(pair) || blockedExact.has(exact)) {
+        return {
+          ok: false,
+          errorCode: "blocked_duplicate",
+          error: `That chart is already on the dashboard (${pair.replace("|", " × ")}). Pick a different cut.`,
+          groupBy,
+          metric,
+          style,
+          splitBy,
+          compare,
+        };
+      }
+
+      return {
+        ok: true,
+        groupBy,
+        metric,
+        style,
+        splitBy,
+        compare,
+        title: String(res.data.title || "").trim().slice(0, 80) || undefined,
+        rationale: String(res.data.rationale || "").trim().slice(0, 240) || undefined,
+      };
+    };
+
+    const firstUser =
+      userBase +
+      (ask
+        ? `User request: ${ask}`
+        : "User request: (none — recommend the single most useful chart that is NOT already hardcoded on the page)");
+
+    let result = await parseAndValidate(firstUser);
+
+    // One automatic retry if the model echoed a built-in chart.
+    if (!result.ok && result.errorCode === "blocked_duplicate") {
+      result = await parseAndValidate(
+        userBase +
+          `User request: ${ask || "(auto recommend)"}\n` +
+          `IMPORTANT RETRY: Your previous suggestion groupBy=${result.groupBy} metric=${result.metric} ` +
+          `is BLOCKED because it duplicates a hardcoded dashboard chart. ` +
+          `Choose a completely different groupBy+metric pair from the allow-list.`,
+      );
+    }
+
+    if (!result.ok && result.errorCode === "blocked_duplicate") {
+      return {
+        ok: false,
+        error:
+          "Gemini kept suggesting a chart that already exists on this page. Try a more specific ask (e.g. a stacked split or compare measure).",
+      };
+    }
+
+    return result;
+  });
+
 // #9 — network progression insights. Input: aggregate rating transitions + a
 // breakdown of who's recently been added (by title / sector / location). All
 // Sheets-native contact data.

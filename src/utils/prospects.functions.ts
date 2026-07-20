@@ -284,6 +284,7 @@ export const addProspectsToContacts = createServerFn({ method: "POST" })
       let location = p.location || "";
       let title = p.title || "";
       let revealedName = "";
+      let linkedin = p.linkedinUrl || "";
       const company = p.company || "";
       try {
         // Apollo-sourced prospects carry an id → reveal by id (exact). Sumble-sourced
@@ -303,6 +304,7 @@ export const addProspectsToContacts = createServerFn({ method: "POST" })
           phone = r.phone || "";
           title = title || r.title || "";
           revealedName = r.name || "";
+          if (r.linkedinUrl) linkedin = r.linkedinUrl;
           const city = [r.city, r.state].filter(Boolean).join(", ");
           if (city) location = city;
         }
@@ -325,6 +327,7 @@ export const addProspectsToContacts = createServerFn({ method: "POST" })
           email,
           phone,
           location,
+          linkedin,
           prime: "",
           sector: p.industry || "",
           temperature: "Cold", // new prospects always enter Cold

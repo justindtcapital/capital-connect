@@ -23,7 +23,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Badge } from "@/components/ui/badge";
 import { Sparkles, Mail, Copy, Loader2, ChevronsUpDown, X } from "lucide-react";
 import { draftEmail } from "@/utils/gemini.functions";
-import { fetchPortfolioCompanies } from "@/utils/sheets.functions";
+import { fetchPortfolioCompanies, recordEmailSent } from "@/utils/sheets.functions";
 import type { Contact } from "@/lib/types";
 import { useFilterOptions } from "@/lib/filter-options-context";
 import { EventPicker } from "@/components/events/EventPicker";
@@ -164,7 +164,7 @@ export function EmailDraftDialog({ open, onOpenChange, contact, onSent, initialP
     }
   };
 
-  const openInMail = () => {
+  const openInMail = async () => {
     if (!primaryEmail) {
       toast.error("This contact has no email address.");
       return;
@@ -175,13 +175,38 @@ export function EmailDraftDialog({ open, onOpenChange, contact, onSent, initialP
       primaryEmail,
     )}&subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
     window.open(url, "_blank", "noopener,noreferrer");
-    onSent?.({
+
+    const sentInfo: EmailSentInfo = {
       subject,
       emailType,
       linkedPortcos: emailType === "PortCo" && linkedPortcos.length ? linkedPortcos : undefined,
       linkedEvent: emailType === "Event" ? linkedEvent || undefined : undefined,
-    });
-    toast.success("Opened Outlook compose · interaction logged");
+    };
+
+    // Close the loop: Notes + Email Activity + Ops Log (every entry point).
+    try {
+      const res = await recordEmailSent({
+        data: {
+          contactEmail: primaryEmail,
+          contactName: contact?.name,
+          subject,
+          emailType,
+          linkedPortcos: sentInfo.linkedPortcos,
+          linkedEvent: sentInfo.linkedEvent,
+          urid: contact?.urid,
+        },
+      });
+      if (!res.ok) {
+        toast.warning(res.error || "Opened Outlook, but logging failed.");
+      } else {
+        toast.success("Opened Outlook · logged to Notes + Ops");
+      }
+    } catch (e) {
+      console.error("recordEmailSent failed", e);
+      toast.warning("Opened Outlook, but CRM logging failed — see console.");
+    }
+
+    onSent?.(sentInfo);
     reset();
     onOpenChange(false);
   };
@@ -376,7 +401,7 @@ export function EmailDraftDialog({ open, onOpenChange, contact, onSent, initialP
           {hasDraft && (
             <Button variant="outline" onClick={copyAll}><Copy className="h-4 w-4" /> Copy</Button>
           )}
-          <Button onClick={openInMail} disabled={!hasDraft || !primaryEmail}>
+          <Button onClick={() => void openInMail()} disabled={!hasDraft || !primaryEmail}>
             <Mail className="h-4 w-4" /> Open in Outlook
           </Button>
         </DialogFooter>

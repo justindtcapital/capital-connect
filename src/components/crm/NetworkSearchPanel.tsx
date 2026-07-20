@@ -36,9 +36,38 @@ import { searchNetworkOrgs } from "@/utils/sumble.functions";
 import { findCompanyDecisionMakers, addProspectsToTargets } from "@/utils/prospects.functions";
 import type { Contact, TargetLead } from "@/lib/types";
 import type { ProspectCompany, NetworkSearchDimension, SumbleProspect } from "@/utils/sumble.server";
+import { companyLogoSources } from "@/lib/domain-utils";
 import { seniorityOf, departmentOf, SENIORITY_LEVELS, DEPARTMENTS } from "@/lib/people-classify";
 import { SlidersHorizontal, X } from "lucide-react";
 import { toast } from "sonner";
+
+/** Tiny company mark with Clearbit-free fallback ladder. */
+function CompanyMiniLogo({ domain }: { domain: string }) {
+  const [stage, setStage] = useState(0);
+  const sources = useMemo(() => companyLogoSources(domain, "high"), [domain]);
+  useEffect(() => {
+    setStage(0);
+  }, [sources.join("|")]);
+  if (stage < sources.length) {
+    const src = sources[stage];
+    return (
+      <img
+        key={src}
+        src={src}
+        alt=""
+        className="h-5 w-5 rounded border border-border object-contain bg-white shrink-0"
+        referrerPolicy="no-referrer"
+        loading="lazy"
+        onError={() => setStage((s) => s + 1)}
+      />
+    );
+  }
+  return (
+    <div className="h-5 w-5 rounded border border-border bg-muted flex items-center justify-center shrink-0">
+      <Building2 className="h-3 w-3 text-muted-foreground" />
+    </div>
+  );
+}
 
 // Company-size bands (keys MUST match SIZE_BANDS in sumble.server.ts). External
 // (Sumble) lane only — internal contacts have no headcount data.
@@ -678,14 +707,7 @@ function NetworkSearchDialog({ open, onOpenChange, initialQuery, initialBy }: Di
                       <div key={co.domain} className="rounded-md border border-border text-xs">
                         <div className="p-2.5">
                           <div className="flex items-center gap-2">
-                            <img
-                              src={`https://logo.clearbit.com/${co.domain}`}
-                              alt=""
-                              className="h-5 w-5 rounded border border-border object-contain bg-white shrink-0"
-                              onError={(e) => {
-                                (e.currentTarget as HTMLImageElement).style.display = "none";
-                              }}
-                            />
+                            <CompanyMiniLogo domain={co.domain} />
                             <span className="font-medium truncate flex-1">{co.name}</span>
                             {entry?.added ? (
                               <Badge variant="secondary" className="text-[9px]">{entry.added} added</Badge>

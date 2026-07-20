@@ -28,7 +28,7 @@ export function PortfolioCard({ company, counts, onClick }: PortfolioCardProps) 
 
   return (
     <Card
-      className="cursor-pointer hover:shadow-md transition-shadow border-border h-full flex flex-col"
+      className="cursor-pointer surface-hover border-border h-full flex flex-col"
       onClick={onClick}
     >
       <CardContent className="p-5 flex flex-col flex-1">

@@ -14,7 +14,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Checkbox } from "@/components/ui/checkbox";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Mail, Linkedin, User } from "lucide-react";
-import { addContact, fetchContactEmails, logImportResult } from "@/utils/sheets.functions";
+import { addContact, fetchContactEmails, logImportResult, storeApolloRaw } from "@/utils/sheets.functions";
 import { enrichContact } from "@/utils/apollo.functions";
 import { toast } from "sonner";
 
@@ -153,7 +153,27 @@ export function SmartPasteDialog({ open, onOpenChange, existingEmails = [], onIm
     let added = 0;
     let enriched = 0;
     for (const p of toImport) {
-      const c = { name: p.name, title: p.title, company: p.company, email: p.email, phone: "", location: "" };
+      const c: {
+        name: string;
+        title: string;
+        company: string;
+        email: string;
+        phone: string;
+        location: string;
+        linkedinUrl: string;
+        sector: string;
+        headline?: string;
+        employmentHistory?: string;
+      } = {
+        name: p.name,
+        title: p.title,
+        company: p.company,
+        email: p.email,
+        phone: "",
+        location: "",
+        linkedinUrl: p.linkedinUrl,
+        sector: "",
+      };
       if (enrich) {
         try {
           const parts = p.name.trim().split(/\s+/);
@@ -173,6 +193,19 @@ export function SmartPasteDialog({ open, onOpenChange, existingEmails = [], onIm
             c.phone = r.phone || "";
             c.location = [r.city, r.state].filter(Boolean).join(", ");
             c.email = c.email || r.email || "";
+            c.linkedinUrl = c.linkedinUrl || r.linkedinUrl || "";
+            c.sector = r.industry || "";
+            c.headline = r.headline || undefined;
+            c.employmentHistory = (r.employmentHistory || [])
+              .map((j) => {
+                const base = [j.title, j.company].filter(Boolean).join(" @ ");
+                return j.current ? `${base} (current)` : base;
+              })
+              .filter(Boolean)
+              .join("; ");
+            if (c.email) {
+              storeApolloRaw({ data: { email: c.email, payload: r } }).catch(() => {});
+            }
             enriched++;
           }
         } catch (e) {
@@ -190,10 +223,13 @@ export function SmartPasteDialog({ open, onOpenChange, existingEmails = [], onIm
             email: c.email,
             phone: c.phone,
             location: c.location,
+            linkedinUrl: c.linkedinUrl,
             prime: "",
-            sector: "",
+            sector: c.sector,
             temperature: "Warm",
             source: "Manual Entry",
+            headline: c.headline,
+            employmentHistory: c.employmentHistory,
           },
         });
         added++;

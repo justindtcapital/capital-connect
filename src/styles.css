@@ -5,9 +5,9 @@
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
-  --radius-sm: calc(var(--radius) - 4px);
-  --radius-md: calc(var(--radius) - 2px);
-  --radius-lg: var(--radius);
+  --radius-sm: calc(var(--radius) - 2px);
+  --radius-md: var(--radius);
+  --radius-lg: calc(var(--radius) + 2px);
   --radius-xl: calc(var(--radius) + 4px);
   --radius-2xl: calc(var(--radius) + 8px);
   --radius-3xl: calc(var(--radius) + 12px);
@@ -54,79 +54,94 @@
   --color-warm-foreground: var(--warm-foreground);
   --color-cold: var(--cold);
   --color-cold-foreground: var(--cold-foreground);
+  --color-copper: var(--copper);
+  --color-copper-foreground: var(--copper-foreground);
+  --color-decay: var(--decay);
+  --color-decay-foreground: var(--decay-foreground);
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Inter", ui-sans-serif, system-ui, sans-serif;
 }
 
 :root {
-  --radius: 0.5rem;
-  /* Dell Technologies Capital — electric blue on a cool near-white, deep navy ink */
-  --background: oklch(0.985 0.003 240);
-  --foreground: oklch(0.21 0.04 256);
+  /* Quiet Authority — Signal Blue on cool field, deep Command navy */
+  --radius: 0.375rem;
+  --background: oklch(0.988 0.002 250);
+  --foreground: oklch(0.18 0.035 256);
   --card: oklch(1 0 0);
-  --card-foreground: oklch(0.21 0.04 256);
+  --card-foreground: oklch(0.18 0.035 256);
   --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.21 0.04 256);
-  --primary: oklch(0.48 0.18 252);
+  --popover-foreground: oklch(0.18 0.035 256);
+  /* Signal — cooler, precise electric blue (no marketing glow fills) */
+  --primary: oklch(0.46 0.175 250);
   --primary-foreground: oklch(1 0 0);
-  /* Brighter companion blue for gradients/glows */
-  --primary-glow: oklch(0.62 0.19 252);
-  --secondary: oklch(0.96 0.006 247);
-  --secondary-foreground: oklch(0.24 0.04 256);
-  --muted: oklch(0.96 0.006 247);
-  --muted-foreground: oklch(0.52 0.03 252);
-  --accent: oklch(0.95 0.022 252);
-  --accent-foreground: oklch(0.3 0.09 252);
-  --destructive: oklch(0.585 0.22 27);
+  --primary-glow: oklch(0.55 0.16 250);
+  --secondary: oklch(0.965 0.005 250);
+  --secondary-foreground: oklch(0.22 0.035 256);
+  --muted: oklch(0.965 0.005 250);
+  --muted-foreground: oklch(0.5 0.025 252);
+  --accent: oklch(0.96 0.012 250);
+  --accent-foreground: oklch(0.28 0.07 250);
+  --destructive: oklch(0.55 0.2 25);
   --destructive-foreground: oklch(1 0 0);
-  --border: oklch(0.9 0.008 247);
-  --input: oklch(0.9 0.008 247);
-  --ring: oklch(0.48 0.18 252);
-  /* Charts anchored on the new electric blue */
-  --chart-1: oklch(0.48 0.18 252);
-  --chart-2: oklch(0.637 0.135 163);
-  --chart-3: oklch(0.735 0.145 85);
-  --chart-4: oklch(0.598 0.2 295);
-  --chart-5: oklch(0.645 0.246 16);
-  /* Sidebar — dark navy scheme */
-  --sidebar: oklch(0.16 0.035 252);
-  --sidebar-foreground: oklch(0.93 0.012 245);
-  --sidebar-primary: oklch(0.62 0.19 252);
+  --border: oklch(0.91 0.006 250);
+  --input: oklch(0.91 0.006 250);
+  --ring: oklch(0.46 0.175 250);
+  /* Charts — monochrome ink + one signal series */
+  --chart-1: oklch(0.46 0.175 250);
+  --chart-2: oklch(0.45 0.04 250);
+  --chart-3: oklch(0.62 0.08 75);
+  --chart-4: oklch(0.55 0.06 300);
+  --chart-5: oklch(0.5 0.08 25);
+  /* Command plane — deep navy */
+  --sidebar: oklch(0.145 0.03 252);
+  --sidebar-foreground: oklch(0.93 0.01 245);
+  --sidebar-primary: oklch(0.62 0.16 250);
   --sidebar-primary-foreground: oklch(1 0 0);
-  --sidebar-accent: oklch(0.22 0.04 252);
-  --sidebar-accent-foreground: oklch(0.97 0.01 245);
-  --sidebar-border: oklch(0.26 0.04 252);
-  --sidebar-ring: oklch(0.62 0.19 252);
-  /* Temperature tokens */
-  --council: oklch(0.93 0.045 300);
-  --council-foreground: oklch(0.5 0.2 300);
-  --hot: oklch(0.936 0.032 25);
-  --hot-foreground: oklch(0.505 0.213 27);
-  --warm: oklch(0.962 0.042 90);
-  --warm-foreground: oklch(0.554 0.135 66);
-  --cold: oklch(0.93 0.03 252);
-  --cold-foreground: oklch(0.48 0.18 252);
-  /* Gradients & elevation (referenced via bg-[var(--…)] / shadow-[var(--…)]) */
-  --gradient-primary: linear-gradient(135deg, var(--primary), var(--primary-glow));
-  --gradient-sidebar: linear-gradient(180deg, var(--sidebar), oklch(0.12 0.03 252));
-  --shadow-card: 0 1px 2px 0 oklch(0.2 0.04 256 / 0.06), 0 1px 3px 0 oklch(0.2 0.04 256 / 0.08);
-  --shadow-elegant: 0 12px 32px -12px oklch(0.48 0.18 252 / 0.4);
+  --sidebar-accent: oklch(0.2 0.035 252);
+  --sidebar-accent-foreground: oklch(0.97 0.008 245);
+  --sidebar-border: oklch(0.24 0.035 252);
+  --sidebar-ring: oklch(0.62 0.16 250);
+  /* Temperature climate (low chroma — meaning, not candy) */
+  --council: oklch(0.94 0.025 300);
+  --council-foreground: oklch(0.42 0.1 300);
+  --hot: oklch(0.945 0.025 25);
+  --hot-foreground: oklch(0.48 0.14 25);
+  --warm: oklch(0.955 0.03 85);
+  --warm-foreground: oklch(0.5 0.1 70);
+  --cold: oklch(0.945 0.02 250);
+  --cold-foreground: oklch(0.46 0.12 250);
+  /* Copper — human judgment / act-now */
+  --copper: oklch(0.72 0.1 55);
+  --copper-foreground: oklch(0.4 0.08 50);
+  /* Decay — relationship cooling */
+  --decay: oklch(0.72 0.015 250);
+  --decay-foreground: oklch(0.45 0.02 250);
+  /* Legacy aliases — solid Signal, not gradient theatre */
+  --gradient-primary: var(--primary);
+  --gradient-sidebar: var(--sidebar);
+  --shadow-card: none;
+  --shadow-elegant: none;
+  --shadow-overlay: 0 8px 24px -8px oklch(0.18 0.035 256 / 0.18);
+  /* Motion scale */
+  --motion-micro: 140ms;
+  --motion-ui: 240ms;
+  --motion-narrative: 480ms;
+  --motion-ambient: 10s;
+  --ease-out-quiet: cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
-/* The sidebar is dark navy, but its inner panels (filters, search, bulk actions)
-   use GLOBAL tokens (text-foreground, bg-card, border-border, …). Scope a token
-   remap to the sidebar container so that content stays readable on navy without
-   touching component classNames. Portalled popovers/dialogs render OUTSIDE this
-   element, so they keep the light theme. Also paints the vertical navy gradient. */
+/* Command plane: solid navy, token remap for filters. Portals stay light. */
 [data-sidebar="sidebar"] {
-  background: var(--gradient-sidebar);
-  --background: oklch(0.13 0.03 252);
+  background: var(--sidebar);
+  --background: oklch(0.13 0.028 252);
   --foreground: var(--sidebar-foreground);
-  --card: oklch(0.13 0.03 252);
+  --card: oklch(0.13 0.028 252);
   --card-foreground: var(--sidebar-foreground);
-  --popover: oklch(0.16 0.035 252);
+  --popover: oklch(0.16 0.03 252);
   --popover-foreground: var(--sidebar-foreground);
-  --muted: oklch(0.22 0.04 252);
-  --muted-foreground: oklch(0.72 0.03 245);
-  --secondary: oklch(0.22 0.04 252);
+  --muted: oklch(0.2 0.035 252);
+  --muted-foreground: oklch(0.7 0.025 245);
+  --secondary: oklch(0.2 0.035 252);
   --secondary-foreground: var(--sidebar-foreground);
   --accent: var(--sidebar-accent);
   --accent-foreground: var(--sidebar-accent-foreground);
@@ -178,6 +193,10 @@
   --warm-foreground: oklch(0.75 0.15 75);
   --cold: oklch(0.28 0.05 241);
   --cold-foreground: oklch(0.7 0.15 241);
+  --copper: oklch(0.65 0.1 55);
+  --copper-foreground: oklch(0.85 0.08 55);
+  --decay: oklch(0.45 0.02 250);
+  --decay-foreground: oklch(0.7 0.02 250);
 }
 
 @layer base {
@@ -188,62 +207,274 @@
   body {
     background-color: var(--color-background);
     color: var(--color-foreground);
+    font-family: var(--font-sans);
+    font-feature-settings: "cv11", "ss01";
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .font-display {
+    font-family: var(--font-display);
+    font-optical-sizing: auto;
+    letter-spacing: -0.025em;
+  }
+
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
   }
 }
 
-/* ── Workspace icons (home "Jump into a workspace") ──────────────────────────
-   Bespoke animated SVGs (see components/home/WorkspaceIcons.tsx). Elements are
-   static at rest; animation runs only while the card (.group) is hovered OR the
-   icon container carries .wsi--active (idle choreography). currentColor drives
-   the hue, set per-module on the tile. */
+/* ── Pulse Ring — signature ambient breath ───────────────────────────────── */
+@keyframes pulse-breath {
+  0%,
+  100% {
+    opacity: 0.92;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.012);
+  }
+}
 
-/* transform origins — most glyphs spin/scale about their own center; bars grow
-   from the bottom; full-icon rotations (radar sweep, orbit, scan ring) pivot on
-   the 24×24 viewBox center. */
-.wsi [class*="wsi-"] { transform-box: fill-box; transform-origin: center; }
-.wsi .wsi-bar { transform-origin: bottom; }
+@keyframes pulse-flash {
+  0% {
+    opacity: 0.85;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+.pulse-ring--breathe {
+  animation: pulse-breath var(--motion-ambient) ease-in-out infinite;
+}
+
+.pulse-ring--flash::after {
+  content: "";
+  position: absolute;
+  inset: -2px;
+  border-radius: 9999px;
+  border: 1px solid var(--primary);
+  animation: pulse-flash var(--motion-narrative) var(--ease-out-quiet) forwards;
+  pointer-events: none;
+}
+
+/* AI presence — thin Signal bar */
+.ai-presence {
+  border-left: 2px solid var(--primary);
+}
+
+/* Surface hover — border emphasis, not lift */
+.surface-hover {
+  transition:
+    border-color var(--motion-micro) ease-out,
+    background-color var(--motion-micro) ease-out;
+}
+.surface-hover:hover {
+  border-color: oklch(0.46 0.175 250 / 0.35);
+}
+
+/* Selection bar (Linear-like) */
+.row-selected {
+  background-color: oklch(0.46 0.175 250 / 0.06);
+  box-shadow: inset 2px 0 0 0 var(--primary);
+}
+
+/* ── Workspace icons — hover only (no idle loop) ─────────────────────────── */
+.wsi [class*="wsi-"] {
+  transform-box: fill-box;
+  transform-origin: center;
+}
+.wsi .wsi-bar {
+  transform-origin: bottom;
+}
 .wsi .wsi-sweep,
 .wsi .wsi-scan,
-.wsi .wsi-orbit { transform-box: view-box; transform-origin: 12px 12px; }
+.wsi .wsi-orbit {
+  transform-box: view-box;
+  transform-origin: 12px 12px;
+}
+.wsi .wsi-line {
+  stroke-dasharray: 34;
+  stroke-dashoffset: 0;
+}
 
-/* line-graph "draw" needs a dash setup even at rest */
-.wsi .wsi-line { stroke-dasharray: 34; stroke-dashoffset: 0; }
+.group:hover .wsi-node {
+  animation: wsi-pulse 1.6s ease-in-out infinite;
+}
+.group:hover .wsi-link {
+  animation: wsi-fade 2s ease-in-out infinite;
+}
+.group:hover .wsi-scan {
+  animation: wsi-spin 6s linear infinite;
+}
+.group:hover .wsi-ping {
+  animation: wsi-ping 1.6s ease-out infinite;
+}
+.group:hover .wsi-center {
+  animation: wsi-lock 1.4s ease-in-out infinite;
+}
+.group:hover .wsi-dot {
+  animation: wsi-pop 1.9s ease-in-out infinite;
+}
+.group:hover .wsi-spark {
+  animation: wsi-twinkle 1.5s ease-in-out infinite;
+}
+.group:hover .wsi-win {
+  animation: wsi-glow 1.8s ease-in-out infinite;
+}
+.group:hover .wsi-arrow {
+  animation: wsi-rise 1.7s ease-in-out infinite;
+}
+.group:hover .wsi-sweep {
+  animation: wsi-spin 1.8s linear infinite;
+}
+.group:hover .wsi-blip {
+  animation: wsi-blip 1.8s ease-in-out infinite;
+}
+.group:hover .wsi-bar {
+  animation: wsi-bar 1.6s ease-out infinite;
+}
+.group:hover .wsi-orbit {
+  animation: wsi-spin 2.6s linear infinite;
+}
+.group:hover .wsi-line {
+  animation: wsi-draw 1.8s ease-out infinite;
+}
 
-/* Trigger: animate on card-hover or while flagged active by the idle loop. */
-.group:hover .wsi-node,  .wsi--active .wsi-node  { animation: wsi-pulse 1.6s ease-in-out infinite; }
-.group:hover .wsi-link,  .wsi--active .wsi-link  { animation: wsi-fade 2s ease-in-out infinite; }
-.group:hover .wsi-scan,  .wsi--active .wsi-scan  { animation: wsi-spin 6s linear infinite; }
-.group:hover .wsi-ping,  .wsi--active .wsi-ping  { animation: wsi-ping 1.6s ease-out infinite; }
-.group:hover .wsi-center,.wsi--active .wsi-center{ animation: wsi-lock 1.4s ease-in-out infinite; }
-.group:hover .wsi-dot,   .wsi--active .wsi-dot   { animation: wsi-pop 1.9s ease-in-out infinite; }
-.group:hover .wsi-spark, .wsi--active .wsi-spark { animation: wsi-twinkle 1.5s ease-in-out infinite; }
-.group:hover .wsi-win,   .wsi--active .wsi-win   { animation: wsi-glow 1.8s ease-in-out infinite; }
-.group:hover .wsi-arrow, .wsi--active .wsi-arrow { animation: wsi-rise 1.7s ease-in-out infinite; }
-.group:hover .wsi-sweep, .wsi--active .wsi-sweep { animation: wsi-spin 1.8s linear infinite; }
-.group:hover .wsi-blip,  .wsi--active .wsi-blip  { animation: wsi-blip 1.8s ease-in-out infinite; }
-.group:hover .wsi-bar,   .wsi--active .wsi-bar   { animation: wsi-bar 1.6s ease-out infinite; }
-.group:hover .wsi-orbit, .wsi--active .wsi-orbit { animation: wsi-spin 2.6s linear infinite; }
-.group:hover .wsi-line,  .wsi--active .wsi-line  { animation: wsi-draw 1.8s ease-out infinite; }
+.group:hover .wsi-d1 {
+  animation-delay: 0.16s;
+}
+.group:hover .wsi-d2 {
+  animation-delay: 0.32s;
+}
+.group:hover .wsi-d3 {
+  animation-delay: 0.48s;
+}
 
-/* stagger delays (placed AFTER the assignments so they override the shorthand's
-   reset of animation-delay) */
-.group:hover .wsi-d1, .wsi--active .wsi-d1 { animation-delay: 0.16s; }
-.group:hover .wsi-d2, .wsi--active .wsi-d2 { animation-delay: 0.32s; }
-.group:hover .wsi-d3, .wsi--active .wsi-d3 { animation-delay: 0.48s; }
-
-@keyframes wsi-pulse { 0%, 100% { opacity: 0.85; transform: scale(1); } 50% { opacity: 1; transform: scale(1.18); } }
-@keyframes wsi-fade  { 0%, 100% { opacity: 0.3; } 50% { opacity: 0.9; } }
-@keyframes wsi-spin  { to { transform: rotate(360deg); } }
-@keyframes wsi-ping  { 0% { transform: scale(0.5); opacity: 0.7; } 100% { transform: scale(1.35); opacity: 0; } }
-@keyframes wsi-lock  { 0%, 100% { transform: scale(0.55); opacity: 0.6; } 50% { transform: scale(1); opacity: 1; } }
-@keyframes wsi-pop   { 0%, 100% { transform: scale(0); } 30%, 70% { transform: scale(1); } }
-@keyframes wsi-twinkle { 0%, 100% { opacity: 0.35; transform: scale(0.7) rotate(0deg); } 50% { opacity: 1; transform: scale(1.1) rotate(20deg); } }
-@keyframes wsi-glow  { 0%, 100% { opacity: 0.25; } 50% { opacity: 1; } }
-@keyframes wsi-rise  { 0%, 100% { transform: translateY(1px); opacity: 0.6; } 50% { transform: translateY(-2px); opacity: 1; } }
-@keyframes wsi-blip  { 0%, 100% { opacity: 0; } 15% { opacity: 1; } 60% { opacity: 0; } }
-@keyframes wsi-bar   { 0% { transform: scaleY(0.25); } 60%, 100% { transform: scaleY(1); } }
-@keyframes wsi-draw  { 0% { stroke-dashoffset: 34; } 65%, 100% { stroke-dashoffset: 0; } }
+@keyframes wsi-pulse {
+  0%,
+  100% {
+    opacity: 0.85;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.12);
+  }
+}
+@keyframes wsi-fade {
+  0%,
+  100% {
+    opacity: 0.3;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+@keyframes wsi-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes wsi-ping {
+  0% {
+    transform: scale(0.5);
+    opacity: 0.7;
+  }
+  100% {
+    transform: scale(1.35);
+    opacity: 0;
+  }
+}
+@keyframes wsi-lock {
+  0%,
+  100% {
+    transform: scale(0.55);
+    opacity: 0.6;
+  }
+  50% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+@keyframes wsi-pop {
+  0%,
+  100% {
+    transform: scale(0);
+  }
+  30%,
+  70% {
+    transform: scale(1);
+  }
+}
+@keyframes wsi-twinkle {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.7) rotate(0deg);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.1) rotate(20deg);
+  }
+}
+@keyframes wsi-glow {
+  0%,
+  100% {
+    opacity: 0.25;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+@keyframes wsi-rise {
+  0%,
+  100% {
+    transform: translateY(1px);
+    opacity: 0.6;
+  }
+  50% {
+    transform: translateY(-2px);
+    opacity: 1;
+  }
+}
+@keyframes wsi-blip {
+  0%,
+  100% {
+    opacity: 0;
+  }
+  15% {
+    opacity: 1;
+  }
+  60% {
+    opacity: 0;
+  }
+}
+@keyframes wsi-bar {
+  0% {
+    transform: scaleY(0.25);
+  }
+  60%,
+  100% {
+    transform: scaleY(1);
+  }
+}
+@keyframes wsi-draw {
+  0% {
+    stroke-dashoffset: 34;
+  }
+  65%,
+  100% {
+    stroke-dashoffset: 0;
+  }
+}
 
 @media (prefers-reduced-motion: reduce) {
-  .wsi [class*="wsi-"] { animation: none !important; }
+  .wsi [class*="wsi-"] {
+    animation: none !important;
+  }
+  .pulse-ring--breathe {
+    animation: none !important;
+  }
 }

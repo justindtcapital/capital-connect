@@ -13,11 +13,15 @@ import { Route as TargetingRouteImport } from './routes/targeting'
 import { Route as SignalsRouteImport } from './routes/signals'
 import { Route as QueryRouteImport } from './routes/query'
 import { Route as PortfolioRouteImport } from './routes/portfolio'
+import { Route as PlatformRouteImport } from './routes/platform'
 import { Route as EventsRouteImport } from './routes/events'
 import { Route as DashboardRouteImport } from './routes/dashboard'
 import { Route as CrmRouteImport } from './routes/crm'
 import { Route as CompaniesRouteImport } from './routes/companies'
+import { Route as ActivityRouteImport } from './routes/activity'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as ApiInngestRouteImport } from './routes/api/inngest'
+import { Route as ApiCronScanSignalsRouteImport } from './routes/api/cron/scan-signals'
 
 const TargetingRoute = TargetingRouteImport.update({
   id: '/targeting',
@@ -37,6 +41,11 @@ const QueryRoute = QueryRouteImport.update({
 const PortfolioRoute = PortfolioRouteImport.update({
   id: '/portfolio',
   path: '/portfolio',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const PlatformRoute = PlatformRouteImport.update({
+  id: '/platform',
+  path: '/platform',
   getParentRoute: () => rootRouteImport,
 } as any)
 const EventsRoute = EventsRouteImport.update({
@@ -59,92 +68,135 @@ const CompaniesRoute = CompaniesRouteImport.update({
   path: '/companies',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ActivityRoute = ActivityRouteImport.update({
+  id: '/activity',
+  path: '/activity',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiInngestRoute = ApiInngestRouteImport.update({
+  id: '/api/inngest',
+  path: '/api/inngest',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiCronScanSignalsRoute = ApiCronScanSignalsRouteImport.update({
+  id: '/api/cron/scan-signals',
+  path: '/api/cron/scan-signals',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/activity': typeof ActivityRoute
   '/companies': typeof CompaniesRoute
   '/crm': typeof CrmRoute
   '/dashboard': typeof DashboardRoute
   '/events': typeof EventsRoute
+  '/platform': typeof PlatformRoute
   '/portfolio': typeof PortfolioRoute
   '/query': typeof QueryRoute
   '/signals': typeof SignalsRoute
   '/targeting': typeof TargetingRoute
+  '/api/inngest': typeof ApiInngestRoute
+  '/api/cron/scan-signals': typeof ApiCronScanSignalsRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/activity': typeof ActivityRoute
   '/companies': typeof CompaniesRoute
   '/crm': typeof CrmRoute
   '/dashboard': typeof DashboardRoute
   '/events': typeof EventsRoute
+  '/platform': typeof PlatformRoute
   '/portfolio': typeof PortfolioRoute
   '/query': typeof QueryRoute
   '/signals': typeof SignalsRoute
   '/targeting': typeof TargetingRoute
+  '/api/inngest': typeof ApiInngestRoute
+  '/api/cron/scan-signals': typeof ApiCronScanSignalsRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/activity': typeof ActivityRoute
   '/companies': typeof CompaniesRoute
   '/crm': typeof CrmRoute
   '/dashboard': typeof DashboardRoute
   '/events': typeof EventsRoute
+  '/platform': typeof PlatformRoute
   '/portfolio': typeof PortfolioRoute
   '/query': typeof QueryRoute
   '/signals': typeof SignalsRoute
   '/targeting': typeof TargetingRoute
+  '/api/inngest': typeof ApiInngestRoute
+  '/api/cron/scan-signals': typeof ApiCronScanSignalsRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
+    | '/activity'
     | '/companies'
     | '/crm'
     | '/dashboard'
     | '/events'
+    | '/platform'
     | '/portfolio'
     | '/query'
     | '/signals'
     | '/targeting'
+    | '/api/inngest'
+    | '/api/cron/scan-signals'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
+    | '/activity'
     | '/companies'
     | '/crm'
     | '/dashboard'
     | '/events'
+    | '/platform'
     | '/portfolio'
     | '/query'
     | '/signals'
     | '/targeting'
+    | '/api/inngest'
+    | '/api/cron/scan-signals'
   id:
     | '__root__'
     | '/'
+    | '/activity'
     | '/companies'
     | '/crm'
     | '/dashboard'
     | '/events'
+    | '/platform'
     | '/portfolio'
     | '/query'
     | '/signals'
     | '/targeting'
+    | '/api/inngest'
+    | '/api/cron/scan-signals'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  ActivityRoute: typeof ActivityRoute
   CompaniesRoute: typeof CompaniesRoute
   CrmRoute: typeof CrmRoute
   DashboardRoute: typeof DashboardRoute
   EventsRoute: typeof EventsRoute
+  PlatformRoute: typeof PlatformRoute
   PortfolioRoute: typeof PortfolioRoute
   QueryRoute: typeof QueryRoute
   SignalsRoute: typeof SignalsRoute
   TargetingRoute: typeof TargetingRoute
+  ApiInngestRoute: typeof ApiInngestRoute
+  ApiCronScanSignalsRoute: typeof ApiCronScanSignalsRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -177,6 +229,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof PortfolioRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/platform': {
+      id: '/platform'
+      path: '/platform'
+      fullPath: '/platform'
+      preLoaderRoute: typeof PlatformRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/events': {
       id: '/events'
       path: '/events'
@@ -205,6 +264,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof CompaniesRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/activity': {
+      id: '/activity'
+      path: '/activity'
+      fullPath: '/activity'
+      preLoaderRoute: typeof ActivityRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/': {
       id: '/'
       path: '/'
@@ -212,19 +278,37 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/inngest': {
+      id: '/api/inngest'
+      path: '/api/inngest'
+      fullPath: '/api/inngest'
+      preLoaderRoute: typeof ApiInngestRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/cron/scan-signals': {
+      id: '/api/cron/scan-signals'
+      path: '/api/cron/scan-signals'
+      fullPath: '/api/cron/scan-signals'
+      preLoaderRoute: typeof ApiCronScanSignalsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  ActivityRoute: ActivityRoute,
   CompaniesRoute: CompaniesRoute,
   CrmRoute: CrmRoute,
   DashboardRoute: DashboardRoute,
   EventsRoute: EventsRoute,
+  PlatformRoute: PlatformRoute,
   PortfolioRoute: PortfolioRoute,
   QueryRoute: QueryRoute,
   SignalsRoute: SignalsRoute,
   TargetingRoute: TargetingRoute,
+  ApiInngestRoute: ApiInngestRoute,
+  ApiCronScanSignalsRoute: ApiCronScanSignalsRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

@@ -1,16 +1,29 @@
 import { useEffect, useMemo, useState } from "react";
 import { createFileRoute, useRouter } from "@tanstack/react-router";
+import { useQuery } from "@tanstack/react-query";
 import {
   fetchContacts,
   fetchPortfolioCompanies,
+  fetchOwnershipIndex,
   recalculateRatings,
+  logOpsEvent,
+  addContact,
 } from "@/utils/sheets.functions";
 import type { Contact, PortfolioCompany } from "@/lib/types";
 import { ContactList } from "@/components/crm/ContactList";
 import { syncAsanaActivities, syncActivityTracks } from "@/utils/activity-sync.functions";
+import { syncGmailCrmTouches } from "@/utils/gmail-crm-sync.functions";
 import { syncEventExposure } from "@/utils/event-exposure.functions";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Plus, Upload, Download, ClipboardPaste, ChevronDown, Gauge, Loader2, Activity } from "lucide-react";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -20,6 +33,8 @@ import {
 import { useFilters } from "@/lib/filter-context";
 import { useFilterOptions } from "@/lib/filter-options-context";
 import { useSelection } from "@/lib/selection-context";
+import { useAuth } from "@/lib/auth-context";
+import { teamProfile } from "@/lib/user-ownership";
 import { BulkUploadDialog } from "@/components/crm/BulkUploadDialog";
 import { SmartPasteDialog } from "@/components/crm/SmartPasteDialog";
 import { canonicalLocations } from "@/lib/location-utils";
@@ -63,38 +78,108 @@ function CrmPage() {
   // Portfolio-tagged contacts belong to portfolio companies — surface them on the Portfolio page instead.
   const contacts = useMemo(() => allContacts.filter((c) => !isPortfolioContact(c)), [allContacts]);
   const { filters } = useFilters();
+  const { email, ready: authReady } = useAuth();
+  const profile = useMemo(() => teamProfile(email), [email]);
+  const ownershipQuery = useQuery({
+    queryKey: ["ownership-index", email],
+    queryFn: () => fetchOwnershipIndex({ data: { email: email! } }),
+    enabled: Boolean(authReady && email),
+    staleTime: 60_000,
+  });
+  const ownedGids = useMemo(
+    () => new Set(ownershipQuery.data?.ownedGids || []),
+    [ownershipQuery.data?.ownedGids],
+  );
   const { updateOptions } = useFilterOptions();
   const { allFilteredContacts, selectedContacts, setOnBulkDelete } = useSelection();
   const router = useRouter();
   const [bulkUploadOpen, setBulkUploadOpen] = useState(false);
   const [pasteOpen, setPasteOpen] = useState(false);
+  const [addContactOpen, setAddContactOpen] = useState(false);
+  const [addBusy, setAddBusy] = useState(false);
+  const [addForm, setAddForm] = useState({
+    name: "",
+    email: "",
+    company: "",
+    title: "",
+    linkedinUrl: "",
+  });
   const [recalcBusy, setRecalcBusy] = useState(false);
   const [syncBusy, setSyncBusy] = useState(false);
 
-  // Pull BD/GTM activities from Asana and log each onto the contacts it matches
+  const handleAddContact = async () => {
+    const name = addForm.name.trim();
+    const email = addForm.email.trim();
+    if (!name && !email) {
+      toast.error("Name or email is required.");
+      return;
+    }
+    if (addBusy) return;
+    setAddBusy(true);
+    try {
+      await addContact({
+        data: {
+          name: name || email,
+          role: addForm.title.trim(),
+          company: addForm.company.trim(),
+          email,
+          phone: "",
+          location: "",
+          linkedinUrl: addForm.linkedinUrl.trim(),
+          prime: "",
+          sector: "",
+          temperature: "Warm",
+          source: "Manual Entry",
+        },
+      });
+      toast.success(`Saved ${name || email} to Contacts.`);
+      setAddContactOpen(false);
+      setAddForm({ name: "", email: "", company: "", title: "", linkedinUrl: "" });
+      await router.invalidate();
+    } catch (e) {
+      console.error("addContact failed", e);
+      toast.error("Couldn't save contact to the sheet — see console.");
+    } finally {
+      setAddBusy(false);
+    }
+  };
+
+  // Pull BD/GTM activities from Asana + Gmail aliases and log onto matched contacts
   // (deduped, read-only). Safe to re-run — only new/newly-matched activities land.
   const handleSyncActivity = async () => {
     setSyncBusy(true);
     try {
-      const [res, exp, tracks] = await Promise.all([
+      const [res, exp, tracks, gmailCrm] = await Promise.all([
         syncAsanaActivities(),
         syncEventExposure(),
         syncActivityTracks(),
+        syncGmailCrmTouches(),
       ]);
       if (!res.ok) {
         toast.error(res.error || "Activity sync failed.");
         return;
       }
       if (res.activities === 0) {
-        toast.info("No BD/GTM activities found in Asana (check the project GIDs / access).");
-      } else if (res.logged === 0) {
+        toast.info("No BD/GTM activities found (check Asana project GIDs and GMAIL_BD_ALIAS / GMAIL_GTM_ALIAS).");
+      } else if (res.logged === 0 && res.portcosLogged === 0) {
         toast.success(
           `Up to date — ${res.matched} matched activit${res.matched !== 1 ? "ies" : "y"}, nothing new to log.`,
         );
       } else {
+        const parts: string[] = [];
+        if (res.logged > 0) {
+          parts.push(
+            `Logged ${res.logged} activit${res.logged !== 1 ? "ies" : "y"} across ${res.contactsTouched} contact${res.contactsTouched !== 1 ? "s" : ""}`,
+          );
+        }
+        if (res.portcosLogged > 0) {
+          parts.push(
+            `${res.portcosLogged} PortCo tag${res.portcosLogged !== 1 ? "s" : ""}`,
+          );
+        }
         toast.success(
-          `Logged ${res.logged} activit${res.logged !== 1 ? "ies" : "y"} across ${res.contactsTouched} contact${res.contactsTouched !== 1 ? "s" : ""}` +
-            (res.skipped > 0 ? ` · ${res.skipped} already synced.` : "."),
+          parts.join(" · ") +
+            (res.skipped > 0 && res.logged > 0 ? ` · ${res.skipped} already synced.` : "."),
         );
       }
       if (!exp.ok) {
@@ -115,7 +200,42 @@ function CrmPage() {
           `BD/GTM tabs: added ${tracks.bdLogged} BD · ${tracks.gtmLogged} GTM row${tracks.gtmLogged !== 1 ? "s" : ""}.`,
         );
       }
+      if (!gmailCrm.ok) {
+        toast.error(gmailCrm.error || "Gmail CRM sync failed.");
+      } else if (!gmailCrm.skipped && (gmailCrm.logged > 0 || gmailCrm.eventsLogged > 0)) {
+        const parts: string[] = [];
+        if (gmailCrm.logged > 0) {
+          parts.push(
+            `${gmailCrm.logged} touch${gmailCrm.logged !== 1 ? "es" : ""} across ${gmailCrm.matchedContacts} contact${gmailCrm.matchedContacts !== 1 ? "s" : ""}`,
+          );
+        }
+        if (gmailCrm.eventsLogged > 0) {
+          parts.push(
+            `${gmailCrm.eventsLogged} event link${gmailCrm.eventsLogged !== 1 ? "s" : ""}`,
+          );
+        }
+        toast.success(`Gmail: ${parts.join(" · ")}.`);
+      }
+      // Refresh Interaction Trails from Notes, then re-score so temperature
+      // reflects the new activity (locked ratings are left alone).
+      const trailTouched =
+        res.logged > 0 ||
+        (!gmailCrm.skipped && (gmailCrm.logged > 0 || gmailCrm.eventsLogged > 0)) ||
+        (exp.ok && exp.engagementsLogged > 0);
+      if (trailTouched) {
+        try {
+          const scores = await recalculateRatings();
+          if (scores.updated > 0) {
+            toast.success(
+              `Updated ${scores.updated} rating${scores.updated !== 1 ? "s" : ""} from new activity.`,
+            );
+          }
+        } catch (e) {
+          console.error("post-sync recalculateRatings failed", e);
+        }
+      }
       await router.invalidate();
+      await ownershipQuery.refetch();
     } catch (e) {
       console.error("syncAsanaActivities failed", e);
       toast.error("Activity sync failed — see console.");
@@ -155,15 +275,34 @@ function CrmPage() {
       return;
     }
     const date = new Date().toISOString().split("T")[0];
+    const filename = format === "xlsx" ? `contacts-${date}.xlsx` : `contacts-${date}.csv`;
     if (format === "xlsx") {
-      downloadXlsx(`contacts-${date}.xlsx`, contactsToXlsx(toExport));
+      downloadXlsx(filename, contactsToXlsx(toExport));
     } else {
-      downloadCsv(`contacts-${date}.csv`, contactsToCsv(toExport));
+      downloadCsv(filename, contactsToCsv(toExport));
     }
     const label = format === "xlsx" ? "Excel" : "CSV";
     toast.success(
       `Exported ${toExport.length} contact${toExport.length !== 1 ? "s" : ""} to ${label}.`,
     );
+    void logOpsEvent({
+      data: {
+        action: "export",
+        source: format === "xlsx" ? "contacts_xlsx" : "contacts_csv",
+        status: "ok",
+        summary: `Exported ${toExport.length} contacts to ${filename}`,
+        records: toExport.length,
+        details: {
+          format,
+          filename,
+          selection: selectedContacts.length > 0 ? "selected" : "filtered_view",
+        },
+        items: toExport.slice(0, 80).map((c) => {
+          const email = (c.email || "").split(";")[0]?.trim() || "";
+          return `${c.name || "(no name)"}${email ? ` <${email}>` : ""}${c.company ? ` · ${c.company}` : ""}`;
+        }),
+      },
+    }).catch((e) => console.error("logOpsEvent export failed", e));
   };
 
   // Portfolio-company names — from the Portfolio sheet plus any already recorded
@@ -290,7 +429,8 @@ function CrmPage() {
 
           <Button
             size="sm"
-            className="text-xs bg-(image:--gradient-primary) shadow-(--shadow-elegant) hover:shadow-(--shadow-elegant) hover:brightness-110"
+            className="text-xs"
+            onClick={() => setAddContactOpen(true)}
           >
             <Plus className="h-3.5 w-3.5 mr-1.5" />
             Add Contact
@@ -298,7 +438,96 @@ function CrmPage() {
         </div>
       </div>
 
-      <ContactList contacts={contacts} filters={filters} focusEmail={focusEmail} />
+      <ContactList
+        contacts={contacts}
+        filters={filters}
+        focusEmail={focusEmail}
+        teamProfile={profile}
+        ownedGids={ownedGids}
+        ownershipLoading={ownershipQuery.isFetching}
+      />
+
+      <Dialog open={addContactOpen} onOpenChange={setAddContactOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Add Contact</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3 py-2">
+            <div>
+              <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+                Name
+              </label>
+              <Input
+                value={addForm.name}
+                onChange={(e) => setAddForm((f) => ({ ...f, name: e.target.value }))}
+                placeholder="Full name"
+                className="h-9 text-sm"
+              />
+            </div>
+            <div>
+              <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+                Email
+              </label>
+              <Input
+                value={addForm.email}
+                onChange={(e) => setAddForm((f) => ({ ...f, email: e.target.value }))}
+                placeholder="name@company.com"
+                className="h-9 text-sm"
+              />
+            </div>
+            <div>
+              <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+                Company
+              </label>
+              <Input
+                value={addForm.company}
+                onChange={(e) => setAddForm((f) => ({ ...f, company: e.target.value }))}
+                placeholder="Company"
+                className="h-9 text-sm"
+              />
+            </div>
+            <div>
+              <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+                Title
+              </label>
+              <Input
+                value={addForm.title}
+                onChange={(e) => setAddForm((f) => ({ ...f, title: e.target.value }))}
+                placeholder="Role / title"
+                className="h-9 text-sm"
+              />
+            </div>
+            <div>
+              <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+                LinkedIn
+              </label>
+              <Input
+                value={addForm.linkedinUrl}
+                onChange={(e) => setAddForm((f) => ({ ...f, linkedinUrl: e.target.value }))}
+                placeholder="https://linkedin.com/in/..."
+                className="h-9 text-sm"
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setAddContactOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              onClick={() => void handleAddContact()}
+              disabled={addBusy || (!addForm.name.trim() && !addForm.email.trim())}
+            >
+              {addBusy ? (
+                <>
+                  <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" /> Saving…
+                </>
+              ) : (
+                "Save to sheet"
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <BulkUploadDialog
         open={bulkUploadOpen}

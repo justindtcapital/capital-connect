@@ -16,7 +16,7 @@ export function ContactCard({ contact, onClick }: ContactCardProps) {
 
   return (
     <Card
-      className="cursor-pointer transition-all duration-200 hover:-translate-y-0.5 hover:shadow-(--shadow-elegant) hover:border-primary/40 border-border h-full flex flex-col"
+      className="cursor-pointer surface-hover border-border h-full flex flex-col"
       onClick={onClick}
     >
       <CardContent className="p-5 flex flex-col flex-1">

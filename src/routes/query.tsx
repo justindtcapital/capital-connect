@@ -1,12 +1,20 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, useRouter } from "@tanstack/react-router";
 import { useState, useRef, useEffect } from "react";
 import {
   submitQuery,
   resumeQuery,
+  loadQuerySession,
+  getQueryProgress,
+  endQuerySession,
+  saveDraftToCrm,
+  saveScoreToCrm,
+  saveInviteListToCrm,
   type QueryResponse,
   type AttachmentInput,
+  type SaveArtifactResult,
+  type QueryProgress,
 } from "@/utils/llm.functions";
-import { updateContact, addContact, addAppEvent, addEvent } from "@/utils/sheets.functions";
+import { useAuth } from "@/lib/auth-context";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -30,6 +38,8 @@ import {
   Image as ImageIcon,
   Lock,
   Plus,
+  Save,
+  Check,
 } from "lucide-react";
 import { toast } from "sonner";
 import { MarkdownMessage } from "@/components/query/MarkdownMessage";
@@ -51,7 +61,10 @@ interface Turn {
   attachments?: string[];
   prov?: { tools: JV[]; sources: JV[]; tokensIn: number; tokensOut: number };
   artifacts?: JV[];
+  partial?: boolean;
 }
+
+const SESSION_LS_KEY = "vp-query-session-id";
 interface FileDraft {
   id: string;
   filename: string;
@@ -86,39 +99,138 @@ const fmtSize = (b: number) =>
       : `${(b / 1024 / 1024).toFixed(1)} MB`;
 
 function QueryPage() {
+  const { email: authEmail } = useAuth();
+  const router = useRouter();
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [sessionId, setSessionId] = useState<string | undefined>();
   const [turns, setTurns] = useState<Turn[]>([]);
   const [pending, setPending] = useState<QueryResponse | null>(null);
   const [files, setFiles] = useState<FileDraft[]>([]);
+  const [progress, setProgress] = useState<QueryProgress | null>(null);
+  const [restoring, setRestoring] = useState(true);
   const endRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [turns, pending, busy]);
+  }, [turns, pending, busy, progress?.message]);
+
+  // Rehydrate chat + pending approval after refresh.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const sid =
+          typeof localStorage !== "undefined"
+            ? localStorage.getItem(SESSION_LS_KEY) || ""
+            : "";
+        if (!sid) {
+          if (!cancelled) setRestoring(false);
+          return;
+        }
+        const snap = await loadQuerySession({
+          data: { sessionId: sid, user: authEmail || undefined },
+        });
+        if (cancelled) return;
+        if (!snap) {
+          try {
+            localStorage.removeItem(SESSION_LS_KEY);
+          } catch {
+            /* */
+          }
+          return;
+        }
+        setSessionId(snap.sessionId);
+        setTurns(snap.turns as Turn[]);
+        if (snap.pending) setPending(snap.pending);
+        if (snap.pendingLost) {
+          toast.message("A pending approval expired — ask again to continue.");
+        }
+      } catch (e) {
+        console.error("loadQuerySession failed", e);
+      } finally {
+        if (!cancelled) setRestoring(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [authEmail]);
+
+  // Poll coarse agent progress while a query is running.
+  useEffect(() => {
+    if (!busy || !sessionId) {
+      setProgress(null);
+      return;
+    }
+    let alive = true;
+    const tick = async () => {
+      try {
+        const p = await getQueryProgress({ data: { sessionId } });
+        if (alive && p) setProgress(p);
+      } catch {
+        /* ignore */
+      }
+    };
+    void tick();
+    const id = window.setInterval(tick, 900);
+    return () => {
+      alive = false;
+      window.clearInterval(id);
+    };
+  }, [busy, sessionId]);
 
   const addTurn = (t: Turn) => setTurns((prev) => [...prev, t]);
 
+  const rememberSession = (sid: string) => {
+    setSessionId(sid);
+    try {
+      localStorage.setItem(SESSION_LS_KEY, sid);
+    } catch {
+      /* */
+    }
+  };
+
   const handleOutcome = (res: QueryResponse) => {
-    setSessionId(res.meta.sessionId);
+    rememberSession(res.meta.sessionId);
     const o = res.outcome;
+    if (res.wrote) {
+      toast.success("CRM updated");
+      void router.invalidate();
+    }
     if (o.status === "complete") {
       addTurn({
         role: "assistant",
         text: o.answer || "(no answer)",
-        prov: o.state.prov as Turn["prov"],
-        artifacts: o.state.prov.artifacts,
+        prov: o.prov as Turn["prov"],
+        artifacts: o.prov.artifacts,
+        partial: o.partial,
       });
       setPending(null);
+      if (o.partial) toast.message("Partial answer — ask a follow-up to continue.");
     } else if (o.status === "error") {
       addTurn({ role: "assistant", text: `⚠️ ${o.error}` });
       setPending(null);
     } else {
       setPending(res);
     }
+  };
+
+  const startNewChat = () => {
+    const sid = sessionId;
+    setTurns([]);
+    setPending(null);
+    setFiles([]);
+    setSessionId(undefined);
+    setProgress(null);
+    try {
+      localStorage.removeItem(SESSION_LS_KEY);
+    } catch {
+      /* */
+    }
+    if (sid) void endQuerySession({ data: { sessionId: sid } });
   };
 
   const onFiles = async (list: FileList | null) => {
@@ -168,8 +280,6 @@ function QueryPage() {
       dataBase64: f.dataBase64,
       level: f.level,
     }));
-    // Carry prior turns (text only) so the agent keeps context across messages.
-    const priorMessages = turns.map((t) => ({ role: t.role, content: t.text }));
     addTurn({
       role: "user",
       text: prompt || "(attachment only)",
@@ -178,7 +288,14 @@ function QueryPage() {
     setFiles([]);
     setBusy(true);
     try {
-      const res = await submitQuery({ data: { prompt, sessionId, attachments, priorMessages } });
+      const res = await submitQuery({
+        data: {
+          prompt,
+          sessionId,
+          attachments,
+          user: authEmail || undefined,
+        },
+      });
       handleOutcome(res);
     } catch (e) {
       console.error("submitQuery failed", e);
@@ -188,7 +305,10 @@ function QueryPage() {
     }
   };
 
-  const resume = async (resultText: string, approvedBy?: string) => {
+  const resume = async (opts: {
+    resultText?: string;
+    decision?: "approved" | "declined";
+  }) => {
     if (!pending) return;
     setBusy(true);
     const { meta, outcome } = pending;
@@ -196,11 +316,12 @@ function QueryPage() {
     try {
       const res = await resumeQuery({
         data: {
-          meta,
-          state: outcome.state,
+          sessionId: meta.sessionId,
+          queryId: meta.queryId,
           toolUseId: outcome.status === "needs_input" ? outcome.pause.toolUseId : "",
-          resultText,
-          approvedBy,
+          resultText: opts.resultText,
+          decision: opts.decision,
+          approvedBy: authEmail || undefined,
         },
       });
       handleOutcome(res);
@@ -230,18 +351,13 @@ function QueryPage() {
               </p>
             </div>
           </div>
-          {turns.length > 0 && (
+          {(turns.length > 0 || pending) && (
             <Button
               variant="outline"
               size="sm"
               className="h-7 text-xs"
               disabled={busy}
-              onClick={() => {
-                setTurns([]);
-                setPending(null);
-                setFiles([]);
-                setSessionId(undefined);
-              }}
+              onClick={startNewChat}
             >
               <Plus className="h-3.5 w-3.5 mr-1" /> New chat
             </Button>
@@ -251,7 +367,12 @@ function QueryPage() {
 
       <div className="flex-1 overflow-auto">
         <div className="max-w-3xl mx-auto px-6 py-6 space-y-5">
-          {turns.length === 0 && !pending && !busy && (
+          {restoring && turns.length === 0 && !pending && (
+            <div className="text-center py-16 text-sm text-muted-foreground">
+              Restoring conversation…
+            </div>
+          )}
+          {!restoring && turns.length === 0 && !pending && !busy && (
             <div className="text-center py-16">
               <div className="h-12 w-12 rounded-2xl bg-primary/10 flex items-center justify-center mx-auto mb-4">
                 <Bot className="h-6 w-6 text-primary" />
@@ -278,14 +399,23 @@ function QueryPage() {
           )}
 
           {turns.map((t, i) => (
-            <TurnView key={i} turn={t} />
+            <TurnView key={i} turn={t} user={authEmail || undefined} />
           ))}
 
           {pause?.kind === "clarification" && (
-            <ClarificationCard input={pause.input} onSubmit={(txt) => resume(txt)} busy={busy} />
+            <ClarificationCard
+              input={pause.input}
+              onSubmit={(txt) => resume({ resultText: txt })}
+              busy={busy}
+            />
           )}
           {pause?.kind === "write_approval" && (
-            <ApprovalCard name={pause.name} input={pause.input} onResolve={resume} busy={busy} />
+            <ApprovalCard
+              name={pause.name}
+              input={pause.input}
+              onResolve={(decision) => resume({ decision })}
+              busy={busy}
+            />
           )}
 
           {busy && (
@@ -293,10 +423,18 @@ function QueryPage() {
               <div className="h-7 w-7 rounded-full bg-primary/10 flex items-center justify-center shrink-0">
                 <Bot className="h-4 w-4 text-primary" />
               </div>
-              <div className="flex gap-1 px-3 py-2.5 rounded-2xl bg-muted">
-                <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/50 animate-bounce [animation-delay:-0.3s]" />
-                <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/50 animate-bounce [animation-delay:-0.15s]" />
-                <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/50 animate-bounce" />
+              <div className="flex flex-col gap-1 px-3 py-2.5 rounded-2xl bg-muted min-w-[12rem]">
+                <div className="flex gap-1">
+                  <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/50 animate-bounce [animation-delay:-0.3s]" />
+                  <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/50 animate-bounce [animation-delay:-0.15s]" />
+                  <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/50 animate-bounce" />
+                </div>
+                <div className="text-[11px] text-muted-foreground leading-tight">
+                  {progress?.message || "Working…"}
+                  {progress?.tool ? (
+                    <span className="text-muted-foreground/70"> · {progress.tool}</span>
+                  ) : null}
+                </div>
               </div>
             </div>
           )}
@@ -384,7 +522,7 @@ function QueryPage() {
               onClick={send}
               disabled={!canSend}
               size="icon"
-              className="h-9 w-9 shrink-0 rounded-xl bg-(image:--gradient-primary) shadow-(--shadow-elegant) hover:shadow-(--shadow-elegant) hover:brightness-110"
+              className="h-9 w-9 shrink-0 rounded-lg bg-primary text-primary-foreground hover:bg-primary/90"
             >
               {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
             </Button>
@@ -399,7 +537,7 @@ function QueryPage() {
   );
 }
 
-function TurnView({ turn }: { turn: Turn }) {
+function TurnView({ turn, user }: { turn: Turn; user?: string }) {
   const [showProv, setShowProv] = useState(false);
   const isUser = turn.role === "user";
   const artifacts = (turn.artifacts || []) as Array<Record<string, JV>>;
@@ -416,6 +554,11 @@ function TurnView({ turn }: { turn: Turn }) {
         >
           {isUser ? turn.text : <MarkdownMessage text={turn.text} />}
         </div>
+        {turn.partial && (
+          <Badge variant="outline" className="mt-1 text-[9px] text-amber-700 border-amber-300">
+            Partial — continue with a follow-up
+          </Badge>
+        )}
         {turn.attachments && turn.attachments.length > 0 && (
           <div className="flex flex-wrap gap-1 mt-1 justify-end">
             {turn.attachments.map((n, i) => (
@@ -428,7 +571,7 @@ function TurnView({ turn }: { turn: Turn }) {
         )}
 
         {artifacts.map((a, i) => (
-          <ArtifactView key={i} a={a} />
+          <ArtifactView key={i} a={a} user={user} />
         ))}
 
         {turn.prov && (turn.prov.tools.length > 0 || turn.prov.sources.length > 0) && (
@@ -496,8 +639,56 @@ function TurnView({ turn }: { turn: Turn }) {
   );
 }
 
-function ArtifactView({ a }: { a: Record<string, unknown> }) {
+// A "save this artifact into the CRM" action button with saving/saved states.
+function SaveToCrmButton({
+  label,
+  disabled,
+  onSave,
+}: {
+  label: string;
+  disabled?: boolean;
+  onSave: () => Promise<SaveArtifactResult>;
+}) {
+  const [saving, setSaving] = useState(false);
+  const [savedTo, setSavedTo] = useState<string | null>(null);
+  if (savedTo) {
+    return (
+      <span className="inline-flex items-center gap-1 text-[11px] text-emerald-600">
+        <Check className="h-3 w-3" /> Saved to {savedTo}
+      </span>
+    );
+  }
+  return (
+    <button
+      disabled={disabled || saving}
+      onClick={async () => {
+        setSaving(true);
+        try {
+          const res = await onSave();
+          if (res.saved) {
+            setSavedTo(res.savedTo);
+            toast.success(`Saved to ${res.savedTo}`);
+          } else {
+            toast.error(res.error);
+          }
+        } catch (e) {
+          console.error("artifact save failed", e);
+          toast.error("Save failed — see console.");
+        } finally {
+          setSaving(false);
+        }
+      }}
+      className="inline-flex items-center gap-1 text-[11px] text-primary hover:underline disabled:opacity-50 disabled:no-underline"
+    >
+      {saving ? <Loader2 className="h-3 w-3 animate-spin" /> : <Save className="h-3 w-3" />}
+      {saving ? "Saving…" : label}
+    </button>
+  );
+}
+
+function ArtifactView({ a, user }: { a: Record<string, unknown>; user?: string }) {
   const type = String(a.type);
+  const [eventName, setEventName] = useState("");
   if (type === "draft_email") {
     const to = String(a.to || ""),
       subject = String(a.subject || ""),
@@ -510,19 +701,30 @@ function ArtifactView({ a }: { a: Record<string, unknown> }) {
         </div>
         <div className="text-sm font-semibold">{subject}</div>
         <div className="text-xs text-muted-foreground whitespace-pre-wrap mt-1">{body}</div>
-        {to && (
-          <a
-            href={mailto}
-            className="text-primary text-[11px] hover:underline inline-flex items-center gap-0.5 mt-2"
-          >
-            Open in email <ExternalLink className="h-3 w-3" />
-          </a>
-        )}
+        <div className="flex items-center gap-3 mt-2">
+          {to && (
+            <a
+              href={mailto}
+              className="text-primary text-[11px] hover:underline inline-flex items-center gap-0.5"
+            >
+              Open in email <ExternalLink className="h-3 w-3" />
+            </a>
+          )}
+          <SaveToCrmButton
+            label="Log to CRM"
+            disabled={!to}
+            onSave={() => saveDraftToCrm({ data: { email: to, subject, body, user } })}
+          />
+          {!to && (
+            <span className="text-[10px] text-muted-foreground">no recipient email — can't log</span>
+          )}
+        </div>
       </div>
     );
   }
   if (type === "invite_list") {
     const contacts = (a.contacts as Array<Record<string, unknown>>) || [];
+    const emails = contacts.map((c) => String(c.email || "")).filter(Boolean);
     return (
       <div className="mt-2 border border-border rounded-xl bg-card p-3">
         <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1.5">
@@ -538,6 +740,21 @@ function ArtifactView({ a }: { a: Record<string, unknown> }) {
             </div>
           ))}
         </div>
+        <div className="flex items-center gap-2 mt-2 pt-2 border-t border-border">
+          <Input
+            value={eventName}
+            onChange={(e) => setEventName(e.target.value)}
+            placeholder="Event name…"
+            className="h-7 text-xs max-w-[220px]"
+          />
+          <SaveToCrmButton
+            label={`Tag ${emails.length} as invited`}
+            disabled={!eventName.trim() || emails.length === 0}
+            onSave={() =>
+              saveInviteListToCrm({ data: { eventName: eventName.trim(), emails, user } })
+            }
+          />
+        </div>
       </div>
     );
   }
@@ -552,6 +769,21 @@ function ArtifactView({ a }: { a: Record<string, unknown> }) {
         {sc.rationale ? (
           <div className="text-xs text-muted-foreground mt-0.5">{String(sc.rationale)}</div>
         ) : null}
+        <div className="mt-2">
+          <SaveToCrmButton
+            label="Save to Platform · Diligence"
+            disabled={sc.score == null}
+            onSave={() =>
+              saveScoreToCrm({
+                data: {
+                  company: String(a.company || ""),
+                  score: sc as { score?: number; dimensions?: unknown[]; rationale?: string },
+                  user,
+                },
+              })
+            }
+          />
+        </div>
       </div>
     );
   }
@@ -665,18 +897,16 @@ function ApprovalCard({
 }: {
   name: string;
   input: unknown;
-  onResolve: (resultText: string, approvedBy?: string) => void;
+  onResolve: (decision: "approved" | "declined") => void;
   busy: boolean;
 }) {
   const d = (input || {}) as Record<string, unknown>;
   const v = (k: string) => (d[k] == null ? undefined : String(d[k]));
   const list = (k: string) => (Array.isArray(d[k]) ? (d[k] as unknown[]).map(String) : []);
 
-  // (title, label, field rows, commit fn) per write tool.
   let title = "Approve write to CRM";
   let subject = "";
   let rows: Array<[string, string]> = [];
-  let commit: () => Promise<void>;
 
   if (name === "sheets_add_contact") {
     title = "Approve — add new contact";
@@ -686,21 +916,6 @@ function ApprovalCard({
     )
       .filter((f) => v(f) != null)
       .map((f) => [f, v(f)!]);
-    commit = async () => {
-      await addContact({
-        data: {
-          name: v("name") || "",
-          role: v("title") || "",
-          company: v("company") || "",
-          email: v("email") || "",
-          phone: v("phone") || "",
-          location: v("location") || "",
-          prime: v("prime") || "",
-          sector: v("sector") || "",
-          temperature: v("temperature") || "Warm",
-        },
-      });
-    };
   } else if (name === "sheets_add_attendees") {
     const emails = list("emails");
     const type = v("type") || "invited";
@@ -711,72 +926,53 @@ function ApprovalCard({
       ["count", String(emails.length)],
       ["contacts", emails.slice(0, 12).join(", ") + (emails.length > 12 ? " …" : "")],
     ];
-    commit = async () => {
-      const ev = v("eventName") || "";
-      for (const email of emails) {
-        await addEvent({ data: { contactEmail: email, eventName: ev, type } });
-      }
-    };
   } else if (name === "sheets_add_event") {
     title = "Approve — create event (app, not Asana)";
     subject = v("name") || "";
-    rows = [
-      ["date", v("date") || ""],
-      ["type", v("type") || ""],
-      ["format", v("format") || ""],
-      ["lead", v("lead") || ""],
-      ["role", v("role") || ""],
-      ["sectors", list("sectors").join(", ")],
-      ["portcos", list("portcos").join(", ")],
-    ].filter(([, val]) => val) as Array<[string, string]>;
-    commit = async () => {
-      await addAppEvent({
-        data: {
-          name: v("name") || "",
-          date: v("date") || "",
-          type: v("type"),
-          format: v("format"),
-          lead: v("lead"),
-          role: v("role"),
-          sectors: list("sectors"),
-          portcos: list("portcos"),
-        },
-      });
-    };
+    rows = (
+      [
+        ["date", v("date") || ""],
+        ["type", v("type") || ""],
+        ["format", v("format") || ""],
+        ["lead", v("lead") || ""],
+        ["role", v("role") || ""],
+        ["sectors", list("sectors").join(", ")],
+        ["portcos", list("portcos").join(", ")],
+      ] as Array<[string, string]>
+    ).filter(([, val]) => val);
+  } else if (name === "sheets_add_note") {
+    title = "Approve — add note to contact";
+    subject = v("contactEmail") || "";
+    rows = (
+      [
+        ["type", v("type") || "note"],
+        ["note", v("note") || ""],
+        ["follow-up", d.requiresFollowUp === true ? "yes" : ""],
+      ] as Array<[string, string]>
+    ).filter(([, val]) => val);
+  } else if (name === "sheets_add_target") {
+    title = "Approve — add target to pipeline";
+    subject = [v("name"), v("company")].filter(Boolean).join(" · ");
+    rows = (
+      ["title", "company", "email", "linkedin", "location", "sector", "stage", "reasonSurfaced", "researchPurpose"] as const
+    )
+      .filter((f) => v(f) != null && v(f) !== "")
+      .map((f) => [f === "reasonSurfaced" ? "reason surfaced" : f === "researchPurpose" ? "research purpose" : f, v(f)!]);
+  } else if (name === "sheets_update_target") {
+    title = "Approve — update target";
+    subject = v("email") || [v("name"), v("company")].filter(Boolean).join(" · ");
+    const fields = (d.fields || {}) as Record<string, unknown>;
+    rows = Object.entries(fields)
+      .filter(([, val]) => val != null && val !== "")
+      .map(([k, val]) => [k, String(val)]);
   } else {
-    // sheets_update_contact
     title = "Approve — update contact";
     subject = v("email") || "";
-    rows = (["title", "company", "phone", "location"] as const)
+    rows = (["title", "company", "phone", "location", "sector", "prime"] as const)
       .filter((f) => v(f) != null)
-      .map((f) => [f, v(f)!]);
-    commit = async () => {
-      await updateContact({
-        data: {
-          email: v("email") || "",
-          title: v("title"),
-          company: v("company"),
-          phone: v("phone"),
-          location: v("location"),
-        },
-      });
-    };
+      .map((f) => [f, v(f)!] as [string, string]);
+    if (v("temperature") != null) rows.push(["temperature", `${v("temperature")!} (locks rating)`]);
   }
-
-  const approve = async () => {
-    try {
-      await commit();
-      toast.success("Applied");
-      onResolve(
-        `Approved & applied (${name}): ${subject} — ${rows.map(([k, val]) => `${k}=${val}`).join(", ")}`,
-        "tester",
-      );
-    } catch (e) {
-      console.error(`${name} failed`, e);
-      toast.error("Write failed — see console.");
-      onResolve(`Write failed for ${subject}.`);
-    }
-  };
 
   return (
     <div className="ml-9 border border-amber-300 bg-amber-50 rounded-xl p-3.5 space-y-2">
@@ -794,8 +990,19 @@ function ApprovalCard({
           </div>
         ))}
       </div>
+      <p className="text-[10px] text-amber-800/80">
+        Write runs on the server after you approve — CRM and Query stay in sync.
+      </p>
       <div className="flex gap-2 pt-0.5">
-        <Button size="sm" className="h-7 text-xs" disabled={busy} onClick={approve}>
+        <Button
+          size="sm"
+          className="h-7 text-xs"
+          disabled={busy}
+          onClick={() => {
+            toast.message("Applying…");
+            onResolve("approved");
+          }}
+        >
           Approve &amp; apply
         </Button>
         <Button
@@ -803,7 +1010,7 @@ function ApprovalCard({
           variant="outline"
           className="h-7 text-xs"
           disabled={busy}
-          onClick={() => onResolve(`User declined (${name}) for ${subject}.`)}
+          onClick={() => onResolve("declined")}
         >
           Decline
         </Button>

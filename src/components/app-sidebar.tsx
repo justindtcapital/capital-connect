@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Users, Target, Search, Filter, Mail, Pencil, X, Telescope } from "lucide-react";
+import { Users, Target, Search, Filter, Mail, Pencil, X, Telescope, Loader2, ScrollText } from "lucide-react";
 import {
   HomeIcon,
   NetworkIcon,
@@ -25,6 +25,7 @@ import {
 } from "@/components/ui/select";
 import { Checkbox } from "@/components/ui/checkbox";
 import { MultiSelect } from "@/components/ui/multi-select";
+import { DateTextField } from "@/components/ui/date-text-field";
 import type {
   ContactFilters,
   Contact,
@@ -36,7 +37,7 @@ import type {
 } from "@/lib/types";
 import { CONTACT_TYPES, RECORD_SOURCES } from "@/lib/types";
 import { SENIORITY_LEVELS, DEPARTMENTS } from "@/lib/people-classify";
-import { bulkUpdateContacts } from "@/utils/sheets.functions";
+import { bulkUpdateContacts, addEvent as addEventToSheet, addPortcoIntro, addNote } from "@/utils/sheets.functions";
 import { toast } from "sonner";
 import { useFilterOptions } from "@/lib/filter-options-context";
 import type { DashboardFilters } from "@/lib/dashboard-filter-context";
@@ -55,6 +56,7 @@ import { NetworkSearchPanel } from "@/components/crm/NetworkSearchPanel";
 import {
   Sidebar,
   SidebarContent,
+  SidebarFooter,
   SidebarGroup,
   SidebarGroupContent,
   SidebarGroupLabel,
@@ -65,6 +67,7 @@ import {
   SidebarSeparator,
   useSidebar,
 } from "@/components/ui/sidebar";
+import { ApiHealthWidget } from "@/components/ApiHealthWidget";
 
 const navItems = [
   { title: "Home", url: "/", icon: HomeIcon },
@@ -74,8 +77,10 @@ const navItems = [
   { title: "PortCo", url: "/portfolio", icon: PortCoIcon },
   { title: "Signals", url: "/signals", icon: SignalsIcon },
   { title: "Companies", url: "/companies", icon: CompaniesIcon },
+  { title: "Platform", url: "/platform", icon: Telescope },
   { title: "Query", url: "/query", icon: QueryIcon },
   { title: "Dashboard", url: "/dashboard", icon: DashboardIcon },
+  { title: "Activity", url: "/activity", icon: ScrollText },
 ];
 
 interface AppSidebarProps {
@@ -109,6 +114,8 @@ export function AppSidebar({
     selectedIds: targetSelectedIds,
     clearSelection: clearTargetSelection,
     onBulkUpdate: onTargetBulkUpdate,
+    onBulkResearch: onTargetBulkResearch,
+    researching: targetResearching,
   } = useTargetSelection();
   const { options: filterOpts } = useFilterOptions();
   const [bulkEditOpen, setBulkEditOpen] = useState(false);
@@ -333,10 +340,71 @@ export function AppSidebar({
     });
 
     onBulkUpdate(updated);
+
+    // Capture values before clearing dialog state — async persist runs after.
+    const persistType = bulkEditType;
+    const persistEventName = bulkEventName.trim();
+    const persistEventType = bulkEventType;
+    const persistPortCo = bulkPortCo;
+    const persistNote = bulkNote.trim();
+    const persistContacts = [...selectedContacts];
+
     setBulkEditOpen(false);
     setBulkPortCo("");
     setBulkEventName("");
     setBulkNote("");
+
+    // Persist event / portco / note bulk edits to the sheet (profile uses its own path).
+    void (async () => {
+      try {
+        if (persistType === "event" && persistEventName) {
+          await Promise.all(
+            persistContacts.map((c) =>
+              addEventToSheet({
+                data: {
+                  contactEmail: (c.email || "").split(/[;,]/)[0]?.trim() || c.email,
+                  eventName: persistEventName,
+                  type: persistEventType,
+                  urid: c.urid,
+                },
+              }),
+            ),
+          );
+          toast.success(
+            `Tagged ${persistContacts.length} contact${persistContacts.length !== 1 ? "s" : ""} on ${persistEventName}.`,
+          );
+        } else if (persistType === "portco" && persistPortCo) {
+          await Promise.all(
+            persistContacts.map((c) =>
+              addPortcoIntro({
+                data: {
+                  contactEmail: (c.email || "").split(/[;,]/)[0]?.trim() || c.email,
+                  portcoName: persistPortCo,
+                },
+              }),
+            ),
+          );
+          toast.success(`Added PortCo intro for ${persistContacts.length} contact(s).`);
+        } else if (persistType === "note" && persistNote) {
+          await Promise.all(
+            persistContacts.map((c) =>
+              addNote({
+                data: {
+                  contactEmail: (c.email || "").split(/[;,]/)[0]?.trim() || c.email,
+                  noteContent: persistNote,
+                  type: "note",
+                  requiresFollowUp: false,
+                },
+              }),
+            ),
+          );
+          toast.success(`Logged note for ${persistContacts.length} contact(s).`);
+        }
+      } catch (e) {
+        console.error("bulk sheet persist failed", e);
+        toast.error("Updated locally, but saving to the sheet failed — see console.");
+      }
+    })();
   };
 
   const handleTargetBulkEmail = () => {
@@ -446,6 +514,36 @@ export function AppSidebar({
                   Filters
                 </SidebarGroupLabel>
                 <SidebarGroupContent className="px-2 space-y-3">
+                  <div>
+                    <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1.5 block">
+                      Book
+                    </label>
+                    <div className="grid grid-cols-2 gap-1 rounded-md border border-border p-0.5">
+                      <button
+                        type="button"
+                        onClick={() => update({ ownershipScope: "mine" })}
+                        className={`h-7 rounded text-[11px] font-medium transition-colors ${
+                          filters.ownershipScope !== "everyone"
+                            ? "bg-primary text-primary-foreground"
+                            : "text-muted-foreground hover:bg-accent"
+                        }`}
+                      >
+                        My contacts
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => update({ ownershipScope: "everyone" })}
+                        className={`h-7 rounded text-[11px] font-medium transition-colors ${
+                          filters.ownershipScope === "everyone"
+                            ? "bg-primary text-primary-foreground"
+                            : "text-muted-foreground hover:bg-accent"
+                        }`}
+                      >
+                        Everyone
+                      </button>
+                    </div>
+                  </div>
+
                   <div className="relative">
                     <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
                     <Input
@@ -894,6 +992,76 @@ export function AppSidebar({
                       </SelectContent>
                     </Select>
                   </div>
+
+                  <div>
+                    <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+                      Title
+                    </label>
+                    <Input
+                      placeholder="Title contains..."
+                      value={targetingFilters.title}
+                      onChange={(e) => updateTarget({ title: e.target.value })}
+                      className="h-8 text-xs"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+                      Seniority
+                    </label>
+                    <MultiSelect
+                      options={[...SENIORITY_LEVELS]}
+                      value={targetingFilters.seniority}
+                      onChange={(v) => updateTarget({ seniority: v })}
+                      placeholder="All Levels"
+                      searchable={false}
+                    />
+                  </div>
+
+                  <div>
+                    <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+                      Department
+                    </label>
+                    <MultiSelect
+                      options={[...DEPARTMENTS]}
+                      value={targetingFilters.department}
+                      onChange={(v) => updateTarget({ department: v })}
+                      placeholder="All Departments"
+                    />
+                  </div>
+
+                  <div>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground block">
+                        Date Added
+                      </label>
+                      {(targetingFilters.dateFrom || targetingFilters.dateTo) && (
+                        <button
+                          type="button"
+                          onClick={() => updateTarget({ dateFrom: "", dateTo: "" })}
+                          className="text-[10px] text-muted-foreground hover:text-foreground"
+                        >
+                          Clear
+                        </button>
+                      )}
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <span className="text-[10px] text-muted-foreground mb-0.5 block">From</span>
+                        <DateTextField
+                          value={targetingFilters.dateFrom}
+                          onChange={(iso) => updateTarget({ dateFrom: iso })}
+                        />
+                      </div>
+                      <div>
+                        <span className="text-[10px] text-muted-foreground mb-0.5 block">To</span>
+                        <DateTextField
+                          value={targetingFilters.dateTo}
+                          onChange={(iso) => updateTarget({ dateTo: iso })}
+                        />
+                      </div>
+                    </div>
+                  </div>
                 </SidebarGroupContent>
               </SidebarGroup>
             </>
@@ -1071,15 +1239,28 @@ export function AppSidebar({
                     <Pencil className="h-3.5 w-3.5 mr-2" />
                     Bulk Edit
                   </Button>
-                  <Button variant="outline" size="sm" className="w-full h-8 text-xs justify-start">
-                    <Telescope className="h-3.5 w-3.5 mr-2" />
-                    Update with Apollo
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="w-full h-8 text-xs justify-start"
+                    onClick={() => void onTargetBulkResearch?.()}
+                    disabled={targetResearching || !onTargetBulkResearch}
+                  >
+                    {targetResearching ? (
+                      <Loader2 className="h-3.5 w-3.5 mr-2 animate-spin" />
+                    ) : (
+                      <Telescope className="h-3.5 w-3.5 mr-2" />
+                    )}
+                    {targetResearching ? "Researching…" : "Update with Apollo"}
                   </Button>
                 </SidebarGroupContent>
               </SidebarGroup>
             </>
           )}
         </SidebarContent>
+        <SidebarFooter className="border-t border-sidebar-border p-0">
+          <ApiHealthWidget collapsed={collapsed} />
+        </SidebarFooter>
       </Sidebar>
 
       {/* Bulk Edit Dialog */}

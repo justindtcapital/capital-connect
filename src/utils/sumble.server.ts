@@ -9,9 +9,19 @@
 import { callGeminiJSON } from "./gemini.server";
 
 const SUMBLE_API_URL = "https://api.sumble.com/v6";
+// v9 is a separate, newer Sumble surface. We use it ONLY for the technology-usage
+// enrichment (buildTechUsage); everything else stays on the v6 endpoints this app
+// was built and verified against.
+const SUMBLE_API_V9_URL = "https://api.sumble.com/v9";
 
 // Concrete JSON type — TanStack server functions require serializable returns.
-export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+export type JsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | JsonValue[]
+  | { [key: string]: JsonValue };
 
 export interface SumbleResponse<T extends JsonValue = JsonValue> {
   found: boolean;
@@ -23,7 +33,12 @@ export interface SumbleResponse<T extends JsonValue = JsonValue> {
 }
 
 // ── Typed shapes used by the PortCo Intelligence UI ──────────────
-export interface SumbleOrg { id: number; slug?: string; name?: string; domain?: string; }
+export interface SumbleOrg {
+  id: number;
+  slug?: string;
+  name?: string;
+  domain?: string;
+}
 export interface SumbleJob {
   id: number;
   title: string;
@@ -41,31 +56,61 @@ export interface SumbleTech {
   jobsCount?: number;
   peopleCount?: number;
   teamsCount?: number;
-  /** Detection confidence 0–100, when Sumble supplies it. */
+  /** Whole-company job posts that MENTION this tech (v9 usage enrichment). */
+  mentionCount?: number;
+  /** Whole-company job posts that ACTIVELY USE this tech (v9 usage enrichment). */
+  usedCount?: number;
+  /** "Actively used" confidence 0–100 = usedCount / mentionCount (v9 enrichment). */
   confidence?: number;
+  /** Portfolio companies whose offerings overlap this technology. */
+  portcoSimilarity?: {
+    portco: string;
+    reason: string;
+    source: "comparable" | "description" | "domain" | "name";
+  }[];
 }
-export interface SumbleBrief { ready: boolean; title?: string; body?: string; url?: string; }
-export interface SumbleCredits { used?: number; remaining?: number; }
+export interface SumbleBrief {
+  ready: boolean;
+  title?: string;
+  body?: string;
+  url?: string;
+}
+export interface SumbleCredits {
+  used?: number;
+  remaining?: number;
+}
 
 function sumbleErrorCode(status: number): string {
   switch (status) {
-    case 401: return "unauthorized";
-    case 402: return "no_credits";
-    case 429: return "rate_limited";
-    case 400: return "bad_request";
-    case 422: return "bad_request";
-    default: return status >= 500 ? "server" : "error";
+    case 401:
+      return "unauthorized";
+    case 402:
+      return "no_credits";
+    case 429:
+      return "rate_limited";
+    case 400:
+      return "bad_request";
+    case 422:
+      return "bad_request";
+    default:
+      return status >= 500 ? "server" : "error";
   }
 }
 
 function sumbleErrorMessage(code: string, status: number): string {
   switch (code) {
-    case "unauthorized": return "Sumble API key is invalid or missing.";
-    case "no_credits": return "Sumble request failed: insufficient credits.";
-    case "rate_limited": return "Sumble rate limit hit (10 req/sec). Try again shortly.";
-    case "bad_request": return "Sumble rejected the request (bad parameters).";
-    case "server": return "Sumble server error — try again later.";
-    default: return `Sumble API error (${status}).`;
+    case "unauthorized":
+      return "Sumble API key is invalid or missing.";
+    case "no_credits":
+      return "Sumble request failed: insufficient credits.";
+    case "rate_limited":
+      return "Sumble rate limit hit (10 req/sec). Try again shortly.";
+    case "bad_request":
+      return "Sumble rejected the request (bad parameters).";
+    case "server":
+      return "Sumble server error — try again later.";
+    default:
+      return `Sumble API error (${status}).`;
   }
 }
 
@@ -74,6 +119,7 @@ async function sumbleFetch<T extends JsonValue = JsonValue>(
   method: "GET" | "POST",
   path: string,
   body?: Record<string, unknown>,
+  apiBase: string = SUMBLE_API_URL,
 ): Promise<SumbleResponse<T>> {
   const apiKey = process.env.SUMBLE_API_KEY;
   if (!apiKey) {
@@ -82,7 +128,7 @@ async function sumbleFetch<T extends JsonValue = JsonValue>(
 
   let res: Response;
   try {
-    res = await fetch(`${SUMBLE_API_URL}${path}`, {
+    res = await fetch(`${apiBase}${path}`, {
       method,
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -91,7 +137,11 @@ async function sumbleFetch<T extends JsonValue = JsonValue>(
       ...(method === "POST" ? { body: JSON.stringify(body || {}) } : {}),
     });
   } catch (err) {
-    return { found: false, error: err instanceof Error ? err.message : "Request to Sumble failed", errorCode: "network" };
+    return {
+      found: false,
+      error: err instanceof Error ? err.message : "Request to Sumble failed",
+      errorCode: "network",
+    };
   }
 
   if (!res.ok) {
@@ -110,7 +160,12 @@ async function sumbleFetch<T extends JsonValue = JsonValue>(
   try {
     data = (await res.json()) as T;
   } catch {
-    return { found: false, error: "Could not parse Sumble response", errorCode: "server", status: res.status };
+    return {
+      found: false,
+      error: "Could not parse Sumble response",
+      errorCode: "server",
+      status: res.status,
+    };
   }
   return { found: true, data, status: res.status };
 }
@@ -131,7 +186,11 @@ async function sumbleFetchCached<T extends JsonValue = JsonValue>(
   const hit = sumbleCache.get(key);
   if (hit && Date.now() < hit.expires) return hit.value as SumbleResponse<T>;
   const res = await sumbleFetch<T>(method, path, body);
-  if (res.found) sumbleCache.set(key, { value: res as SumbleResponse, expires: Date.now() + SUMBLE_CACHE_TTL_MS });
+  if (res.found)
+    sumbleCache.set(key, {
+      value: res as SumbleResponse,
+      expires: Date.now() + SUMBLE_CACHE_TTL_MS,
+    });
   return res;
 }
 
@@ -143,7 +202,11 @@ function asArr(v: JsonValue | undefined): JsonValue[] {
   return Array.isArray(v) ? v : [];
 }
 function str(v: JsonValue | undefined): string | undefined {
-  return typeof v === "string" && v ? v : v != null && typeof v !== "object" ? String(v) : undefined;
+  return typeof v === "string" && v
+    ? v
+    : v != null && typeof v !== "object"
+      ? String(v)
+      : undefined;
 }
 function num(v: JsonValue | undefined): number | undefined {
   return typeof v === "number" ? v : undefined;
@@ -177,23 +240,6 @@ function parseJobs(data: JsonValue | undefined): SumbleJob[] {
       url: str(o.url),
     };
   });
-}
-
-function parseTechnologies(data: JsonValue | undefined): SumbleTech[] {
-  return asArr(asObj(data).technologies).map((t) => {
-    const o = asObj(t);
-    // Confidence may arrive as 0–1 or 0–100 under a few possible keys; normalize to 0–100.
-    const rawConf = num(o.confidence) ?? num(o.score) ?? num(o.confidence_score);
-    const confidence = rawConf == null ? undefined : Math.round(rawConf <= 1 ? rawConf * 100 : rawConf);
-    return {
-      name: str(o.name) || "",
-      lastJobPost: str(o.last_job_post),
-      jobsCount: num(o.jobs_count),
-      peopleCount: num(o.people_count),
-      teamsCount: num(o.teams_count),
-      confidence,
-    };
-  }).filter((t) => t.name);
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -318,12 +364,17 @@ function aggregateJobTechnologies(jobs: SumbleJob[]): SumbleTech[] {
     );
 }
 
-// Default (cheap) tech stack: derived from the company's recent job posts via the
-// verified /jobs/find endpoint. Sumble has NO "dump the full stack" call, and
-// /organizations/enrich is a per-technology CHECKER (it 422s when asked with no
-// technologies), so we aggregate hiring signals instead — one call, no per-tech
-// billing. Confidence % is not available here; use verifyPortcoTechStack to add it.
-export async function buildPortcoTechStack(domain: string, jobLimit = 20): Promise<PortcoTechResult> {
+// Detected tech stack for a company, derived from its recent job posts via the
+// verified /jobs/find endpoint. Sumble has NO "dump the full stack" call: a job's
+// `matched_technologies` is only populated for the technologies you pass in the
+// filter (with an empty filter it comes back null — which is why the stack used to
+// always be empty). So we pass a broad candidate list (STACK_TECH_CANDIDATES) and
+// aggregate which of them appear across the company's recent postings. One call,
+// billed per job returned. Confidence % is not available from this endpoint.
+export async function buildPortcoTechStack(
+  domain: string,
+  jobLimit = 20,
+): Promise<PortcoTechResult> {
   // Resolve to Sumble's canonical org first — /jobs/find 404s for a domain Sumble
   // doesn't have as an org record (the raw contact/email domain often isn't one).
   const match = await matchOrganization(domain, domain);
@@ -332,12 +383,20 @@ export async function buildPortcoTechStack(domain: string, jobLimit = 20): Promi
   }
   const orgDomain = match.org?.domain || domain;
   if (!match.org) {
-    return { found: false, error: `"${domain}" isn't in Sumble's company database.`, errorCode: "not_found", technologies: [], credits: match.credits };
+    return {
+      found: false,
+      error: `"${domain}" isn't in Sumble's company database.`,
+      errorCode: "not_found",
+      technologies: [],
+      credits: match.credits,
+    };
   }
 
   const res = await sumbleFetch("POST", "/jobs/find", {
     organization: { domain: orgDomain },
-    filters: {}, // required key (Sumble returns 422 without it)
+    // matched_technologies is filter-relative: without a technologies filter every
+    // job returns matched_technologies: null and the aggregated stack is empty.
+    filters: { technologies: STACK_TECH_CANDIDATES },
     include_descriptions: false,
     limit: jobLimit,
     offset: 0,
@@ -349,49 +408,141 @@ export async function buildPortcoTechStack(domain: string, jobLimit = 20): Promi
     }
     return { found: false, error: res.error, errorCode: res.errorCode, technologies: [] };
   }
-  return { found: true, technologies: aggregateJobTechnologies(parseJobs(res.data)), credits: parseCredits(res.data) };
+  return {
+    found: true,
+    technologies: aggregateJobTechnologies(parseJobs(res.data)),
+    credits: parseCredits(res.data),
+  };
 }
 
-// A curated set of common enterprise technologies, used as the fallback list for
-// the enrich checker when the caller has no jobs-derived names to confirm.
-export const CURATED_TECHNOLOGIES = [
-  "Salesforce", "HubSpot", "AWS", "Google Cloud", "Microsoft Azure", "Snowflake",
-  "Databricks", "Okta", "CrowdStrike", "Splunk", "Datadog", "ServiceNow",
-  "Workday", "SAP", "Oracle", "MongoDB", "Kubernetes", "Tableau", "Looker", "Segment",
+// Broad OR-filter for the /jobs/find query in buildPortcoTechStack. Sumble only
+// fills a job's `matched_technologies` with the technologies from THIS list that the
+// posting mentions, so the list bounds what the tech stack can surface. Credits are
+// billed per job returned (not per filter term), so a generous list costs nothing
+// extra and simply widens coverage. Names are Sumble's canonical display names.
+export const STACK_TECH_CANDIDATES = [
+  // Cloud & infrastructure
+  "AWS", "Google Cloud", "Microsoft Azure", "Cloudflare", "Kubernetes", "Docker", "Terraform", "Ansible",
+  // Languages
+  "Python", "Java", "JavaScript", "TypeScript", "Go", "Ruby", "PHP", "C#", "Rust", "Scala", "Kotlin", "Swift",
+  // Web frameworks & runtimes
+  "React", "Angular", "Vue.js", "Next.js", "Node.js", "Django", "Flask", "Spring", "Ruby on Rails", ".NET", "FastAPI",
+  // Data stores
+  "PostgreSQL", "MySQL", "MongoDB", "Redis", "Cassandra", "Elasticsearch", "DynamoDB", "Snowflake", "Oracle",
+  "Microsoft SQL Server", "Databricks", "BigQuery",
+  // Data & streaming
+  "Apache Kafka", "Apache Spark", "Apache Airflow", "dbt", "Hadoop",
+  // BI & ML
+  "Tableau", "Looker", "Power BI", "TensorFlow", "PyTorch",
+  // CI/CD & source control
+  "Jenkins", "GitLab", "GitHub", "CircleCI",
+  // Observability
+  "Datadog", "Splunk", "New Relic", "Grafana", "Prometheus", "Sentry",
+  // Security & identity
+  "Okta", "CrowdStrike", "Auth0", "Palo Alto Networks", "SailPoint",
+  // Business & SaaS
+  "Salesforce", "HubSpot", "ServiceNow", "Workday", "SAP", "Marketo", "Segment", "NetSuite", "Zendesk", "Jira",
+  "MuleSoft", "Stripe",
 ];
 
-// Opt-in confirmation pass: ask Sumble's enrich CHECKER which of these specific
-// technologies the company is detected using, returning confidence per tech.
-// Billed ~5 cr PER technology checked, so the list is bounded. Falls back to the
-// curated set when no names are supplied.
-export async function verifyPortcoTechStack(domain: string, technologies: string[]): Promise<PortcoTechResult> {
-  const provided = [...new Set(technologies.map((t) => t.trim()).filter(Boolean))];
-  const techs = (provided.length > 0 ? provided : CURATED_TECHNOLOGIES).slice(0, 20);
-  if (techs.length === 0) return { found: true, technologies: [] };
+// ── v9 technology-usage enrichment ───────────────────────────────
+// The v6 stack above tells you WHICH technologies appear in a company's recent
+// postings. This adds Sumble's v9 "actively used" signal: per technology it returns
+// whole-company mention vs. use counts, from which we derive a 0–100 "actively used"
+// confidence (used / mentioned). v9's technology `term` is an opaque slug that is NOT
+// derivable from the display name (Google Cloud → "gcp", Go → "golang", Apache Kafka
+// → "kafka", .NET → "microsoft-net"), so display names are mapped via TECH_SLUGS
+// (hand-curated, each live-verified 2026-07-14 to return non-zero for a known user),
+// with a lowercase-hyphen fallback that already resolves the many single-word techs.
+const TECH_SLUGS: Record<string, string> = {
+  "AWS": "aws",
+  "Google Cloud": "gcp",
+  "Microsoft Azure": "azure",
+  "Go": "golang",
+  "C#": "microsoft-c#",
+  ".NET": "microsoft-net",
+  "Power BI": "microsoft-power-bi",
+  "Microsoft SQL Server": "microsoft-sql-server",
+  "Node.js": "node-js",
+  "Vue.js": "vue-js",
+  "Next.js": "next-js",
+  "Ruby on Rails": "ruby-on-rails",
+  "BigQuery": "gcp-bigquery",
+  "DynamoDB": "aws-dynamodb",
+  "Apache Kafka": "kafka",
+  "Apache Spark": "spark",
+  "Apache Airflow": "airflow",
+  "New Relic": "new-relic",
+  "Palo Alto Networks": "palo-alto-networks",
+  "Marketo": "adobe-marketo",
+};
 
-  // Resolve to Sumble's canonical org domain (same reason as buildPortcoTechStack).
-  const match = await matchOrganization(domain, domain);
-  if (match.error) return { found: false, error: match.error, errorCode: match.errorCode, technologies: [] };
-  if (!match.org) return { found: false, error: `"${domain}" isn't in Sumble's company database.`, errorCode: "not_found", technologies: [] };
-  const orgDomain = match.org.domain || domain;
+// Fallback slug for names not in TECH_SLUGS — lowercase, non-alphanumeric → hyphen.
+// Correct for the many single-word technologies whose slug is just the lowercased
+// name (python, react, kubernetes, datadog, snowflake, …), all verified live.
+function techSlug(name: string): string {
+  const mapped = TECH_SLUGS[name.trim()];
+  if (mapped) return mapped;
+  return name.trim().toLowerCase().replace(/[^a-z0-9#]+/g, "-").replace(/^-+|-+$/g, "");
+}
 
-  // enrich's exact request schema isn't documented; try filters.technologies first
-  // (matches organizations/find), then a top-level technologies array if Sumble
-  // rejects the body. Rejected (422) requests don't spend credits.
-  let res = await sumbleFetch("POST", "/organizations/enrich", {
-    organization: { domain: orgDomain },
-    filters: { technologies: techs },
-  });
-  if (!res.found && res.errorCode === "bad_request") {
-    res = await sumbleFetch("POST", "/organizations/enrich", {
-      organization: { domain: orgDomain },
-      technologies: techs,
-    });
+// Opt-in usage enrichment (v9): given the technology names already surfaced for a
+// company, return each one's whole-company mention/use counts and an "actively used"
+// confidence. Billed ~1 credit per technology. Names that don't resolve to a real
+// Sumble technology come back with mentionCount 0 and are dropped (no false signal).
+export async function buildTechUsage(
+  domain: string,
+  names: string[],
+): Promise<PortcoTechResult> {
+  const cleanDomain = domain
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/^www\./, "")
+    .replace(/\/.*$/, "");
+  const uniqueNames = [...new Set(names.map((n) => n.trim()).filter(Boolean))].slice(0, 40);
+  if (!cleanDomain || uniqueNames.length === 0) return { found: true, technologies: [] };
+
+  // slug → display name, so we can map v9's slug-keyed response back to what we show.
+  const slugToName = new Map<string, string>();
+  for (const name of uniqueNames) {
+    const slug = techSlug(name);
+    if (!slugToName.has(slug)) slugToName.set(slug, name);
   }
+  const entities = [...slugToName.keys()].map((slug) => ({
+    type: "technology",
+    term: slug,
+    metrics: ["job_post_count", "job_post_used_count"],
+  }));
+
+  const res = await sumbleFetch(
+    "POST",
+    "/organizations",
+    { organizations: [{ url: cleanDomain }], select: { attributes: ["name"], entities } },
+    SUMBLE_API_V9_URL,
+  );
   if (!res.found) {
     return { found: false, error: res.error, errorCode: res.errorCode, technologies: [] };
   }
-  return { found: true, technologies: parseTechnologies(res.data), credits: parseCredits(res.data) };
+
+  const org = asObj(asArr(asObj(res.data).organizations)[0]);
+  const techs: SumbleTech[] = [];
+  for (const raw of asArr(org.entities)) {
+    const e = asObj(raw);
+    const mention = num(e.job_post_count) ?? 0;
+    if (mention <= 0) continue; // unresolved slug or genuinely not detected
+    const used = num(e.job_post_used_count) ?? 0;
+    techs.push({
+      name: slugToName.get(str(e.term) || "") || str(e.term) || "",
+      mentionCount: mention,
+      usedCount: used,
+      confidence: Math.round((used / mention) * 100),
+    });
+  }
+  techs.sort(
+    (a, b) => (b.usedCount ?? 0) - (a.usedCount ?? 0) || (b.confidence ?? 0) - (a.confidence ?? 0),
+  );
+  return { found: true, technologies: techs, credits: parseCredits(res.data) };
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -425,33 +576,62 @@ export interface ProspectsResult {
   companiesScanned?: number;
 }
 
-interface OrgLite { id: number; name: string; domain?: string; industry?: string; employees?: number; }
-
-function parseOrgs(data: JsonValue | undefined): OrgLite[] {
-  return asArr(asObj(data).organizations).map((o) => {
-    const r = asObj(o);
-    return {
-      id: num(r.id) ?? 0,
-      name: str(r.name) || "",
-      domain: str(r.domain),
-      industry: str(r.industry),
-      employees: num(r.total_employees),
-    };
-  }).filter((o) => o.id);
+interface OrgLite {
+  id: number;
+  name: string;
+  domain?: string;
+  industry?: string;
+  employees?: number;
+  location?: string;
 }
 
-function parsePeople(data: JsonValue | undefined): Array<Omit<SumbleProspect, "company" | "companyDomain" | "industry">> {
-  return asArr(asObj(data).people).map((p) => {
-    const r = asObj(p);
-    return {
-      name: str(r.name) || "",
-      title: str(r.job_title) || "",
-      jobLevel: str(r.job_level),
-      jobFunction: str(r.job_function),
-      location: str(r.location),
-      linkedinUrl: str(r.linkedin_url),
-    };
-  }).filter((p) => p.name);
+// Coarse HQ/location string from whatever location-ish fields Sumble supplies.
+function orgLocation(r: Record<string, JsonValue>): string | undefined {
+  const direct = str(r.location) || str(r.hq) || str(r.headquarters);
+  if (direct) return direct;
+  // /organizations/find returns HQ state + country (headquarters_state /
+  // headquarters_country) — there is NO city-level field, so location is
+  // state + country only. Older key names kept as fallbacks.
+  const parts = [
+    str(r.city),
+    str(r.state) || str(r.region) || str(r.headquarters_state),
+    str(r.country) || str(r.headquarters_country),
+  ].filter(Boolean);
+  return parts.length ? parts.join(", ") : undefined;
+}
+
+function parseOrgs(data: JsonValue | undefined): OrgLite[] {
+  return asArr(asObj(data).organizations)
+    .map((o) => {
+      const r = asObj(o);
+      return {
+        id: num(r.id) ?? 0,
+        name: str(r.name) || "",
+        domain: str(r.domain),
+        industry: str(r.industry),
+        employees: num(r.total_employees),
+        location: orgLocation(r),
+      };
+    })
+    .filter((o) => o.id);
+}
+
+function parsePeople(
+  data: JsonValue | undefined,
+): Array<Omit<SumbleProspect, "company" | "companyDomain" | "industry">> {
+  return asArr(asObj(data).people)
+    .map((p) => {
+      const r = asObj(p);
+      return {
+        name: str(r.name) || "",
+        title: str(r.job_title) || "",
+        jobLevel: str(r.job_level),
+        jobFunction: str(r.job_function),
+        location: str(r.location),
+        linkedinUrl: str(r.linkedin_url),
+      };
+    })
+    .filter((p) => p.name);
 }
 
 export interface ProspectCriteria {
@@ -487,6 +667,43 @@ const CHIP_TO_SUMBLE_LEVEL: Record<string, string> = {
   Manager: "Manager",
 };
 
+// User-typed country full names → the ISO-2 code Sumble returns in the HQ
+// country slot, so "United States" matches a "California, US" location.
+const COUNTRY_ALIASES: Record<string, string> = {
+  "united states": "us",
+  "united states of america": "us",
+  usa: "us",
+  america: "us",
+  "united kingdom": "gb",
+  uk: "gb",
+  "great britain": "gb",
+  england: "gb",
+  canada: "ca",
+  australia: "au",
+  germany: "de",
+  france: "fr",
+  ireland: "ie",
+  india: "in",
+  netherlands: "nl",
+  spain: "es",
+  italy: "it",
+  japan: "jp",
+};
+
+// Match a HQ location ("State, CC" or "CC") against a user-typed state/country.
+// Direct substring covers state names and ISO codes typed as-is; a full country
+// name resolves to its ISO code and is matched as the trailing country TOKEN, so
+// "Canada" ("ca") never false-matches "California, US".
+function locationMatches(location: string | undefined, want: string): boolean {
+  const loc = (location || "").toLowerCase();
+  const w = want.trim().toLowerCase();
+  if (!w) return true;
+  if (loc.includes(w)) return true;
+  const iso = COUNTRY_ALIASES[w];
+  if (!iso) return false;
+  return loc.split(",").some((part) => part.trim() === iso);
+}
+
 function matchesSize(employees: number | undefined, sizes: string[]): boolean {
   if (sizes.length === 0) return true;
   if (employees == null) return false; // unknown headcount can't satisfy a size filter
@@ -515,12 +732,19 @@ export interface ProspectCompaniesResult {
 
 // Phase 1: resolve the technology → companies using it (with industry/size
 // post-filters). The user prunes this list before the people fan-out.
-export async function discoverProspectCompanies(c: ProspectCriteria): Promise<ProspectCompaniesResult> {
+export async function discoverProspectCompanies(
+  c: ProspectCriteria,
+): Promise<ProspectCompaniesResult> {
   const companyLimit = Math.min(25, Math.max(1, c.companyLimit ?? 5));
   const focus = (c.focus || "").trim();
   const industry = (c.industry || "").trim();
   const term = focus || industry;
-  if (!term) return { found: false, companies: [], error: "Provide a focus/technology or a focus area to search." };
+  if (!term)
+    return {
+      found: false,
+      companies: [],
+      error: "Provide a focus/technology or a focus area to search.",
+    };
 
   const applyIndustryFilter = !!industry && !!focus;
   const sizes = (c.sizes || []).filter((s) => SIZE_BANDS[s]);
@@ -528,7 +752,8 @@ export async function discoverProspectCompanies(c: ProspectCriteria): Promise<Pr
   const overfetch = applyIndustryFilter || applySizeFilter;
 
   const techRes = await sumbleFetchCached("POST", "/technologies/find", { query: term });
-  if (!techRes.found) return { found: false, error: techRes.error, errorCode: techRes.errorCode, companies: [] };
+  if (!techRes.found)
+    return { found: false, error: techRes.error, errorCode: techRes.errorCode, companies: [] };
   const techName = str(asObj(asArr(asObj(techRes.data).technologies)[0]).name);
   if (!techName) {
     return {
@@ -544,7 +769,14 @@ export async function discoverProspectCompanies(c: ProspectCriteria): Promise<Pr
     limit: orgLimit,
     offset: 0,
   });
-  if (!orgsRes.found) return { found: false, error: orgsRes.error, errorCode: orgsRes.errorCode, companies: [], focusResolved: techName };
+  if (!orgsRes.found)
+    return {
+      found: false,
+      error: orgsRes.error,
+      errorCode: orgsRes.errorCode,
+      companies: [],
+      focusResolved: techName,
+    };
   let orgs = parseOrgs(orgsRes.data);
   if (applyIndustryFilter) {
     const want = industry.toLowerCase();
@@ -572,7 +804,9 @@ export async function fetchProspectPeople(
   const peopleFilters: Record<string, unknown> = {};
   if (filters.jobFunctions?.length) peopleFilters.job_functions = filters.jobFunctions;
   if (filters.jobLevels?.length) {
-    const mapped = [...new Set(filters.jobLevels.map((l) => CHIP_TO_SUMBLE_LEVEL[l] || l).filter(Boolean))];
+    const mapped = [
+      ...new Set(filters.jobLevels.map((l) => CHIP_TO_SUMBLE_LEVEL[l] || l).filter(Boolean)),
+    ];
     if (mapped.length) peopleFilters.job_levels = mapped;
   }
   if (filters.countries?.length) peopleFilters.countries = filters.countries;
@@ -590,7 +824,12 @@ export async function fetchProspectPeople(
     if (!peopleRes.found) continue;
     credits = parseCredits(peopleRes.data);
     for (const p of parsePeople(peopleRes.data)) {
-      prospects.push({ ...p, company: org.name, companyDomain: org.domain, industry: org.industry });
+      prospects.push({
+        ...p,
+        company: org.name,
+        companyDomain: org.domain,
+        industry: org.industry,
+      });
     }
   }
   return { prospects, credits };
@@ -600,14 +839,26 @@ export async function fetchProspectPeople(
 export async function buildProspects(c: ProspectCriteria): Promise<ProspectsResult> {
   const disc = await discoverProspectCompanies(c);
   if (!disc.found) {
-    return { found: false, error: disc.error, errorCode: disc.errorCode, prospects: [], focusResolved: disc.focusResolved };
+    return {
+      found: false,
+      error: disc.error,
+      errorCode: disc.errorCode,
+      prospects: [],
+      focusResolved: disc.focusResolved,
+    };
   }
   const { prospects, credits } = await fetchProspectPeople(disc.companies, c.perCompany ?? 5, {
     jobFunctions: c.jobFunctions,
     jobLevels: c.jobLevels,
     countries: c.countries,
   });
-  return { found: true, prospects, credits: credits || disc.credits, focusResolved: disc.focusResolved, companiesScanned: disc.companies.length };
+  return {
+    found: true,
+    prospects,
+    credits: credits || disc.credits,
+    focusResolved: disc.focusResolved,
+    companiesScanned: disc.companies.length,
+  };
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -785,8 +1036,14 @@ function fallbackProfile(o: DiscoveryOptions): SellerProfile {
   };
 }
 
-async function profileSeller(o: DiscoveryOptions): Promise<{ profile: SellerProfile; usedClaude: boolean }> {
-  const res = await callGeminiJSON<Record<string, JsonValue>>(DISCOVERY_SYSTEM, buildSellerPrompt(o), 1200);
+async function profileSeller(
+  o: DiscoveryOptions,
+): Promise<{ profile: SellerProfile; usedClaude: boolean }> {
+  const res = await callGeminiJSON<Record<string, JsonValue>>(
+    DISCOVERY_SYSTEM,
+    buildSellerPrompt(o),
+    1200,
+  );
   if (res.ok && res.data) {
     const profile = normalizeProfile(res.data);
     if (profile.comparableTechnologies.length > 0) return { profile, usedClaude: true };
@@ -803,7 +1060,12 @@ function sizeWithin(employees: number | undefined, min?: number, max?: number): 
 
 // 0-100. Tech overlap is the strongest signal (displacement), then industry/size
 // fit, then active hiring against the buying-signal keywords.
-function scoreFit(techMatches: number, industryMatch: boolean, sizeMatch: boolean, hiringHits: number): number {
+function scoreFit(
+  techMatches: number,
+  industryMatch: boolean,
+  sizeMatch: boolean,
+  hiringHits: number,
+): number {
   const tech = Math.min(techMatches, 3) * 15; // up to 45
   const industry = industryMatch ? 20 : 0;
   const size = sizeMatch ? 15 : 0;
@@ -829,7 +1091,11 @@ interface Candidate {
 
 // Claude batch pass: write an outreach angle + suggested-match line per company.
 // One call for all top opportunities (token-efficient, rate-limit friendly).
-async function enrichOutreach(seller: string, profile: SellerProfile, opps: OpportunityCompany[]): Promise<void> {
+async function enrichOutreach(
+  seller: string,
+  profile: SellerProfile,
+  opps: OpportunityCompany[],
+): Promise<void> {
   if (opps.length === 0) return;
   const system = `You write concise B2B sales guidance. For each prospect company, given the SELLER's product and the evidence we found, return an outreach angle and a one-line fit rationale.
 
@@ -839,7 +1105,9 @@ Return ONLY a JSON object: {"items":[{"index":0,"outreachAngle":"...","suggested
 
   const lines: string[] = [];
   lines.push(`SELLER: ${seller} — ${profile.category}. ${profile.valueProp}`);
-  lines.push(`What signals a customer: uses ${profile.comparableTechnologies.join(", ")}; hires around ${profile.buyingSignalKeywords.join(", ") || "n/a"}.`);
+  lines.push(
+    `What signals a customer: uses ${profile.comparableTechnologies.join(", ")}; hires around ${profile.buyingSignalKeywords.join(", ") || "n/a"}.`,
+  );
   lines.push("");
   lines.push("PROSPECTS:");
   opps.forEach((o, i) => {
@@ -847,14 +1115,14 @@ Return ONLY a JSON object: {"items":[{"index":0,"outreachAngle":"...","suggested
     if (o.evidence.techMatches.length) ev.push(`uses ${o.evidence.techMatches.join(", ")}`);
     if (o.evidence.hiringHits.length) ev.push(`hiring: ${o.evidence.hiringHits.join(", ")}`);
     if (o.evidence.industryMatch) ev.push(`industry fit (${o.industry || ""})`);
-    lines.push(`${i}. ${o.name}${o.industry ? ` [${o.industry}]` : ""} — ${ev.join("; ") || "comparable tech in use"}`);
+    lines.push(
+      `${i}. ${o.name}${o.industry ? ` [${o.industry}]` : ""} — ${ev.join("; ") || "comparable tech in use"}`,
+    );
   });
 
-  const res = await callGeminiJSON<{ items?: Array<{ index?: number; outreachAngle?: string; suggestedMatch?: string }> }>(
-    system,
-    lines.join("\n"),
-    1600,
-  );
+  const res = await callGeminiJSON<{
+    items?: Array<{ index?: number; outreachAngle?: string; suggestedMatch?: string }>;
+  }>(system, lines.join("\n"), 1600);
   if (!res.ok || !res.data?.items) return;
   for (const item of res.data.items) {
     const idx = typeof item.index === "number" ? item.index : -1;
@@ -872,14 +1140,24 @@ export async function buildCustomerDiscovery(o: DiscoveryOptions): Promise<Disco
   const generatedAt = new Date().toISOString().split("T")[0];
 
   if (!isSumbleConfigured()) {
-    return { found: false, error: "SUMBLE_API_KEY is not configured", errorCode: "no_key", seller: o.companyName, opportunities: [], usedClaude: false };
+    return {
+      found: false,
+      error: "SUMBLE_API_KEY is not configured",
+      errorCode: "no_key",
+      seller: o.companyName,
+      opportunities: [],
+      usedClaude: false,
+    };
   }
 
   // 1. Profile the seller (Claude, with heuristic fallback) for ICP + roles.
   const { profile, usedClaude } = await profileSeller(o);
   // User-typed technologies override the profiled set when provided.
   const override = (o.technologies || []).map((t) => t.trim()).filter(Boolean);
-  const techs = (override.length > 0 ? override : profile.comparableTechnologies).slice(0, Math.max(maxTechnologies, override.length ? Math.min(6, override.length) : 0));
+  const techs = (override.length > 0 ? override : profile.comparableTechnologies).slice(
+    0,
+    Math.max(maxTechnologies, override.length ? Math.min(6, override.length) : 0),
+  );
   // Reflect the actual search set in the returned profile so the UI shows it.
   if (override.length > 0) profile.comparableTechnologies = techs;
 
@@ -890,7 +1168,15 @@ export async function buildCustomerDiscovery(o: DiscoveryOptions): Promise<Disco
     const techRes = await sumbleFetchCached("POST", "/technologies/find", { query: tech });
     if (!techRes.found) {
       if (techRes.errorCode === "unauthorized" || techRes.errorCode === "no_credits") {
-        return { found: false, error: techRes.error, errorCode: techRes.errorCode, seller: o.companyName, profile, opportunities: [], usedClaude };
+        return {
+          found: false,
+          error: techRes.error,
+          errorCode: techRes.errorCode,
+          seller: o.companyName,
+          profile,
+          opportunities: [],
+          usedClaude,
+        };
       }
       continue;
     }
@@ -913,24 +1199,41 @@ export async function buildCustomerDiscovery(o: DiscoveryOptions): Promise<Disco
 
   if (orgMap.size === 0) {
     return {
-      found: true, seller: o.companyName, profile, opportunities: [], credits, generatedAt, usedClaude,
+      found: true,
+      seller: o.companyName,
+      profile,
+      opportunities: [],
+      credits,
+      generatedAt,
+      usedClaude,
       funnel: [
         { stage: `Comparable technologies (${techs.join(", ") || "none"})`, count: techs.length },
         { stage: "Companies using them", count: 0 },
       ],
-      funnelNote: techs.length === 0
-        ? "Couldn't identify comparable technologies for this company. Try the technology search box."
-        : `No companies found using ${techs.join(", ")}. Try different/broader technologies.`,
+      funnelNote:
+        techs.length === 0
+          ? "Couldn't identify comparable technologies for this company. Try the technology search box."
+          : `No companies found using ${techs.join(", ")}. Try different/broader technologies.`,
     };
   }
 
   // 3. Heuristic score every candidate (cheap, deterministic).
   const wantIndustries = profile.targetIndustries.map((s) => s.toLowerCase()).filter(Boolean);
   let candidates: Candidate[] = [...orgMap.values()].map(({ org, techMatches }) => {
-    const industryMatch = wantIndustries.length > 0 && wantIndustries.some((w) => (org.industry || "").toLowerCase().includes(w));
+    const industryMatch =
+      wantIndustries.length > 0 &&
+      wantIndustries.some((w) => (org.industry || "").toLowerCase().includes(w));
     const sizeMatch = sizeWithin(org.employees, profile.minEmployees, profile.maxEmployees);
     const tm = [...techMatches];
-    return { org, techMatches: tm, industryMatch, sizeMatch, hiringHits: [], people: [], score: scoreFit(tm.length, industryMatch, sizeMatch, 0) };
+    return {
+      org,
+      techMatches: tm,
+      industryMatch,
+      sizeMatch,
+      hiringHits: [],
+      people: [],
+      score: scoreFit(tm.length, industryMatch, sizeMatch, 0),
+    };
   });
   candidates.sort((a, b) => b.score - a.score);
 
@@ -941,7 +1244,9 @@ export async function buildCustomerDiscovery(o: DiscoveryOptions): Promise<Disco
   // and an unmatched LLM-generated value (e.g. "Security"/"DevOps"/"IT") zeroes the
   // entire AND-filtered result — which is why discovery stopped surfacing contacts.
   const peopleFilters: Record<string, unknown> = {};
-  const levels = [...new Set(profile.targetJobLevels.map((l) => CHIP_TO_SUMBLE_LEVEL[l] || l).filter(Boolean))];
+  const levels = [
+    ...new Set(profile.targetJobLevels.map((l) => CHIP_TO_SUMBLE_LEVEL[l] || l).filter(Boolean)),
+  ];
   if (levels.length) peopleFilters.job_levels = levels;
   const kws = profile.buyingSignalKeywords.map((k) => k.toLowerCase()).filter(Boolean);
 
@@ -968,7 +1273,12 @@ export async function buildCustomerDiscovery(o: DiscoveryOptions): Promise<Disco
         cand.hiringHits = [...hits].slice(0, 4);
       }
     }
-    cand.score = scoreFit(cand.techMatches.length, cand.industryMatch, cand.sizeMatch, cand.hiringHits.length);
+    cand.score = scoreFit(
+      cand.techMatches.length,
+      cand.industryMatch,
+      cand.sizeMatch,
+      cand.hiringHits.length,
+    );
 
     // Decision-makers. Try the seniority filter first; if it surfaces nobody, fall
     // back to an unfiltered lookup so we still return senior contacts for the company.
@@ -1009,7 +1319,12 @@ export async function buildCustomerDiscovery(o: DiscoveryOptions): Promise<Disco
     employees: c.org.employees,
     fitScore: c.score,
     likelihood: likelihoodFor(c.score),
-    evidence: { techMatches: c.techMatches, hiringHits: c.hiringHits, industryMatch: c.industryMatch, sizeMatch: c.sizeMatch },
+    evidence: {
+      techMatches: c.techMatches,
+      hiringHits: c.hiringHits,
+      industryMatch: c.industryMatch,
+      sizeMatch: c.sizeMatch,
+    },
     suggestedMatch: `${o.companyName} — already uses ${c.techMatches.join(", ") || "comparable tech"}.`,
     outreachAngle: c.techMatches.length
       ? `Uses ${c.techMatches.join(", ")}${c.hiringHits.length ? `; hiring for ${c.hiringHits.join(", ")}` : ""} — strong fit to introduce ${o.companyName}.`
@@ -1040,7 +1355,17 @@ export async function buildCustomerDiscovery(o: DiscoveryOptions): Promise<Disco
     funnelNote = `Found ${orgMap.size} candidate compan${orgMap.size === 1 ? "y" : "ies"}, but Sumble returned no contacts for the top ${top.length} (even unfiltered). These are likely large/generic companies with thin Sumble people coverage — try a more specific technology so the candidate companies are a tighter fit.`;
   }
 
-  return { found: true, seller: o.companyName, profile, opportunities, credits, generatedAt, usedClaude, funnel, funnelNote };
+  return {
+    found: true,
+    seller: o.companyName,
+    profile,
+    opportunities,
+    credits,
+    generatedAt,
+    usedClaude,
+    funnel,
+    funnelNote,
+  };
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1086,7 +1411,12 @@ export async function searchNetworkOrganizations(
   const q = (query || "").trim();
   if (!q) return { found: false, companies: [], error: "Enter a search term." };
   if (!isSumbleConfigured()) {
-    return { found: false, companies: [], error: "SUMBLE_API_KEY is not configured", errorCode: "no_key" };
+    return {
+      found: false,
+      companies: [],
+      error: "SUMBLE_API_KEY is not configured",
+      errorCode: "no_key",
+    };
   }
   const lim = Math.min(25, Math.max(1, limit));
   const sizes = (opts.sizes || []).filter((s) => SIZE_BANDS[s]);
@@ -1103,7 +1433,9 @@ export async function searchNetworkOrganizations(
   // technology, then pull companies detected using it (the technographic angle).
   if (by === "technology" || by === "product" || by === "keywords") {
     const techRes = await sumbleFetchCached("POST", "/technologies/find", { query: q });
-    focusResolved = techRes.found ? str(asObj(asArr(asObj(techRes.data).technologies)[0]).name) : undefined;
+    focusResolved = techRes.found
+      ? str(asObj(asArr(asObj(techRes.data).technologies)[0]).name)
+      : undefined;
     const techs = [...new Set([focusResolved, ...extraTech].filter(Boolean))] as string[];
     if (techs.length) filters.technologies = techs;
   } else if (extraTech.length) {
@@ -1111,15 +1443,129 @@ export async function searchNetworkOrganizations(
     filters.technologies = extraTech;
   }
 
-  const orgsRes = await sumbleFetchCached("POST", "/organizations/find", { filters, limit: fetchLimit, offset: 0 });
+  const orgsRes = await sumbleFetchCached("POST", "/organizations/find", {
+    filters,
+    limit: fetchLimit,
+    offset: 0,
+  });
   if (!orgsRes.found) {
-    return { found: false, error: orgsRes.error, errorCode: orgsRes.errorCode, companies: [], focusResolved };
+    return {
+      found: false,
+      error: orgsRes.error,
+      errorCode: orgsRes.errorCode,
+      companies: [],
+      focusResolved,
+    };
   }
   let orgs = parseOrgs(orgsRes.data);
-  if (wantIndustry) orgs = orgs.filter((o) => (o.industry || "").toLowerCase().includes(wantIndustry));
+  if (wantIndustry)
+    orgs = orgs.filter((o) => (o.industry || "").toLowerCase().includes(wantIndustry));
   if (sizes.length) orgs = orgs.filter((o) => matchesSize(o.employees, sizes));
-  const companies = orgs.filter((o) => o.domain).slice(0, lim).map(orgToCompany);
+  const companies = orgs
+    .filter((o) => o.domain)
+    .slice(0, lim)
+    .map(orgToCompany);
   return { found: true, companies, credits: parseCredits(orgsRes.data), focusResolved };
+}
+
+// ══════════════════════════════════════════════════════════════
+// Install-tech company search — phase 1 of the Targeting "Find" flow.
+// Returns companies detected running a specific INSTALLED technology,
+// optionally narrowed by city and headcount band. People are found in
+// phase 2 via Apollo (findAccountPeople), so this stops at the company list.
+// ══════════════════════════════════════════════════════════════
+
+export interface FoundCompany {
+  name: string;
+  domain: string;
+  industry?: string;
+  location?: string;
+  employees?: number;
+}
+
+export interface FindCompaniesCriteria {
+  /** Installed technology to search by (required). */
+  technology: string;
+  /** Optional HQ state/country substring to require (Sumble has no city-level
+   *  org data, so this matches headquarters_state / headquarters_country). */
+  city?: string;
+  /** Optional headcount bands (keys of SIZE_BANDS). */
+  sizes?: string[];
+  limit?: number;
+}
+
+export interface FindCompaniesResult {
+  found: boolean;
+  error?: string;
+  errorCode?: string;
+  companies: FoundCompany[];
+  credits?: SumbleCredits;
+  /** The technology name Sumble resolved the term to (audit context). */
+  techResolved?: string;
+}
+
+export async function findCompaniesByTech(c: FindCompaniesCriteria): Promise<FindCompaniesResult> {
+  const technology = (c.technology || "").trim();
+  if (!technology)
+    return { found: false, companies: [], error: "Enter an installed technology to search by." };
+  if (!isSumbleConfigured()) {
+    return {
+      found: false,
+      companies: [],
+      error: "SUMBLE_API_KEY is not configured",
+      errorCode: "no_key",
+    };
+  }
+
+  const limit = Math.min(50, Math.max(1, c.limit ?? 15));
+  const city = (c.city || "").trim();
+  const sizes = (c.sizes || []).filter((s) => SIZE_BANDS[s]);
+  // City + size are post-filters on the response (Sumble has no size param and
+  // only a coarse location field), so over-fetch when either is applied.
+  const hasPostFilter = !!city || sizes.length > 0;
+  const fetchLimit = hasPostFilter ? Math.min(100, limit * 4) : limit;
+
+  // Resolve the typed term to a Sumble-known technology so the org search matches.
+  const techRes = await sumbleFetchCached("POST", "/technologies/find", { query: technology });
+  if (!techRes.found)
+    return { found: false, error: techRes.error, errorCode: techRes.errorCode, companies: [] };
+  const techName = str(asObj(asArr(asObj(techRes.data).technologies)[0]).name);
+  if (!techName) {
+    return {
+      found: false,
+      companies: [],
+      error: `Sumble couldn't match "${technology}" to a technology. Try a specific tool or platform name (e.g. "Kubernetes", "Splunk", "Snowflake").`,
+    };
+  }
+
+  const orgsRes = await sumbleFetchCached("POST", "/organizations/find", {
+    filters: { query: technology, technologies: [techName] },
+    limit: fetchLimit,
+    offset: 0,
+  });
+  if (!orgsRes.found) {
+    return {
+      found: false,
+      error: orgsRes.error,
+      errorCode: orgsRes.errorCode,
+      companies: [],
+      techResolved: techName,
+    };
+  }
+
+  let orgs = parseOrgs(orgsRes.data);
+  if (city) orgs = orgs.filter((o) => locationMatches(o.location, city));
+  if (sizes.length) orgs = orgs.filter((o) => matchesSize(o.employees, sizes));
+  orgs = orgs.filter((o) => o.domain).slice(0, limit);
+
+  const companies: FoundCompany[] = orgs.map((o) => ({
+    name: o.name,
+    domain: o.domain as string,
+    industry: o.industry,
+    location: o.location,
+    employees: o.employees,
+  }));
+  return { found: true, companies, credits: parseCredits(orgsRes.data), techResolved: techName };
 }
 
 // Resolve a company name → its primary domain via organizations/match (1 credit).

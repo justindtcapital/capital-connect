@@ -13,6 +13,12 @@ interface TargetSelectionContextType {
   setOnBulkUpdate: (fn: ((updatedTargets: TargetLead[]) => void) | undefined) => void;
   onBulkDelete?: (deletedIds: string[]) => void;
   setOnBulkDelete: (fn: ((deletedIds: string[]) => void) | undefined) => void;
+  // Mass Apollo research over the current selection. Registered by the Targeting
+  // page so both the in-page banner and the sidebar button trigger one handler.
+  onBulkResearch?: () => void | Promise<void>;
+  setOnBulkResearch: (fn: (() => void | Promise<void>) | undefined) => void;
+  researching: boolean;
+  setResearching: (busy: boolean) => void;
 }
 
 const TargetSelectionContext = createContext<TargetSelectionContextType>({
@@ -25,6 +31,9 @@ const TargetSelectionContext = createContext<TargetSelectionContextType>({
   setFilteredTargets: () => {},
   setOnBulkUpdate: () => {},
   setOnBulkDelete: () => {},
+  setOnBulkResearch: () => {},
+  researching: false,
+  setResearching: () => {},
 });
 
 export function TargetSelectionProvider({ children }: { children: ReactNode }) {
@@ -32,6 +41,8 @@ export function TargetSelectionProvider({ children }: { children: ReactNode }) {
   const [allFilteredTargets, setAllFilteredTargets] = useState<TargetLead[]>([]);
   const [onBulkUpdate, setOnBulkUpdateState] = useState<((updatedTargets: TargetLead[]) => void) | undefined>();
   const [onBulkDelete, setOnBulkDeleteState] = useState<((deletedIds: string[]) => void) | undefined>();
+  const [onBulkResearch, setOnBulkResearchState] = useState<(() => void | Promise<void>) | undefined>();
+  const [researching, setResearching] = useState(false);
 
   const toggleId = useCallback((id: string) => {
     setSelectedIds((prev) => {
@@ -67,6 +78,10 @@ export function TargetSelectionProvider({ children }: { children: ReactNode }) {
     setOnBulkDeleteState(() => fn);
   }, []);
 
+  const setOnBulkResearch = useCallback((fn: (() => void | Promise<void>) | undefined) => {
+    setOnBulkResearchState(() => fn);
+  }, []);
+
   return (
     <TargetSelectionContext.Provider
       value={{
@@ -81,6 +96,10 @@ export function TargetSelectionProvider({ children }: { children: ReactNode }) {
         setOnBulkUpdate,
         onBulkDelete,
         setOnBulkDelete,
+        onBulkResearch,
+        setOnBulkResearch,
+        researching,
+        setResearching,
       }}
     >
       {children}

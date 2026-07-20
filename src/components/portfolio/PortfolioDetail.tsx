@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import type { PortfolioCompany, Contact, EmailActivityRecord } from "@/lib/types";
 import {
   Sheet,
@@ -9,7 +9,27 @@ import {
 } from "@/components/ui/sheet";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import {
   Building2,
   Mail,
@@ -29,8 +49,12 @@ import {
   Briefcase,
   FileText,
   AlertTriangle,
+  UserPlus,
+  Trash2,
 } from "lucide-react";
 import { ContactAvatar } from "@/components/crm/ContactAvatar";
+import { addContact, deletePortfolioCompany } from "@/utils/sheets.functions";
+import { extractDomain } from "@/lib/domain-utils";
 import { getPortcoIntel, getPortcoBrief } from "@/utils/sumble.functions";
 import { TechStackSection } from "@/components/crm/TechStackSection";
 import { ActivitySection } from "@/components/crm/ActivitySection";
@@ -40,6 +64,12 @@ import type { PortcoIntelResult, PortcoBriefResult } from "@/utils/sumble.server
 import { CustomerDiscoveryPanel } from "./CustomerDiscoveryPanel";
 import { PortcoSignalsPanel } from "./PortcoSignalsPanel";
 import { companyIntroInsights, type InsightNarrative } from "@/utils/insights.functions";
+import { syncPortcoFromAsana, syncPortcoFromWeb } from "@/utils/portco-sync.functions";
+import {
+  findPortcoPeople,
+  addPortcoPeopleFromApollo,
+  type PortcoPersonCandidate,
+} from "@/utils/portco-people.functions";
 import { toast } from "sonner";
 
 interface PortfolioDetailProps {
@@ -51,6 +81,12 @@ interface PortfolioDetailProps {
   /** Outreach emails logged on behalf of this company (from Email Activity). */
   emails?: EmailActivityRecord[];
   onPersonClick?: (contact: Contact) => void;
+  /** Called after a person is added so the parent can refresh its contacts. */
+  onPersonAdded?: () => void | Promise<void>;
+  /** Apply a patch after PortCo Asana / Web sync so the open sheet updates live. */
+  onCompanyUpdate?: (updated: PortfolioCompany) => void;
+  /** Called after the company is deleted so the parent can drop it + refresh. */
+  onCompanyDeleted?: (deleted: PortfolioCompany) => void | Promise<void>;
 }
 
 // Approx row height (py-1.5 + 7 avatar + multi-line label) ≈ 56px. Cap visible at 4 rows ≈ 240px.
@@ -71,14 +107,59 @@ function getLogoUrl(website: string) {
   }
 }
 
-export function PortfolioDetail({ company, open, onOpenChange, crmContacts = [], crmIntros = [], emails = [], onPersonClick }: PortfolioDetailProps) {
+export function PortfolioDetail({
+  company,
+  open,
+  onOpenChange,
+  crmContacts = [],
+  crmIntros = [],
+  emails = [],
+  onPersonClick,
+  onPersonAdded,
+  onCompanyUpdate,
+  onCompanyDeleted,
+}: PortfolioDetailProps) {
   const [syncing, setSyncing] = useState(false);
-  const [fetchingPeople, setFetchingPeople] = useState(false);
+  const [asanaSyncing, setAsanaSyncing] = useState(false);
+  const [findPeopleOpen, setFindPeopleOpen] = useState(false);
   const [insight, setInsight] = useState<InsightNarrative | null>(null);
   const [insightLoading, setInsightLoading] = useState(false);
+  const [addPersonOpen, setAddPersonOpen] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const { activities, loading: activitiesLoading } = useAsanaActivities();
 
   if (!company) return null;
+
+  // Companies that live only in the Asana portco project (no Sheet row) can't be
+  // deleted here — there's nothing to remove, and they'd just re-appear on sync.
+  const isSheetBacked = !company.id.startsWith("asana-pc-");
+
+  const handleDelete = async () => {
+    setDeleting(true);
+    try {
+      const res = await deletePortfolioCompany({
+        data: { urid: company.urid, name: company.name },
+      });
+      if (res.deleted > 0) {
+        toast.success(`Removed ${company.name} from the portfolio.`);
+        setDeleteOpen(false);
+        onOpenChange(false);
+        await onCompanyDeleted?.(company);
+      } else {
+        toast.error("Couldn't find that company in the sheet to delete.");
+      }
+    } catch (e) {
+      console.error("deletePortfolioCompany failed", e);
+      toast.error("Couldn't delete the company — see console.");
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  // The company's email domain (from its website) — used to auto-complete the
+  // email of a person added here, so the new contact matches back to this portco.
+  const companyDomain = extractDomain(company.website) || "";
 
   const companyActivities = matchActivitiesToCompany(activities, company.name);
 
@@ -105,18 +186,108 @@ export function PortfolioDetail({ company, open, onOpenChange, crmContacts = [],
     }
   };
 
-  const handleLinkedInSync = () => {
+  // Sumble org match (+ Asana LinkedIn/website fields) → fill blank Portfolio sheet cells.
+  const handleWebSync = async () => {
     setSyncing(true);
-    setTimeout(() => setSyncing(false), 2000);
+    try {
+      const res = await syncPortcoFromWeb({
+        data: {
+          companyName: company.name,
+          website: company.website || undefined,
+          location: company.location || undefined,
+        },
+      });
+      if (!res.ok) {
+        toast.error(res.error || "Web sync failed.");
+        return;
+      }
+      const patched: PortfolioCompany = {
+        ...company,
+        website: company.website || res.website || company.website,
+        linkedinUrl: company.linkedinUrl || res.linkedinUrl || company.linkedinUrl,
+        location: company.location || res.location || company.location,
+        description: company.description || res.description || company.description,
+      };
+      onCompanyUpdate?.(patched);
+      const bits = [
+        res.sumbleDomain ? `matched ${res.sumbleDomain}` : null,
+        res.sheetFieldsUpdated.length
+          ? `filled ${res.sheetFieldsUpdated.join(", ")}`
+          : "profile up to date",
+      ].filter(Boolean);
+      toast.success(`Web sync · ${bits.join(" · ")}`);
+    } catch (e) {
+      console.error("syncPortcoFromWeb failed", e);
+      toast.error("Web sync failed — see console.");
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  // Asana PortCo fields + events → UI + blank sheet cells + event-exposure pass.
+  const handleAsanaSync = async () => {
+    setAsanaSyncing(true);
+    try {
+      const res = await syncPortcoFromAsana({ data: { companyName: company.name } });
+      if (!res.ok) {
+        toast.error(res.error || "Asana sync failed.");
+        return;
+      }
+      const profileWebsite =
+        Object.entries(res.asanaFields).find(([k]) => /website|^url$|web\s*site/i.test(k))?.[1] ||
+        "";
+      const profileLinkedin =
+        Object.entries(res.asanaFields).find(([k]) => /linkedin/i.test(k))?.[1] || "";
+      const profileLocation =
+        Object.entries(res.asanaFields).find(([k]) =>
+          /^hq$|headquarter|location|city|geograph/i.test(k),
+        )?.[1] || "";
+      const profileDescription =
+        Object.entries(res.asanaFields).find(([k]) =>
+          /summary|description|about|overview/i.test(k),
+        )?.[1] || "";
+
+      const patched: PortfolioCompany = {
+        ...company,
+        asanaFields:
+          Object.keys(res.asanaFields).length > 0 ? res.asanaFields : company.asanaFields,
+        events: res.events,
+        website: company.website || profileWebsite || company.website,
+        linkedinUrl: company.linkedinUrl || profileLinkedin || company.linkedinUrl,
+        location: company.location || profileLocation || company.location,
+        description: company.description || profileDescription || company.description,
+      };
+      onCompanyUpdate?.(patched);
+
+      const parts = [
+        `${res.fieldCount} field${res.fieldCount !== 1 ? "s" : ""}`,
+        `${res.eventCount} event${res.eventCount !== 1 ? "s" : ""}`,
+      ];
+      if (res.sheetFieldsUpdated.length) parts.push(`sheet: ${res.sheetFieldsUpdated.join(", ")}`);
+      if (res.exposuresLogged + res.engagementsLogged > 0) {
+        parts.push(
+          `+${res.exposuresLogged} exposure${res.exposuresLogged !== 1 ? "s" : ""} · +${res.engagementsLogged} engagement${res.engagementsLogged !== 1 ? "s" : ""}`,
+        );
+      }
+      toast.success(`Asana sync · ${parts.join(" · ")}`);
+    } catch (e) {
+      console.error("syncPortcoFromAsana failed", e);
+      toast.error("Asana sync failed — see console.");
+    } finally {
+      setAsanaSyncing(false);
+    }
   };
 
   const handleFetchPeople = () => {
-    setFetchingPeople(true);
-    setTimeout(() => setFetchingPeople(false), 2000);
+    if (!companyDomain) {
+      toast.error("Add a website first (Web Sync) so we can search by company domain.");
+      return;
+    }
+    setFindPeopleOpen(true);
   };
 
   const todayStr = new Date().toISOString().split("T")[0];
-  const eventStatus = (e: typeof company.events[number]): "planned" | "completed" =>
+  const eventStatus = (e: (typeof company.events)[number]): "planned" | "completed" =>
     e.status ?? (e.date >= todayStr ? "planned" : "completed");
   const plannedEvents = company.events
     .filter((e) => eventStatus(e) === "planned")
@@ -165,7 +336,7 @@ export function PortfolioDetail({ company, open, onOpenChange, crmContacts = [],
   });
 
   const sortedIntros = [...companyIntros, ...crmDerivedIntros].sort(
-    (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()
+    (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime(),
   );
 
   // Deterministic intro stat: the most-engaged network title for this company.
@@ -177,498 +348,1113 @@ export function PortfolioDetail({ company, open, onOpenChange, crmContacts = [],
     }
     let best = "";
     let n = 0;
-    for (const [t, c] of counts) if (c > n) { best = t; n = c; }
+    for (const [t, c] of counts)
+      if (c > n) {
+        best = t;
+        n = c;
+      }
     return best;
   })();
 
   const logoUrl = getLogoUrl(company.website);
 
   return (
-    <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent className="w-full sm:max-w-2xl overflow-hidden flex flex-col">
-        <SheetHeader className="pb-4 border-b border-border shrink-0">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <div className="h-12 w-12 rounded-full bg-primary/10 flex items-center justify-center overflow-hidden">
-                {logoUrl ? (
-                  <img
-                    src={logoUrl}
-                    alt={company.name}
-                    className="h-9 w-9 object-contain"
-                    onError={(e) => {
-                      const target = e.currentTarget;
-                      target.style.display = "none";
-                      if (target.nextElementSibling) (target.nextElementSibling as HTMLElement).style.display = "";
-                    }}
-                  />
-                ) : null}
-                <span
-                  className="text-lg font-bold text-primary"
-                  style={logoUrl ? { display: "none" } : {}}
-                >
-                  {company.name.split(" ").map((n) => n[0]).join("").slice(0, 2)}
-                </span>
+    <>
+      <Sheet open={open} onOpenChange={onOpenChange}>
+        <SheetContent className="w-full sm:max-w-2xl overflow-hidden flex flex-col">
+          <SheetHeader className="pb-4 border-b border-border shrink-0">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="h-12 w-12 rounded-full bg-primary/10 flex items-center justify-center overflow-hidden">
+                  {logoUrl ? (
+                    <img
+                      src={logoUrl}
+                      alt={company.name}
+                      className="h-9 w-9 object-contain"
+                      onError={(e) => {
+                        const target = e.currentTarget;
+                        target.style.display = "none";
+                        if (target.nextElementSibling)
+                          (target.nextElementSibling as HTMLElement).style.display = "";
+                      }}
+                    />
+                  ) : null}
+                  <span
+                    className="text-lg font-bold text-primary"
+                    style={logoUrl ? { display: "none" } : {}}
+                  >
+                    {company.name
+                      .split(" ")
+                      .map((n) => n[0])
+                      .join("")
+                      .slice(0, 2)}
+                  </span>
+                </div>
+                <div>
+                  <SheetTitle className="text-base">{company.name}</SheetTitle>
+                  <SheetDescription className="flex items-center gap-1">
+                    <Building2 className="h-3 w-3" />
+                    {company.sector} · {company.location}
+                  </SheetDescription>
+                </div>
               </div>
-              <div>
-                <SheetTitle className="text-base">{company.name}</SheetTitle>
-                <SheetDescription className="flex items-center gap-1">
-                  <Building2 className="h-3 w-3" />
-                  {company.sector} · {company.location}
-                </SheetDescription>
+              <div className="flex items-center gap-2 shrink-0 mr-6">
+                <Badge variant="outline" className="text-xs">
+                  {company.domain}
+                </Badge>
+                {isSheetBacked && (
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7 text-muted-foreground hover:text-destructive"
+                    onClick={() => setDeleteOpen(true)}
+                    title="Delete company"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                )}
               </div>
             </div>
-            <Badge variant="outline" className="text-xs shrink-0">{company.domain}</Badge>
-          </div>
-        </SheetHeader>
+          </SheetHeader>
 
-        <ScrollArea className="flex-1 -mx-6 px-6">
-          <div className="py-5 space-y-6">
-            {/* Description */}
-            <section className="border-b border-border pb-4">
-              <p className="text-sm text-muted-foreground">{company.description}</p>
-            </section>
-
-            {/* Company Info */}
-            <section className="border-b border-border pb-6">
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-4 sm:divide-x sm:divide-border">
-                {/* Left column: company info */}
-                <div className="min-w-0">
-                  <div className="flex items-start justify-between mb-3 gap-2">
-                    <h3 className="text-[10px] uppercase tracking-widest font-semibold text-muted-foreground">
-                      Company Information
-                    </h3>
-                    <div className="flex flex-col items-end gap-1">
-                      <Button variant="ghost" size="sm" className="h-6 px-1.5 text-[10px] font-medium">
-                        <Pencil className="h-3 w-3 mr-1" />
-                        Edit
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="h-6 px-1.5 text-[10px] font-medium"
-                        onClick={handleLinkedInSync}
-                        disabled={syncing}
-                      >
-                        <RefreshCw className={`h-3 w-3 mr-1 ${syncing ? "animate-spin" : ""}`} />
-                        {syncing ? "Syncing" : "Web Sync"}
-                      </Button>
-                    </div>
-                  </div>
-                  <div className="space-y-1.5 text-sm min-w-0">
-                    <div className="flex items-center gap-2 text-muted-foreground">
-                      <MapPin className="h-3.5 w-3.5 shrink-0" />
-                      <span className="truncate">{company.location}</span>
-                    </div>
-                    <div className="flex items-center gap-2 text-muted-foreground min-w-0">
-                      <Globe className="h-3.5 w-3.5 shrink-0" />
-                      <a href={company.website} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline truncate">
-                        {company.website}
-                      </a>
-                    </div>
-                    <div className="flex items-center gap-2 text-muted-foreground">
-                      <Linkedin className="h-3.5 w-3.5 shrink-0" />
-                      <a href={company.linkedinUrl} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">
-                        LinkedIn Profile
-                      </a>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Right column: DTC Investment Profile */}
-                <div className="min-w-0 sm:pl-6">
-                  <h3 className="text-[10px] uppercase tracking-widest font-semibold text-muted-foreground mb-3">
-                    DTC Investment Profile
-                  </h3>
-                  {(() => {
-                    const fields = company.asanaFields || {};
-                    const lowered = Object.keys(fields).reduce<Record<string, string>>((acc, k) => {
-                      acc[k.toLowerCase().trim()] = fields[k];
-                      return acc;
-                    }, {});
-                    const lookup = (aliases: string[]): string | undefined => {
-                      for (const a of aliases) {
-                        const v = lowered[a.toLowerCase().trim()];
-                        if (v) return v;
-                      }
-                      return undefined;
-                    };
-                    const profile: { label: string; value?: string }[] = [
-                      { label: "DTC Priority", value: lookup(["DTC Priority"]) },
-                      { label: "Product/Market Fit", value: lookup(["GTM Marketing/PMF", "PMF", "Product Market Fit"]) },
-                      { label: "DTC Investment", value: (() => {
-                        const v = lookup(["DTC Investment ($M)", "DTC Investment"]);
-                        return v ? `$${v}M` : undefined;
-                      })() },
-                      { label: "DTC Ownership", value: (() => {
-                        const v = lookup(["DTC Ownership"]);
-                        if (!v) return undefined;
-                        const num = parseFloat(v.replace(/[%,\s]/g, ""));
-                        if (isNaN(num)) return v;
-                        // If value is a decimal (≤1), treat as fraction; otherwise it's already a percent.
-                        const pct = num <= 1 ? num * 100 : num;
-                        // Trim trailing zeros, max 2 decimals.
-                        return `${parseFloat(pct.toFixed(2))}%`;
-                      })() },
-                      { label: "Company Stage", value: lookup(["Company Stage", "Stage"]) },
-                      { label: "Lead Investor", value: lookup(["Lead Investor"]) },
-                    ];
-                    const hasAny = profile.some((p) => p.value);
-                    return hasAny ? (
-                      <dl className="space-y-1.5">
-                        {profile.map((p) => (
-                          <div key={p.label} className="flex justify-between gap-2 text-xs">
-                            <dt className="text-muted-foreground">{p.label}</dt>
-                            <dd className="text-foreground font-medium text-right truncate">{p.value || "—"}</dd>
-                          </div>
-                        ))}
-                      </dl>
-                    ) : (
-                      <p className="text-[11px] text-muted-foreground italic">
-                        No Asana data available for this company.
-                      </p>
-                    );
-                  })()}
-                </div>
-              </div>
-            </section>
-
-            {/* BD / GTM activity from Asana, matched to this company */}
-            {(activitiesLoading || companyActivities.length > 0) && (
-              <section className="border-b border-border pb-6">
-                <ActivitySection activities={companyActivities} loading={activitiesLoading} enableSourcing defaultCompany={company.name} />
+          <ScrollArea className="flex-1 -mx-6 px-6">
+            <div className="py-5 space-y-6">
+              {/* Description */}
+              <section className="border-b border-border pb-4">
+                <p className="text-sm text-muted-foreground">{company.description}</p>
               </section>
-            )}
 
-            {/* Signals — recent news/activity for this PortCo (scoped scan) */}
-            <section className="border-b border-border pb-6">
-              <PortcoSignalsPanel company={company} />
-            </section>
-
-            {/* Sumble Intelligence */}
-            <section className="border-b border-border pb-6">
-              <PortcoIntelPanel company={company} />
-            </section>
-
-            {/* Customer Discovery — likely customers for this portfolio company */}
-            <section className="border-b border-border pb-6">
-              <CustomerDiscoveryPanel company={company} />
-            </section>
-
-            {/* Key People — pulled from CRM contacts whose email domain matches the company website */}
-            <section className="border-b border-border pb-6">
-              <div className="flex items-center justify-between mb-3">
-                <h3 className="text-[10px] uppercase tracking-widest font-semibold text-muted-foreground">
-                  Key People ({crmContacts.length + company.employees.length})
-                </h3>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className={actionBtnClass}
-                  onClick={handleFetchPeople}
-                  disabled={fetchingPeople}
-                >
-                  <Linkedin className={`h-3 w-3 mr-1 ${fetchingPeople ? "animate-pulse" : ""}`} />
-                  {fetchingPeople ? "Fetching..." : "Get more from LinkedIn"}
-                </Button>
-              </div>
-              {crmContacts.length === 0 && company.employees.length === 0 ? (
-                <p className="text-xs text-muted-foreground">
-                  No CRM contacts matched this company's domain yet. Tag contacts with sector "Portfolio" and use a matching email domain to surface them here.
-                </p>
-              ) : (
-                <div
-                  className="space-y-1 overflow-y-auto pr-1 border-t border-border/50"
-                  style={{ maxHeight: KEY_PEOPLE_MAX_HEIGHT }}
-                >
-                  {crmContacts.map((contact) => (
-                    <button
-                      key={contact.id}
-                      type="button"
-                      onClick={() => onPersonClick?.(contact)}
-                      className="w-full flex items-center justify-between gap-2 py-1.5 px-2 -mx-2 rounded-md hover:bg-accent/50 transition-colors text-left border-b border-border/30 last:border-b-0"
-                    >
-                      <div className="flex items-center gap-2 min-w-0 flex-1">
-                        <ContactAvatar contact={contact} size="sm" />
-                        <div className="min-w-0 flex-1">
-                          <p className="text-xs font-medium text-foreground truncate">{contact.name}</p>
-                          <p className="text-[10px] text-muted-foreground truncate">
-                            {contact.title || "—"}
-                          </p>
-                          <div className="flex items-center gap-2 mt-0.5">
-                            {contact.email && (
-                              <span className="text-[10px] text-muted-foreground truncate flex items-center gap-1 min-w-0">
-                                <Mail className="h-2.5 w-2.5 shrink-0" />
-                                <span className="truncate">{contact.email}</span>
-                              </span>
-                            )}
-                            {contact.phone && (
-                              <span className="text-[10px] text-muted-foreground flex items-center gap-1 shrink-0">
-                                <Phone className="h-2.5 w-2.5" />
-                                {contact.phone}
-                              </span>
-                            )}
-                          </div>
-                        </div>
+              {/* Company Info */}
+              <section className="border-b border-border pb-6">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-4 sm:divide-x sm:divide-border">
+                  {/* Left column: company info */}
+                  <div className="min-w-0">
+                    <div className="flex items-start justify-between mb-3 gap-2">
+                      <h3 className="text-[10px] uppercase tracking-widest font-semibold text-muted-foreground">
+                        Company Information
+                      </h3>
+                      <div className="flex flex-col items-end gap-1">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-6 px-1.5 text-[10px] font-medium"
+                        >
+                          <Pencil className="h-3 w-3 mr-1" />
+                          Edit
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-6 px-1.5 text-[10px] font-medium"
+                          onClick={handleWebSync}
+                          disabled={syncing || asanaSyncing}
+                        >
+                          <RefreshCw className={`h-3 w-3 mr-1 ${syncing ? "animate-spin" : ""}`} />
+                          {syncing ? "Syncing" : "Web Sync"}
+                        </Button>
                       </div>
-                      <div
-                        className="flex items-center gap-1.5 shrink-0"
-                        onClick={(e) => e.stopPropagation()}
-                      >
-                        {contact.email && (
-                          <a
-                            href={`mailto:${contact.email}`}
-                            className="text-muted-foreground hover:text-foreground p-1"
-                            title={`Email ${contact.email}`}
-                            onClick={(e) => e.stopPropagation()}
-                          >
-                            <Mail className="h-3.5 w-3.5" />
-                          </a>
-                        )}
-                        {contact.phone && (
-                          <a
-                            href={`tel:${contact.phone}`}
-                            className="text-muted-foreground hover:text-foreground p-1"
-                            title={`Call ${contact.phone}`}
-                            onClick={(e) => e.stopPropagation()}
-                          >
-                            <Phone className="h-3.5 w-3.5" />
-                          </a>
-                        )}
-                        {contact.linkedinUrl && (
-                          <a
-                            href={contact.linkedinUrl}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="text-muted-foreground hover:text-primary p-1"
-                            onClick={(e) => e.stopPropagation()}
-                          >
-                            <Linkedin className="h-3.5 w-3.5" />
-                          </a>
-                        )}
+                    </div>
+                    <div className="space-y-1.5 text-sm min-w-0">
+                      <div className="flex items-center gap-2 text-muted-foreground">
+                        <MapPin className="h-3.5 w-3.5 shrink-0" />
+                        <span className="truncate">{company.location}</span>
                       </div>
-                    </button>
-                  ))}
-                  {company.employees.map((emp) => (
-                    <div key={emp.id} className="flex items-center justify-between py-1.5 border-b border-border/30 last:border-b-0">
-                      <div className="flex items-center gap-2">
-                        <div className="h-7 w-7 rounded-full bg-accent flex items-center justify-center">
-                          <span className="text-[10px] font-semibold text-foreground">
-                            {emp.name.split(" ").map((n) => n[0]).join("")}
-                          </span>
-                        </div>
-                        <div>
-                          <p className="text-xs font-medium text-foreground">{emp.name}</p>
-                          <p className="text-[10px] text-muted-foreground">{emp.title}</p>
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <a href={`mailto:${emp.email}`} className="text-muted-foreground hover:text-foreground">
-                          <Mail className="h-3.5 w-3.5" />
+                      <div className="flex items-center gap-2 text-muted-foreground min-w-0">
+                        <Globe className="h-3.5 w-3.5 shrink-0" />
+                        <a
+                          href={company.website}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-primary hover:underline truncate"
+                        >
+                          {company.website}
                         </a>
-                        <a href={emp.linkedinUrl} target="_blank" rel="noopener noreferrer" className="text-muted-foreground hover:text-primary">
-                          <Linkedin className="h-3.5 w-3.5" />
+                      </div>
+                      <div className="flex items-center gap-2 text-muted-foreground">
+                        <Linkedin className="h-3.5 w-3.5 shrink-0" />
+                        <a
+                          href={company.linkedinUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-primary hover:underline"
+                        >
+                          LinkedIn Profile
                         </a>
                       </div>
                     </div>
-                  ))}
-                </div>
-              )}
-            </section>
+                  </div>
 
-            {/* Events Timeline */}
-            <section className="border-b border-border pb-6">
-              <div className="flex items-center justify-between mb-3">
-                <h3 className="text-[10px] uppercase tracking-widest font-semibold text-muted-foreground">
-                  Events Timeline
-                </h3>
-                <Button variant="outline" size="sm" className={actionBtnClass}>
-                  <RefreshCw className="h-3 w-3 mr-1" />
-                  Sync with Asana
-                </Button>
-              </div>
-              {plannedEvents.length === 0 && completedEvents.length === 0 ? (
-                <p className="text-xs text-muted-foreground">No events recorded</p>
-              ) : (
-                <div className="max-h-72 overflow-y-auto pr-1 space-y-4">
-                  {plannedEvents.length > 0 && (
-                    <div>
-                      <h4 className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">
-                        Planned ({plannedEvents.length})
-                      </h4>
-                      <div className="space-y-0">
-                        {plannedEvents.map((event, idx) => (
-                          <div key={event.id} className="flex gap-3 relative">
-                            <div className="flex flex-col items-center">
-                              <div className="h-2 w-2 rounded-full bg-primary shrink-0 mt-1.5" />
-                              {idx < plannedEvents.length - 1 && <div className="w-px flex-1 bg-border" />}
+                  {/* Right column: DTC Investment Profile */}
+                  <div className="min-w-0 sm:pl-6">
+                    <h3 className="text-[10px] uppercase tracking-widest font-semibold text-muted-foreground mb-3">
+                      DTC Investment Profile
+                    </h3>
+                    {(() => {
+                      const fields = company.asanaFields || {};
+                      const lowered = Object.keys(fields).reduce<Record<string, string>>(
+                        (acc, k) => {
+                          acc[k.toLowerCase().trim()] = fields[k];
+                          return acc;
+                        },
+                        {},
+                      );
+                      const lookup = (aliases: string[]): string | undefined => {
+                        for (const a of aliases) {
+                          const v = lowered[a.toLowerCase().trim()];
+                          if (v) return v;
+                        }
+                        return undefined;
+                      };
+                      const profile: { label: string; value?: string }[] = [
+                        { label: "DTC Priority", value: lookup(["DTC Priority"]) },
+                        {
+                          label: "Product/Market Fit",
+                          value: lookup(["GTM Marketing/PMF", "PMF", "Product Market Fit"]),
+                        },
+                        {
+                          label: "DTC Investment",
+                          value: (() => {
+                            const v = lookup(["DTC Investment ($M)", "DTC Investment"]);
+                            return v ? `$${v}M` : undefined;
+                          })(),
+                        },
+                        {
+                          label: "DTC Ownership",
+                          value: (() => {
+                            const v = lookup(["DTC Ownership"]);
+                            if (!v) return undefined;
+                            const num = parseFloat(v.replace(/[%,\s]/g, ""));
+                            if (isNaN(num)) return v;
+                            // If value is a decimal (≤1), treat as fraction; otherwise it's already a percent.
+                            const pct = num <= 1 ? num * 100 : num;
+                            // Trim trailing zeros, max 2 decimals.
+                            return `${parseFloat(pct.toFixed(2))}%`;
+                          })(),
+                        },
+                        { label: "Company Stage", value: lookup(["Company Stage", "Stage"]) },
+                        { label: "Lead Investor", value: lookup(["Lead Investor"]) },
+                      ];
+                      const hasAny = profile.some((p) => p.value);
+                      return hasAny ? (
+                        <dl className="space-y-1.5">
+                          {profile.map((p) => (
+                            <div key={p.label} className="flex justify-between gap-2 text-xs">
+                              <dt className="text-muted-foreground">{p.label}</dt>
+                              <dd className="text-foreground font-medium text-right truncate">
+                                {p.value || "—"}
+                              </dd>
                             </div>
-                            <div className="pb-3 flex-1 min-w-0">
-                              <div className="flex items-center gap-2 flex-wrap">
-                                <Badge variant="outline" className="text-[10px] shrink-0">Planned</Badge>
-                                {event.eventRole && (
-                                  <Badge variant="secondary" className="text-[10px] capitalize shrink-0">{event.eventRole}</Badge>
-                                )}
-                                <span className="text-xs font-medium text-foreground truncate">{event.name}</span>
-                              </div>
-                              <span className="text-[10px] text-muted-foreground">{event.date}</span>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                  {completedEvents.length > 0 && (
-                    <div>
-                      <h4 className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">
-                        Completed ({completedEvents.length})
-                      </h4>
-                      <div className="space-y-0">
-                        {completedEvents.map((event, idx) => (
-                          <div key={event.id} className="flex gap-3 relative">
-                            <div className="flex flex-col items-center">
-                              <div className="h-2 w-2 rounded-full bg-muted-foreground/60 shrink-0 mt-1.5" />
-                              {idx < completedEvents.length - 1 && <div className="w-px flex-1 bg-border" />}
-                            </div>
-                            <div className="pb-3 flex-1 min-w-0">
-                              <div className="flex items-center gap-2 flex-wrap">
-                                <Badge variant="outline" className="text-[10px] shrink-0">Completed</Badge>
-                                {event.eventRole && (
-                                  <Badge variant="secondary" className="text-[10px] capitalize shrink-0">{event.eventRole}</Badge>
-                                )}
-                                <span className="text-xs font-medium text-foreground truncate">{event.name}</span>
-                              </div>
-                              <span className="text-[10px] text-muted-foreground">{event.date}</span>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
+                          ))}
+                        </dl>
+                      ) : (
+                        <p className="text-[11px] text-muted-foreground italic">
+                          No Asana data available for this company.
+                        </p>
+                      );
+                    })()}
+                  </div>
                 </div>
-              )}
-            </section>
-            <section>
-              <h3 className="text-[10px] uppercase tracking-widest font-semibold text-muted-foreground mb-3">
-                Introductions ({sortedIntros.length})
-              </h3>
+              </section>
 
-              {/* #5 — intro insights: deterministic stats always; Claude on demand */}
-              {sortedIntros.length > 0 && (
-                <div className="mb-3 rounded-md border border-border bg-muted/20 p-2.5 space-y-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="text-[11px] text-muted-foreground">
-                      <span className="font-semibold text-foreground">{sortedIntros.length}</span> total ·{" "}
-                      <span className="font-semibold text-foreground">{crmIntros.length}</span> from network
-                      {topTitle && <> · most engaged: <span className="text-foreground">{topTitle}</span></>}
-                    </div>
+              {/* BD / GTM activity from Asana, matched to this company */}
+              {(activitiesLoading || companyActivities.length > 0) && (
+                <section className="border-b border-border pb-6">
+                  <ActivitySection
+                    activities={companyActivities}
+                    loading={activitiesLoading}
+                    enableSourcing
+                    defaultCompany={company.name}
+                  />
+                </section>
+              )}
+
+              {/* Signals — recent news/activity for this PortCo (scoped scan) */}
+              <section className="border-b border-border pb-6">
+                <PortcoSignalsPanel company={company} />
+              </section>
+
+              {/* Sumble Intelligence */}
+              <section className="border-b border-border pb-6">
+                <PortcoIntelPanel company={company} />
+              </section>
+
+              {/* Customer Discovery — likely customers for this portfolio company */}
+              <section className="border-b border-border pb-6">
+                <CustomerDiscoveryPanel company={company} />
+              </section>
+
+              {/* Key People — pulled from CRM contacts whose email domain matches the company website */}
+              <section className="border-b border-border pb-6">
+                <div className="flex items-center justify-between mb-3">
+                  <h3 className="text-[10px] uppercase tracking-widest font-semibold text-muted-foreground">
+                    Key People ({crmContacts.length + company.employees.length})
+                  </h3>
+                  <div className="flex items-center gap-1.5">
                     <Button
                       variant="outline"
                       size="sm"
                       className={actionBtnClass}
-                      onClick={genCompanyInsights}
-                      disabled={insightLoading || crmIntros.length === 0}
-                      title={crmIntros.length === 0 ? "Needs network contacts engaged with this company" : "AI commonality insights (network data only)"}
+                      onClick={() => setAddPersonOpen(true)}
                     >
-                      {insightLoading ? (
-                        <><Loader2 className="h-3 w-3 mr-1 animate-spin" /> Thinking…</>
-                      ) : (
-                        <><Sparkles className="h-3 w-3 mr-1" /> Generate insights</>
-                      )}
+                      <UserPlus className="h-3 w-3 mr-1" />
+                      Add person
                     </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className={actionBtnClass}
+                    onClick={handleFetchPeople}
+                    title={
+                      companyDomain
+                        ? `Find leadership at ${companyDomain} via Apollo`
+                        : "Needs a company website / domain first"
+                    }
+                  >
+                    <Linkedin className="h-3 w-3 mr-1" />
+                    Get more from LinkedIn
+                  </Button>
                   </div>
-                  {insight?.ok && (
-                    <div className="space-y-1.5 border-t border-border pt-2">
-                      {insight.summary && <p className="text-[11px] text-foreground">{insight.summary}</p>}
-                      {insight.commonalities && insight.commonalities.length > 0 && (
-                        <div>
-                          <span className="text-[9px] uppercase tracking-wider font-semibold text-muted-foreground">Commonalities</span>
-                          <ul className="list-disc pl-4 text-[11px] text-muted-foreground">
-                            {insight.commonalities.map((c, i) => <li key={i}>{c}</li>)}
-                          </ul>
-                        </div>
-                      )}
-                      {insight.suggestions && insight.suggestions.length > 0 && (
-                        <div>
-                          <span className="text-[9px] uppercase tracking-wider font-semibold text-muted-foreground">Suggested next intros</span>
-                          <ul className="list-disc pl-4 text-[11px] text-muted-foreground">
-                            {insight.suggestions.map((c, i) => <li key={i}>{c}</li>)}
-                          </ul>
-                        </div>
-                      )}
-                    </div>
-                  )}
                 </div>
-              )}
-
-              {sortedIntros.length > 0 ? (
-                <div className="max-h-64 overflow-y-auto pr-1 space-y-0">
-                  {sortedIntros.map((intro, idx) => {
-                    const clickable = intro.source === "crm" && intro.contact;
-                    return (
-                      <div
-                        key={intro.id}
-                        className={`flex gap-3 relative ${clickable ? "cursor-pointer hover:bg-accent/40 rounded-md -mx-1 px-1" : ""}`}
-                        onClick={() => clickable && intro.contact && onPersonClick?.(intro.contact)}
+                {crmContacts.length === 0 && company.employees.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">
+                    No CRM contacts matched this company's domain yet. Tag contacts with sector
+                    "Portfolio" and use a matching email domain to surface them here.
+                  </p>
+                ) : (
+                  <div
+                    className="space-y-1 overflow-y-auto pr-1 border-t border-border/50"
+                    style={{ maxHeight: KEY_PEOPLE_MAX_HEIGHT }}
+                  >
+                    {crmContacts.map((contact) => (
+                      <button
+                        key={contact.id}
+                        type="button"
+                        onClick={() => onPersonClick?.(contact)}
+                        className="w-full flex items-center justify-between gap-2 py-1.5 px-2 -mx-2 rounded-md hover:bg-accent/50 transition-colors text-left border-b border-border/30 last:border-b-0"
                       >
-                        <div className="flex flex-col items-center">
-                          <div className={`h-2 w-2 rounded-full shrink-0 mt-1.5 ${intro.source === "crm" ? "bg-accent-foreground" : "bg-primary"}`} />
-                          {idx < sortedIntros.length - 1 && (
-                            <div className="w-px flex-1 bg-border" />
-                          )}
-                        </div>
-                        <div className="pb-4 flex-1 min-w-0">
-                          <div className="flex items-center gap-2">
-                            <Badge variant="outline" className="text-[10px] shrink-0">
-                              {intro.sublabel}
-                            </Badge>
-                            <span className="text-xs font-medium text-foreground truncate">{intro.label}</span>
+                        <div className="flex items-center gap-2 min-w-0 flex-1">
+                          <ContactAvatar contact={contact} size="sm" />
+                          <div className="min-w-0 flex-1">
+                            <p className="text-xs font-medium text-foreground truncate">
+                              {contact.name}
+                            </p>
+                            <p className="text-[10px] text-muted-foreground truncate">
+                              {contact.title || "—"}
+                            </p>
+                            <div className="flex items-center gap-2 mt-0.5">
+                              {contact.email && (
+                                <span className="text-[10px] text-muted-foreground truncate flex items-center gap-1 min-w-0">
+                                  <Mail className="h-2.5 w-2.5 shrink-0" />
+                                  <span className="truncate">{contact.email}</span>
+                                </span>
+                              )}
+                              {contact.phone && (
+                                <span className="text-[10px] text-muted-foreground flex items-center gap-1 shrink-0">
+                                  <Phone className="h-2.5 w-2.5" />
+                                  {contact.phone}
+                                </span>
+                              )}
+                            </div>
                           </div>
-                          <span className="text-[10px] text-muted-foreground">{intro.date}</span>
-                          {intro.source !== "crm" ? (
-                            <p className="text-[10px] text-muted-foreground/80 mt-0.5">{intro.detail}</p>
-                          ) : (
-                            intro.engagement && (
-                              <p className="text-[10px] text-muted-foreground/80 mt-0.5 capitalize">
-                                {intro.engagement}
-                              </p>
-                            )
+                        </div>
+                        <div
+                          className="flex items-center gap-1.5 shrink-0"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          {contact.email && (
+                            <a
+                              href={`mailto:${contact.email}`}
+                              className="text-muted-foreground hover:text-foreground p-1"
+                              title={`Email ${contact.email}`}
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              <Mail className="h-3.5 w-3.5" />
+                            </a>
+                          )}
+                          {contact.phone && (
+                            <a
+                              href={`tel:${contact.phone}`}
+                              className="text-muted-foreground hover:text-foreground p-1"
+                              title={`Call ${contact.phone}`}
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              <Phone className="h-3.5 w-3.5" />
+                            </a>
+                          )}
+                          {contact.linkedinUrl && (
+                            <a
+                              href={contact.linkedinUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-muted-foreground hover:text-primary p-1"
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              <Linkedin className="h-3.5 w-3.5" />
+                            </a>
                           )}
                         </div>
+                      </button>
+                    ))}
+                    {company.employees.map((emp) => (
+                      <div
+                        key={emp.id}
+                        className="flex items-center justify-between py-1.5 border-b border-border/30 last:border-b-0"
+                      >
+                        <div className="flex items-center gap-2">
+                          <div className="h-7 w-7 rounded-full bg-accent flex items-center justify-center">
+                            <span className="text-[10px] font-semibold text-foreground">
+                              {emp.name
+                                .split(" ")
+                                .map((n) => n[0])
+                                .join("")}
+                            </span>
+                          </div>
+                          <div>
+                            <p className="text-xs font-medium text-foreground">{emp.name}</p>
+                            <p className="text-[10px] text-muted-foreground">{emp.title}</p>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <a
+                            href={`mailto:${emp.email}`}
+                            className="text-muted-foreground hover:text-foreground"
+                          >
+                            <Mail className="h-3.5 w-3.5" />
+                          </a>
+                          <a
+                            href={emp.linkedinUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-muted-foreground hover:text-primary"
+                          >
+                            <Linkedin className="h-3.5 w-3.5" />
+                          </a>
+                        </div>
                       </div>
-                    );
-                  })}
-                </div>
-              ) : (
-                <p className="text-xs text-muted-foreground">No introductions logged yet</p>
-              )}
-            </section>
+                    ))}
+                  </div>
+                )}
+              </section>
 
-            <section>
-              <h3 className="text-[10px] uppercase tracking-widest font-semibold text-muted-foreground mb-3">
-                Outreach ({emails.length})
-              </h3>
-              {emails.length > 0 ? (
-                <div className="max-h-48 overflow-y-auto pr-1 space-y-1.5">
-                  {emails.map((e, i) => (
-                    <div key={`${e.contactEmail}-${i}`} className="border border-border rounded px-2 py-1.5">
-                      <div className="text-xs font-medium text-foreground truncate">
-                        {e.subject || "(no subject)"}
-                      </div>
-                      <div className="text-[10px] text-muted-foreground truncate">
-                        {e.contactEmail}
-                        {e.timestamp ? ` · ${e.timestamp.slice(0, 10)}` : ""}
-                      </div>
-                    </div>
-                  ))}
+              {/* Events Timeline */}
+              <section className="border-b border-border pb-6">
+                <div className="flex items-center justify-between mb-3">
+                  <h3 className="text-[10px] uppercase tracking-widest font-semibold text-muted-foreground">
+                    Events Timeline
+                  </h3>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className={actionBtnClass}
+                    onClick={handleAsanaSync}
+                    disabled={asanaSyncing || syncing}
+                  >
+                    <RefreshCw className={`h-3 w-3 mr-1 ${asanaSyncing ? "animate-spin" : ""}`} />
+                    {asanaSyncing ? "Syncing…" : "Sync with Asana"}
+                  </Button>
                 </div>
+                {plannedEvents.length === 0 && completedEvents.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">No events recorded</p>
+                ) : (
+                  <div className="max-h-72 overflow-y-auto pr-1 space-y-4">
+                    {plannedEvents.length > 0 && (
+                      <div>
+                        <h4 className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">
+                          Planned ({plannedEvents.length})
+                        </h4>
+                        <div className="space-y-0">
+                          {plannedEvents.map((event, idx) => (
+                            <div key={event.id} className="flex gap-3 relative">
+                              <div className="flex flex-col items-center">
+                                <div className="h-2 w-2 rounded-full bg-primary shrink-0 mt-1.5" />
+                                {idx < plannedEvents.length - 1 && (
+                                  <div className="w-px flex-1 bg-border" />
+                                )}
+                              </div>
+                              <div className="pb-3 flex-1 min-w-0">
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <Badge variant="outline" className="text-[10px] shrink-0">
+                                    Planned
+                                  </Badge>
+                                  {event.eventRole && (
+                                    <Badge
+                                      variant="secondary"
+                                      className="text-[10px] capitalize shrink-0"
+                                    >
+                                      {event.eventRole}
+                                    </Badge>
+                                  )}
+                                  <span className="text-xs font-medium text-foreground truncate">
+                                    {event.name}
+                                  </span>
+                                </div>
+                                <span className="text-[10px] text-muted-foreground">
+                                  {event.date}
+                                </span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    {completedEvents.length > 0 && (
+                      <div>
+                        <h4 className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">
+                          Completed ({completedEvents.length})
+                        </h4>
+                        <div className="space-y-0">
+                          {completedEvents.map((event, idx) => (
+                            <div key={event.id} className="flex gap-3 relative">
+                              <div className="flex flex-col items-center">
+                                <div className="h-2 w-2 rounded-full bg-muted-foreground/60 shrink-0 mt-1.5" />
+                                {idx < completedEvents.length - 1 && (
+                                  <div className="w-px flex-1 bg-border" />
+                                )}
+                              </div>
+                              <div className="pb-3 flex-1 min-w-0">
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <Badge variant="outline" className="text-[10px] shrink-0">
+                                    Completed
+                                  </Badge>
+                                  {event.eventRole && (
+                                    <Badge
+                                      variant="secondary"
+                                      className="text-[10px] capitalize shrink-0"
+                                    >
+                                      {event.eventRole}
+                                    </Badge>
+                                  )}
+                                  <span className="text-xs font-medium text-foreground truncate">
+                                    {event.name}
+                                  </span>
+                                </div>
+                                <span className="text-[10px] text-muted-foreground">
+                                  {event.date}
+                                </span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </section>
+              <section>
+                <h3 className="text-[10px] uppercase tracking-widest font-semibold text-muted-foreground mb-3">
+                  Introductions ({sortedIntros.length})
+                </h3>
+
+                {/* #5 — intro insights: deterministic stats always; Claude on demand */}
+                {sortedIntros.length > 0 && (
+                  <div className="mb-3 rounded-md border border-border bg-muted/20 p-2.5 space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="text-[11px] text-muted-foreground">
+                        <span className="font-semibold text-foreground">{sortedIntros.length}</span>{" "}
+                        total ·{" "}
+                        <span className="font-semibold text-foreground">{crmIntros.length}</span>{" "}
+                        from network
+                        {topTitle && (
+                          <>
+                            {" "}
+                            · most engaged: <span className="text-foreground">{topTitle}</span>
+                          </>
+                        )}
+                      </div>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className={actionBtnClass}
+                        onClick={genCompanyInsights}
+                        disabled={insightLoading || crmIntros.length === 0}
+                        title={
+                          crmIntros.length === 0
+                            ? "Needs network contacts engaged with this company"
+                            : "AI commonality insights (network data only)"
+                        }
+                      >
+                        {insightLoading ? (
+                          <>
+                            <Loader2 className="h-3 w-3 mr-1 animate-spin" /> Thinking…
+                          </>
+                        ) : (
+                          <>
+                            <Sparkles className="h-3 w-3 mr-1" /> Generate insights
+                          </>
+                        )}
+                      </Button>
+                    </div>
+                    {insight?.ok && (
+                      <div className="space-y-1.5 border-t border-border pt-2">
+                        {insight.summary && (
+                          <p className="text-[11px] text-foreground">{insight.summary}</p>
+                        )}
+                        {insight.commonalities && insight.commonalities.length > 0 && (
+                          <div>
+                            <span className="text-[9px] uppercase tracking-wider font-semibold text-muted-foreground">
+                              Commonalities
+                            </span>
+                            <ul className="list-disc pl-4 text-[11px] text-muted-foreground">
+                              {insight.commonalities.map((c, i) => (
+                                <li key={i}>{c}</li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                        {insight.suggestions && insight.suggestions.length > 0 && (
+                          <div>
+                            <span className="text-[9px] uppercase tracking-wider font-semibold text-muted-foreground">
+                              Suggested next intros
+                            </span>
+                            <ul className="list-disc pl-4 text-[11px] text-muted-foreground">
+                              {insight.suggestions.map((c, i) => (
+                                <li key={i}>{c}</li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {sortedIntros.length > 0 ? (
+                  <div className="max-h-64 overflow-y-auto pr-1 space-y-0">
+                    {sortedIntros.map((intro, idx) => {
+                      const clickable = intro.source === "crm" && intro.contact;
+                      return (
+                        <div
+                          key={intro.id}
+                          className={`flex gap-3 relative ${clickable ? "cursor-pointer hover:bg-accent/40 rounded-md -mx-1 px-1" : ""}`}
+                          onClick={() =>
+                            clickable && intro.contact && onPersonClick?.(intro.contact)
+                          }
+                        >
+                          <div className="flex flex-col items-center">
+                            <div
+                              className={`h-2 w-2 rounded-full shrink-0 mt-1.5 ${intro.source === "crm" ? "bg-accent-foreground" : "bg-primary"}`}
+                            />
+                            {idx < sortedIntros.length - 1 && (
+                              <div className="w-px flex-1 bg-border" />
+                            )}
+                          </div>
+                          <div className="pb-4 flex-1 min-w-0">
+                            <div className="flex items-center gap-2">
+                              <Badge variant="outline" className="text-[10px] shrink-0">
+                                {intro.sublabel}
+                              </Badge>
+                              <span className="text-xs font-medium text-foreground truncate">
+                                {intro.label}
+                              </span>
+                            </div>
+                            <span className="text-[10px] text-muted-foreground">{intro.date}</span>
+                            {intro.source !== "crm" ? (
+                              <p className="text-[10px] text-muted-foreground/80 mt-0.5">
+                                {intro.detail}
+                              </p>
+                            ) : (
+                              intro.engagement && (
+                                <p className="text-[10px] text-muted-foreground/80 mt-0.5 capitalize">
+                                  {intro.engagement}
+                                </p>
+                              )
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <p className="text-xs text-muted-foreground">No introductions logged yet</p>
+                )}
+              </section>
+
+              <section>
+                <h3 className="text-[10px] uppercase tracking-widest font-semibold text-muted-foreground mb-3">
+                  Outreach ({emails.length})
+                </h3>
+                {emails.length > 0 ? (
+                  <div className="max-h-48 overflow-y-auto pr-1 space-y-1.5">
+                    {emails.map((e, i) => (
+                      <div
+                        key={`${e.contactEmail}-${i}`}
+                        className="border border-border rounded px-2 py-1.5"
+                      >
+                        <div className="text-xs font-medium text-foreground truncate">
+                          {e.subject || "(no subject)"}
+                        </div>
+                        <div className="text-[10px] text-muted-foreground truncate">
+                          {e.contactEmail}
+                          {e.timestamp ? ` · ${e.timestamp.slice(0, 10)}` : ""}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    No outreach emails logged for this company yet
+                  </p>
+                )}
+              </section>
+            </div>
+          </ScrollArea>
+        </SheetContent>
+      </Sheet>
+
+      <AddPersonDialog
+        open={addPersonOpen}
+        onOpenChange={setAddPersonOpen}
+        companyName={company.name}
+        companyLocation={company.location}
+        domain={companyDomain}
+        onAdded={onPersonAdded}
+      />
+
+      <FindPortcoPeopleDialog
+        open={findPeopleOpen}
+        onOpenChange={setFindPeopleOpen}
+        companyName={company.name}
+        companyLocation={company.location}
+        website={company.website}
+        domain={companyDomain}
+        onAdded={onPersonAdded}
+      />
+
+      <AlertDialog open={deleteOpen} onOpenChange={(o) => !deleting && setDeleteOpen(o)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete {company.name}?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This removes the company row from the Portfolio Companies sheet. Contacts, intros, and
+              events are not deleted, but this company will no longer appear in the portfolio. This
+              can't be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault();
+                void handleDelete();
+              }}
+              disabled={deleting}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {deleting ? (
+                <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" />
               ) : (
-                <p className="text-xs text-muted-foreground">No outreach emails logged for this company yet</p>
+                <Trash2 className="h-3.5 w-3.5 mr-1" />
               )}
-            </section>
+              Delete
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  );
+}
+
+// ─── Find Key People via Apollo (LinkedIn-sourced profiles) ─────
+// Searches by company domain for leadership roles, then reveals + adds
+// selected people as Portfolio-sector contacts.
+function FindPortcoPeopleDialog({
+  open,
+  onOpenChange,
+  companyName,
+  companyLocation,
+  website,
+  domain,
+  onAdded,
+}: {
+  open: boolean;
+  onOpenChange: (o: boolean) => void;
+  companyName: string;
+  companyLocation: string;
+  website: string;
+  domain: string;
+  onAdded?: () => void | Promise<void>;
+}) {
+  const [loading, setLoading] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const [people, setPeople] = useState<PortcoPersonCandidate[]>([]);
+  const [total, setTotal] = useState(0);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    setPeople([]);
+    setSelected(new Set());
+    setTotal(0);
+    void (async () => {
+      try {
+        const res = await findPortcoPeople({
+          data: { companyName, website: website || domain, perPage: 15 },
+        });
+        if (cancelled) return;
+        if (!res.ok) {
+          setError(res.error || "Search failed");
+          return;
+        }
+        setPeople(res.people);
+        setTotal(res.total);
+        // Pre-select everyone with an email flag — most useful for Key People.
+        setSelected(new Set(res.people.filter((p) => p.hasEmail).map((p) => p.apolloId)));
+      } catch (e) {
+        console.error("findPortcoPeople failed", e);
+        if (!cancelled) setError("Apollo search failed — see console.");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, companyName, website, domain]);
+
+  const toggle = (id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleAll = () => {
+    if (selected.size === people.length) setSelected(new Set());
+    else setSelected(new Set(people.map((p) => p.apolloId)));
+  };
+
+  const addSelected = async () => {
+    const chosen = people.filter((p) => selected.has(p.apolloId));
+    if (chosen.length === 0) {
+      toast.error("Select at least one person.");
+      return;
+    }
+    setAdding(true);
+    try {
+      const res = await addPortcoPeopleFromApollo({
+        data: { companyName, companyLocation, people: chosen },
+      });
+      if (!res.ok && res.added === 0) {
+        toast.error(res.error || "Couldn't add people.");
+        return;
+      }
+      const parts = [
+        res.added > 0 ? `Added ${res.added}` : null,
+        res.duplicates > 0 ? `${res.duplicates} already in CRM` : null,
+        res.noEmail > 0 ? `${res.noEmail} without email` : null,
+      ].filter(Boolean);
+      toast.success(parts.join(" · ") || "Done.");
+      if (res.added > 0) await onAdded?.();
+      onOpenChange(false);
+    } catch (e) {
+      console.error("addPortcoPeopleFromApollo failed", e);
+      toast.error("Couldn't add people — see console.");
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Find Key People — {companyName}</DialogTitle>
+          <DialogDescription className="text-xs">
+            Leadership search via Apollo (LinkedIn-sourced profiles) at{" "}
+            <span className="font-mono">@{domain || "—"}</span>. Select who to reveal and add as
+            Portfolio contacts.
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="max-h-72 overflow-y-auto border border-border rounded-md">
+          {loading ? (
+            <div className="flex items-center justify-center gap-2 py-10 text-xs text-muted-foreground">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" /> Searching Apollo…
+            </div>
+          ) : error ? (
+            <p className="p-4 text-xs text-destructive">{error}</p>
+          ) : people.length === 0 ? (
+            <p className="p-4 text-xs text-muted-foreground">
+              No leadership matches found for this domain.
+            </p>
+          ) : (
+            <ul className="divide-y divide-border">
+              <li className="flex items-center gap-2 px-3 py-1.5 bg-muted/30 sticky top-0">
+                <button
+                  type="button"
+                  className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground hover:text-foreground"
+                  onClick={toggleAll}
+                >
+                  {selected.size === people.length ? "Deselect all" : "Select all"}
+                </button>
+                <span className="text-[10px] text-muted-foreground ml-auto">
+                  {selected.size}/{people.length}
+                  {total > people.length ? ` · ${total} total` : ""}
+                </span>
+              </li>
+              {people.map((p) => {
+                const checked = selected.has(p.apolloId);
+                return (
+                  <li key={p.apolloId}>
+                    <button
+                      type="button"
+                      onClick={() => toggle(p.apolloId)}
+                      className={`w-full flex items-start gap-2.5 px-3 py-2 text-left hover:bg-accent/40 transition-colors ${
+                        checked ? "bg-accent/20" : ""
+                      }`}
+                    >
+                      <span
+                        className={`mt-0.5 h-3.5 w-3.5 shrink-0 rounded border flex items-center justify-center ${
+                          checked
+                            ? "bg-primary border-primary text-primary-foreground"
+                            : "border-border"
+                        }`}
+                      >
+                        {checked ? <span className="text-[8px] font-bold">✓</span> : null}
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="text-xs font-medium text-foreground block truncate">
+                          {p.firstName || "(name locked)"}
+                          {p.title ? (
+                            <span className="font-normal text-muted-foreground"> · {p.title}</span>
+                          ) : null}
+                        </span>
+                        <span className="text-[10px] text-muted-foreground flex flex-wrap gap-x-2">
+                          {p.hasEmail && <span>email available</span>}
+                          {p.hasPhone && <span>phone available</span>}
+                          {p.hasLocation && <span>location available</span>}
+                          {!p.hasEmail && !p.hasPhone && (
+                            <span>reveal on add for full profile</span>
+                          )}
+                        </span>
+                      </span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+
+        <DialogFooter>
+          <Button variant="outline" size="sm" onClick={() => onOpenChange(false)} disabled={adding}>
+            Cancel
+          </Button>
+          <Button
+            size="sm"
+            onClick={() => void addSelected()}
+            disabled={adding || loading || selected.size === 0}
+          >
+            {adding ? (
+              <>
+                <Loader2 className="h-3 w-3 mr-1 animate-spin" /> Adding…
+              </>
+            ) : (
+              <>
+                <UserPlus className="h-3 w-3 mr-1" />
+                Add {selected.size || ""} selected
+              </>
+            )}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+// ─── Add a person to this PortCo ────────────────────────────────
+// Minimal contact form that pre-fills the email domain from the company's
+// website, so the new contact matches back to this portco (Key People joins on
+// email domain). Writes a "Portfolio"-sector contact via addContact.
+function AddPersonDialog({
+  open,
+  onOpenChange,
+  companyName,
+  companyLocation,
+  domain,
+  onAdded,
+}: {
+  open: boolean;
+  onOpenChange: (o: boolean) => void;
+  companyName: string;
+  companyLocation: string;
+  domain: string;
+  onAdded?: () => void | Promise<void>;
+}) {
+  const [name, setName] = useState("");
+  const [title, setTitle] = useState("");
+  const [localPart, setLocalPart] = useState("");
+  const [fullEmail, setFullEmail] = useState("");
+  const [phone, setPhone] = useState("");
+  const [linkedin, setLinkedin] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const reset = () => {
+    setName("");
+    setTitle("");
+    setLocalPart("");
+    setFullEmail("");
+    setPhone("");
+    setLinkedin("");
+    setBusy(false);
+  };
+
+  // With a known domain we collect just the local part and append "@domain";
+  // otherwise fall back to a full email field.
+  const email = domain
+    ? localPart.trim()
+      ? `${localPart.trim()}@${domain}`
+      : ""
+    : fullEmail.trim();
+
+  const submit = async () => {
+    if (!name.trim()) return;
+    setBusy(true);
+    try {
+      await addContact({
+        data: {
+          name: name.trim(),
+          role: title.trim(),
+          company: companyName,
+          email,
+          phone: phone.trim(),
+          location: companyLocation,
+          prime: "",
+          sector: "Portfolio",
+          temperature: "Warm",
+          source: "Manual Entry",
+          linkedinUrl: linkedin.trim(),
+        },
+      });
+      toast.success(`Added ${name.trim()} to ${companyName}.`);
+      await onAdded?.();
+      reset();
+      onOpenChange(false);
+    } catch (e) {
+      console.error("addContact (portco person) failed", e);
+      toast.error("Couldn't add the person — see console.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(o) => {
+        if (!o) reset();
+        onOpenChange(o);
+      }}
+    >
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Add person to {companyName}</DialogTitle>
+          <DialogDescription className="text-xs">
+            Adds a Portfolio contact linked to this company. New people match back to the PortCo by
+            email domain
+            {domain ? (
+              <>
+                {" "}
+                (<span className="font-mono">@{domain}</span>).
+              </>
+            ) : (
+              "."
+            )}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="grid grid-cols-2 gap-3 py-2">
+          <div className="col-span-2">
+            <Label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+              Name *
+            </Label>
+            <Input
+              className="h-8 text-sm"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="Jane Doe"
+            />
           </div>
-        </ScrollArea>
-      </SheetContent>
-    </Sheet>
+          <div className="col-span-2">
+            <Label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+              Title
+            </Label>
+            <Input
+              className="h-8 text-sm"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="VP Engineering"
+            />
+          </div>
+          <div className="col-span-2">
+            <Label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+              Email
+            </Label>
+            {domain ? (
+              <div className="flex items-center">
+                <Input
+                  className="h-8 text-sm rounded-r-none"
+                  value={localPart}
+                  onChange={(e) => setLocalPart(e.target.value.replace(/@.*$/, ""))}
+                  placeholder="jane"
+                />
+                <span className="h-8 inline-flex items-center rounded-r-md border border-l-0 border-input bg-muted px-2 text-xs text-muted-foreground">
+                  @{domain}
+                </span>
+              </div>
+            ) : (
+              <Input
+                className="h-8 text-sm"
+                value={fullEmail}
+                onChange={(e) => setFullEmail(e.target.value)}
+                placeholder="jane@company.com"
+              />
+            )}
+          </div>
+          <div>
+            <Label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+              Phone
+            </Label>
+            <Input
+              className="h-8 text-sm"
+              value={phone}
+              onChange={(e) => setPhone(e.target.value)}
+            />
+          </div>
+          <div>
+            <Label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+              LinkedIn
+            </Label>
+            <Input
+              className="h-8 text-sm"
+              value={linkedin}
+              onChange={(e) => setLinkedin(e.target.value)}
+              placeholder="linkedin.com/in/…"
+            />
+          </div>
+        </div>
+
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={busy}>
+            Cancel
+          </Button>
+          <Button onClick={submit} disabled={busy || !name.trim()}>
+            {busy ? (
+              <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" />
+            ) : (
+              <UserPlus className="h-3.5 w-3.5 mr-1" />
+            )}
+            Add person
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -712,7 +1498,9 @@ function PortcoIntelPanel({ company }: { company: PortfolioCompany }) {
     if (!intel?.org) return;
     setBriefLoading(true);
     try {
-      const res = await getPortcoBrief({ data: { organizationId: intel.org.id, companyName: company.name } });
+      const res = await getPortcoBrief({
+        data: { organizationId: intel.org.id, companyName: company.name },
+      });
       if (!res.found && res.error) {
         toast.error(res.error);
         return;
@@ -734,7 +1522,13 @@ function PortcoIntelPanel({ company }: { company: PortfolioCompany }) {
           <Sparkles className="h-3 w-3 text-primary" /> Sumble Intelligence
         </h3>
         {intel && !intel.notFound && (
-          <Button variant="ghost" size="sm" className="h-6 px-1.5 text-[10px]" onClick={() => load(true)} disabled={loading}>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-6 px-1.5 text-[10px]"
+            onClick={() => load(true)}
+            disabled={loading}
+          >
             <RefreshCw className={`h-3 w-3 mr-1 ${loading ? "animate-spin" : ""}`} /> Refresh
           </Button>
         )}
@@ -750,13 +1544,27 @@ function PortcoIntelPanel({ company }: { company: PortfolioCompany }) {
           <p className="text-xs text-muted-foreground">
             Pull hiring signals and an AI brief for {company.name} from Sumble.
           </p>
-          <Button size="sm" className="h-7 text-[11px] shrink-0" onClick={() => load()} disabled={loading}>
-            {loading ? <><Loader2 className="h-3 w-3 mr-1 animate-spin" /> Loading…</> : <><Sparkles className="h-3 w-3 mr-1" /> Load intel</>}
+          <Button
+            size="sm"
+            className="h-7 text-[11px] shrink-0"
+            onClick={() => load()}
+            disabled={loading}
+          >
+            {loading ? (
+              <>
+                <Loader2 className="h-3 w-3 mr-1 animate-spin" /> Loading…
+              </>
+            ) : (
+              <>
+                <Sparkles className="h-3 w-3 mr-1" /> Load intel
+              </>
+            )}
           </Button>
         </div>
       ) : intel.notFound ? (
         <p className="text-xs text-muted-foreground">
-          {company.name} wasn't found in Sumble's database. Try refreshing, or check the company's website is correct.
+          {company.name} wasn't found in Sumble's database. Try refreshing, or check the company's
+          website is correct.
         </p>
       ) : (
         <div className="space-y-4">
@@ -764,11 +1572,19 @@ function PortcoIntelPanel({ company }: { company: PortfolioCompany }) {
           <div className="flex items-center justify-between text-[11px]">
             <span className="text-muted-foreground">
               Matched: <span className="text-foreground font-medium">{intel.org?.name}</span>
-              {intel.org?.domain && <span className="text-muted-foreground"> · {intel.org.domain}</span>}
+              {intel.org?.domain && (
+                <span className="text-muted-foreground"> · {intel.org.domain}</span>
+              )}
             </span>
             <span className="text-muted-foreground flex items-center gap-1.5">
               {intel.fetchedAt && (
-                <span title={intel.cached ? "Loaded from saved cache — no credits spent" : "Freshly fetched from Sumble"}>
+                <span
+                  title={
+                    intel.cached
+                      ? "Loaded from saved cache — no credits spent"
+                      : "Freshly fetched from Sumble"
+                  }
+                >
                   {intel.cached ? "Saved" : "Fetched"} {intel.fetchedAt}
                 </span>
               )}
@@ -792,7 +1608,13 @@ function PortcoIntelPanel({ company }: { company: PortfolioCompany }) {
                     <div className="flex items-center justify-between gap-2">
                       <span className="text-xs font-medium truncate">{j.title}</span>
                       {j.url && (
-                        <a href={j.url} target="_blank" rel="noopener noreferrer" className="text-primary shrink-0" title="View posting">
+                        <a
+                          href={j.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-primary shrink-0"
+                          title="View posting"
+                        >
                           <ExternalLink className="h-3 w-3" />
                         </a>
                       )}
@@ -805,9 +1627,14 @@ function PortcoIntelPanel({ company }: { company: PortfolioCompany }) {
                     </div>
                     {j.technologies && (
                       <div className="flex flex-wrap gap-1 mt-1">
-                        {j.technologies.split(/,\s*/).slice(0, 6).map((t) => (
-                          <Badge key={t} variant="secondary" className="text-[9px] px-1 py-0">{t}</Badge>
-                        ))}
+                        {j.technologies
+                          .split(/,\s*/)
+                          .slice(0, 6)
+                          .map((t) => (
+                            <Badge key={t} variant="secondary" className="text-[9px] px-1 py-0">
+                              {t}
+                            </Badge>
+                          ))}
                       </div>
                     )}
                   </div>
@@ -823,22 +1650,46 @@ function PortcoIntelPanel({ company }: { company: PortfolioCompany }) {
                 <FileText className="h-3 w-3" /> Intelligence brief
               </h4>
               {!brief?.brief && (
-                <Button variant="outline" size="sm" className="h-6 px-1.5 text-[10px]" onClick={loadBrief} disabled={briefLoading}>
-                  {briefLoading ? <><Loader2 className="h-3 w-3 mr-1 animate-spin" /> …</> : (brief?.pending ? "Retry" : "Generate (~50 cr)")}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-6 px-1.5 text-[10px]"
+                  onClick={loadBrief}
+                  disabled={briefLoading}
+                >
+                  {briefLoading ? (
+                    <>
+                      <Loader2 className="h-3 w-3 mr-1 animate-spin" /> …
+                    </>
+                  ) : brief?.pending ? (
+                    "Retry"
+                  ) : (
+                    "Generate (~50 cr)"
+                  )}
                 </Button>
               )}
             </div>
             {brief?.pending && (
               <p className="text-[11px] text-muted-foreground flex items-center gap-1">
-                <Loader2 className="h-3 w-3 animate-spin" /> Sumble is generating the brief — click Retry shortly.
+                <Loader2 className="h-3 w-3 animate-spin" /> Sumble is generating the brief — click
+                Retry shortly.
               </p>
             )}
             {brief?.brief?.body && (
               <div className="rounded border border-border bg-muted/30 p-2.5">
-                {brief.brief.title && <div className="text-xs font-semibold mb-1">{brief.brief.title}</div>}
-                <p className="text-[11px] text-muted-foreground whitespace-pre-wrap">{brief.brief.body}</p>
+                {brief.brief.title && (
+                  <div className="text-xs font-semibold mb-1">{brief.brief.title}</div>
+                )}
+                <p className="text-[11px] text-muted-foreground whitespace-pre-wrap">
+                  {brief.brief.body}
+                </p>
                 {brief.brief.url && (
-                  <a href={brief.brief.url} target="_blank" rel="noopener noreferrer" className="text-primary text-[10px] hover:underline inline-flex items-center gap-0.5 mt-1.5">
+                  <a
+                    href={brief.brief.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-primary text-[10px] hover:underline inline-flex items-center gap-0.5 mt-1.5"
+                  >
                     Open in Sumble <ExternalLink className="h-2.5 w-2.5" />
                   </a>
                 )}
@@ -846,13 +1697,19 @@ function PortcoIntelPanel({ company }: { company: PortfolioCompany }) {
             )}
             {!brief && (
               <p className="text-[11px] text-muted-foreground flex items-center gap-1">
-                <AlertTriangle className="h-3 w-3" /> The brief is a paid call (~50 credits) — generated on demand.
+                <AlertTriangle className="h-3 w-3" /> The brief is a paid call (~50 credits) —
+                generated on demand.
               </p>
             )}
           </div>
 
           {/* Tech Stack (Sumble enrich) */}
-          <TechStackSection domain={intel.org?.domain} website={company.website} company={company.name} compact />
+          <TechStackSection
+            domain={intel.org?.domain}
+            website={company.website}
+            company={company.name}
+            compact
+          />
         </div>
       )}
     </div>

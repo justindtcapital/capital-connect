@@ -28,98 +28,29 @@ import type { DailyMetrics, SnapshotResult } from "@/utils/sheets.server";
 import { Card, CardContent } from "@/components/ui/card";
 import { ContactAvatar } from "@/components/crm/ContactAvatar";
 import { DailyBriefing } from "@/components/home/DailyBriefing";
+import { PulseRing } from "@/components/pulse/PulseRing";
 import { useAuth } from "@/lib/auth-context";
+import { teamProfile } from "@/lib/user-ownership";
 import {
-  Users,
-  Flame,
-  Bell,
-  Target,
-  Briefcase,
-  Building2,
-  Calendar,
-  Radar,
-  BarChart3,
+  buildAttentionQueue,
+  hasOpenFollowUp,
+  networkContacts,
+  type AttentionItem,
+  type AttentionReason,
+} from "@/lib/attention-queue";
+import { fetchMyAttention } from "@/utils/sheets.functions";
+import {
   ArrowRight,
   ArrowUpRight,
   ArrowDownRight,
   AlertTriangle,
   ExternalLink,
+  Loader2,
+  Radar,
+  Telescope,
 } from "lucide-react";
 
 // ── Derivations (run server-side in the loader) ───────────────────
-function isPortfolioContact(c: Contact): boolean {
-  return (c.sector || "").trim().toLowerCase() === "portfolio";
-}
-function hasOpenFollowUp(c: Contact): boolean {
-  return c.interactions.some((i) => i.isFollowUp && !i.followUpComplete) || !!c.followUpPending;
-}
-
-type AttentionReason = "overdue" | "stale" | "cooling";
-interface AttentionItem {
-  id: string;
-  name: string;
-  title: string;
-  company: string;
-  email: string;
-  reason: AttentionReason;
-  detail: string;
-  score: number;
-}
-
-// Score contacts by importance × days-since-touch and surface the ones that need
-// action: open follow-ups (overdue), important contacts going stale, and warm/hot
-// relationships cooling off. This is what makes Home worth opening on purpose.
-function buildAttentionQueue(contacts: Contact[]): AttentionItem[] {
-  const now = Date.now();
-  const DAY = 86_400_000;
-  const tempW = (t: string) => (t === "Hot" ? 3 : t === "Warm" ? 2 : 1);
-  const lastTouch = (c: Contact): number => {
-    let ts = Date.parse(c.lastContact || "") || 0;
-    for (const it of c.interactions) {
-      const t = Date.parse(it.date || "");
-      if (!Number.isNaN(t) && t > ts) ts = t;
-    }
-    return ts || Date.parse(c.dateAdded || "") || 0;
-  };
-
-  const out: AttentionItem[] = [];
-  for (const c of contacts) {
-    const ts = lastTouch(c);
-    const days = ts ? Math.floor((now - ts) / DAY) : 999;
-    const importance =
-      tempW(c.temperature) + Math.min(c.portCoIntros.length, 5) * 0.6 + (c.activityScore || 0) / 40;
-    const open = hasOpenFollowUp(c);
-
-    let reason: AttentionReason | null = null;
-    let detail = "";
-    if (open) {
-      reason = "overdue";
-      detail = `Follow-up open · last touch ${days}d ago`;
-    } else if (days >= 30 && importance >= 2.5) {
-      reason = "stale";
-      detail = `Last touch ${days} days ago`;
-    } else if ((c.temperature === "Hot" || c.temperature === "Warm") && days >= 10 && days < 30) {
-      reason = "cooling";
-      detail = `Quiet ${days} days`;
-    }
-    if (!reason) continue;
-
-    const boost = reason === "overdue" ? 100_000 : 0;
-    out.push({
-      id: c.id,
-      name: c.name,
-      title: c.title,
-      company: c.company,
-      email: c.email,
-      reason,
-      detail,
-      score: boost + importance * days,
-    });
-  }
-  return out.sort((a, b) => b.score - a.score);
-}
-
-// ── Signal digest (deferred — streams behind a skeleton) ──────────
 type DigestBadge = "portco" | "prospect" | "chatter";
 interface DigestItem {
   company: string;
@@ -195,14 +126,13 @@ export const Route = createFileRoute("/")({
     ],
   }),
   loader: async () => {
-    // Fast (cached) — drives the greeting, stat cards, and attention queue.
     const [contactsAll, targets, companies, briefing] = await Promise.all([
       fetchContacts().catch((): Contact[] => []),
       fetchTargets().catch((): TargetLead[] => []),
       fetchPortfolioCompanies().catch((): PortfolioCompany[] => []),
       getBriefing().catch((): BriefingData | null => null),
     ]);
-    const contacts = contactsAll.filter((c) => !isPortfolioContact(c));
+    const contacts = networkContacts(contactsAll);
     const metrics: DailyMetrics = {
       contacts: contacts.length,
       hotLeads: contacts.filter((c) => c.temperature === "Hot").length,
@@ -214,7 +144,6 @@ export const Route = createFileRoute("/")({
       (): SnapshotResult => ({ today: metrics, baseline: null, baselineDate: null }),
     );
 
-    // Timestamp fallback for added-deltas before a week of snapshots exists.
     const within7 = (d?: string) => {
       const t = Date.parse(d || "");
       return !Number.isNaN(t) && t >= Date.now() - 7 * 86_400_000;
@@ -226,9 +155,15 @@ export const Route = createFileRoute("/")({
 
     const queue = buildAttentionQueue(contacts);
     const portcoNames = new Set(companies.map((c) => c.name.trim().toLowerCase()));
-
-    // Deferred — NOT awaited; streams in behind a skeleton.
     const digest = buildHomeDigest(portcoNames);
+
+    const hotRatio = metrics.contacts ? metrics.hotLeads / metrics.contacts : 0;
+    const followPressure = metrics.contacts
+      ? Math.min(1, metrics.openFollowUps / Math.max(1, metrics.contacts * 0.08))
+      : 0;
+    const networkHealth = Math.round(
+      Math.max(12, Math.min(96, hotRatio * 55 + (1 - followPressure) * 35 + 10)),
+    );
 
     return {
       metrics,
@@ -238,6 +173,7 @@ export const Route = createFileRoute("/")({
       attentionTotal: queue.length,
       digest,
       briefing,
+      networkHealth,
     };
   },
   component: HomePage,
@@ -248,10 +184,7 @@ type Module = {
   url: string;
   Icon: (p: { className?: string }) => React.ReactNode;
   description: string;
-  /** Soft gradient behind the glyph (resting + hover-strengthened). */
-  tile: string;
-  /** Glyph color + ring tint that fades in on hover. */
-  glyph: string;
+  accent: string;
 };
 
 const MODULES: Module[] = [
@@ -259,65 +192,64 @@ const MODULES: Module[] = [
     title: "Network",
     url: "/crm",
     Icon: NetworkIcon,
-    description: "Manage and track your DTC network contacts.",
-    tile: "from-blue-500/15 to-blue-400/5 group-hover:from-blue-500/25 group-hover:to-blue-400/10",
-    glyph: "text-blue-600 group-hover:ring-blue-500/30",
+    description: "Relationships, temperature, and introductions.",
+    accent: "text-foreground",
   },
   {
     title: "Targeting",
     url: "/targeting",
     Icon: TargetingIcon,
-    description: "Work your prospecting pipeline of new leads.",
-    tile: "from-rose-500/15 to-pink-400/5 group-hover:from-rose-500/25 group-hover:to-pink-400/10",
-    glyph: "text-rose-600 group-hover:ring-rose-500/30",
+    description: "Prospects entering the network's gravity.",
+    accent: "text-[var(--copper-foreground)]",
   },
   {
     title: "Events",
     url: "/events",
     Icon: EventsIcon,
-    description: "Track events and network attendance.",
-    tile: "from-orange-500/15 to-amber-400/5 group-hover:from-orange-500/25 group-hover:to-amber-400/10",
-    glyph: "text-orange-600 group-hover:ring-orange-500/30",
+    description: "Where the network meets in time.",
+    accent: "text-muted-foreground",
   },
   {
     title: "PortCo",
     url: "/portfolio",
     Icon: PortCoIcon,
-    description: "Explore portfolio companies and their signals.",
-    tile: "from-violet-500/15 to-purple-400/5 group-hover:from-violet-500/25 group-hover:to-purple-400/10",
-    glyph: "text-violet-600 group-hover:ring-violet-500/30",
+    description: "Companies under stewardship.",
+    accent: "text-foreground",
   },
   {
     title: "Signals",
     url: "/signals",
     Icon: SignalsIcon,
-    description: "Scan the web for portfolio-relevant news.",
-    tile: "from-cyan-500/15 to-sky-400/5 group-hover:from-cyan-500/25 group-hover:to-sky-400/10",
-    glyph: "text-cyan-600 group-hover:ring-cyan-500/30",
+    description: "Live intelligence mapped to your book.",
+    accent: "text-primary",
   },
   {
     title: "Companies",
     url: "/companies",
     Icon: CompaniesIcon,
-    description: "One intelligence brief per company.",
-    tile: "from-indigo-500/15 to-blue-400/5 group-hover:from-indigo-500/25 group-hover:to-blue-400/10",
-    glyph: "text-indigo-600 group-hover:ring-indigo-500/30",
+    description: "One brief per company.",
+    accent: "text-muted-foreground",
   },
   {
     title: "Query",
     url: "/query",
     Icon: QueryIcon,
-    description: "Ask the AI agent across all of your data.",
-    tile: "from-fuchsia-500/15 to-pink-400/5 group-hover:from-fuchsia-500/25 group-hover:to-pink-400/10",
-    glyph: "text-fuchsia-600 group-hover:ring-fuchsia-500/30",
+    description: "Ask the network anything.",
+    accent: "text-primary",
   },
   {
     title: "Dashboard",
     url: "/dashboard",
     Icon: DashboardIcon,
-    description: "Network analytics and progression insights.",
-    tile: "from-emerald-500/15 to-green-400/5 group-hover:from-emerald-500/25 group-hover:to-green-400/10",
-    glyph: "text-emerald-600 group-hover:ring-emerald-500/30",
+    description: "Firm network intelligence.",
+    accent: "text-muted-foreground",
+  },
+  {
+    title: "Platform",
+    url: "/platform",
+    Icon: Telescope,
+    description: "Research, sourcing, and diligence tools.",
+    accent: "text-primary",
   },
 ];
 
@@ -334,25 +266,28 @@ function greetingFor(hour: number): string {
 }
 
 const REASON_STYLE: Record<AttentionReason, { label: string; cls: string }> = {
-  overdue: { label: "overdue", cls: "bg-red-50 text-red-700 border-red-200" },
-  stale: { label: "going stale", cls: "bg-amber-50 text-amber-700 border-amber-200" },
-  cooling: { label: "cooling", cls: "bg-yellow-50 text-yellow-700 border-yellow-200" },
+  overdue: {
+    label: "overdue",
+    cls: "text-[var(--copper-foreground)] border-[var(--copper)]/40 bg-[var(--copper)]/10",
+  },
+  stale: { label: "going stale", cls: "text-decay-foreground border-decay/40 bg-decay/15" },
+  cooling: { label: "cooling", cls: "text-cold-foreground border-cold/50 bg-cold/40" },
 };
 const BADGE_STYLE: Record<DigestBadge, { label: string; cls: string }> = {
-  portco: { label: "portco", cls: "bg-emerald-50 text-emerald-700 border-emerald-200" },
-  prospect: { label: "new prospect", cls: "bg-primary/10 text-primary border-primary/20" },
-  chatter: { label: "chatter", cls: "bg-amber-50 text-amber-700 border-amber-200" },
+  portco: { label: "portco", cls: "text-foreground border-border bg-muted" },
+  prospect: { label: "prospect", cls: "text-primary border-primary/25 bg-primary/5" },
+  chatter: { label: "chatter", cls: "text-muted-foreground border-border bg-muted/50" },
 };
 
 function DeltaLine({ delta, label }: { delta: number | null; label: string }) {
   if (delta === null)
     return <span className="text-[11px] text-muted-foreground">building baseline…</span>;
   if (delta === 0)
-    return <span className="text-[11px] text-muted-foreground">no change {label}</span>;
+    return <span className="text-[11px] text-muted-foreground">steady {label}</span>;
   const up = delta > 0;
   return (
     <span
-      className={`text-[11px] inline-flex items-center gap-0.5 ${up ? "text-emerald-600" : "text-muted-foreground"}`}
+      className={`text-[11px] inline-flex items-center gap-0.5 ${up ? "text-foreground" : "text-muted-foreground"}`}
     >
       {up ? <ArrowUpRight className="h-3 w-3" /> : <ArrowDownRight className="h-3 w-3" />}
       {Math.abs(delta)} {label}
@@ -361,15 +296,58 @@ function DeltaLine({ delta, label }: { delta: number | null; label: string }) {
 }
 
 function HomePage() {
-  const { metrics, snapshot, added, attention, attentionTotal, digest, briefing } =
-    Route.useLoaderData();
-  const { email } = useAuth();
+  const {
+    metrics,
+    snapshot,
+    added,
+    attention: teamAttention,
+    attentionTotal: teamAttentionTotal,
+    digest,
+    briefing,
+    networkHealth,
+  } = Route.useLoaderData();
+  const { email, ready: authReady } = useAuth();
   const navigate = useNavigate();
   const router = useRouter();
   const { setFilters } = useFilters();
   const [briefingBusy, setBriefingBusy] = useState(false);
+  const [myBusy, setMyBusy] = useState(false);
+  const [myView, setMyView] = useState<{
+    firstName: string;
+    openFollowUps: number;
+    attention: AttentionItem[];
+    attentionTotal: number;
+  } | null>(null);
 
-  // Build (or rebuild) today's briefing, then reload so the stored copy renders.
+  useEffect(() => {
+    if (!authReady || !email) {
+      setMyView(null);
+      return;
+    }
+    let cancelled = false;
+    setMyBusy(true);
+    fetchMyAttention({ data: { email } })
+      .then((res) => {
+        if (cancelled) return;
+        setMyView({
+          firstName: res.firstName,
+          openFollowUps: res.openFollowUps,
+          attention: res.attention,
+          attentionTotal: res.attentionTotal,
+        });
+      })
+      .catch((e) => {
+        console.error("fetchMyAttention failed", e);
+        if (!cancelled) setMyView(null);
+      })
+      .finally(() => {
+        if (!cancelled) setMyBusy(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [authReady, email]);
+
   const runBriefing = async () => {
     setBriefingBusy(true);
     try {
@@ -383,15 +361,18 @@ function HomePage() {
     }
   };
 
-  // Apply a clean Network filter, then jump to /crm — the FilterProvider sits
-  // above both pages, so the filter is already set when CRM mounts.
   const goWithFilter = (patch: Partial<ContactFilters>) => {
-    setFilters({ ...defaultFilters, ...patch });
+    setFilters({ ...defaultFilters, ownershipScope: "mine", ...patch });
     navigate({ to: "/crm" });
   };
 
   const now = new Date();
-  const name = firstNameFrom(email);
+  const profile = teamProfile(email);
+  const name = myView?.firstName || profile?.firstName || firstNameFrom(email);
+  const attention = myView?.attention ?? teamAttention;
+  const attentionTotal = myView?.attentionTotal ?? teamAttentionTotal;
+  const openFollowUps = myView?.openFollowUps ?? metrics.openFollowUps;
+  const personalized = !!myView;
   const longDate = now.toLocaleDateString("en-US", {
     weekday: "long",
     month: "long",
@@ -403,146 +384,153 @@ function HomePage() {
   const delta = (key: keyof DailyMetrics, fallback: number | null) =>
     base ? metrics[key] - base[key] : fallback;
 
-  const stats: {
-    label: string;
-    value: number;
-    icon: typeof Users;
-    to: string;
-    onActivate?: () => void;
-    sub: React.ReactNode;
-  }[] = [
-    {
-      label: "Network",
-      value: metrics.contacts,
-      icon: Users,
-      to: "/crm",
-      sub: <DeltaLine delta={delta("contacts", added.contacts)} label="this week" />,
-    },
-    {
-      label: "Hot Leads",
-      value: metrics.hotLeads,
-      icon: Flame,
-      to: "/crm",
-      onActivate: () => goWithFilter({ temperature: ["Hot"] }),
-      sub: <DeltaLine delta={delta("hotLeads", null)} label="this week" />,
-    },
-    {
-      label: "Follow-ups",
-      value: metrics.openFollowUps,
-      icon: Bell,
-      to: "/crm",
-      onActivate: () => goWithFilter({ followUpOnly: true }),
-      sub: (
-        <span
-          className={`text-[11px] ${metrics.openFollowUps > 0 ? "text-red-600" : "text-muted-foreground"}`}
-        >
-          {metrics.openFollowUps > 0 ? "need action" : "all clear"}
-        </span>
-      ),
-    },
-    {
-      label: "Targets",
-      value: metrics.targets,
-      icon: Target,
-      to: "/targeting",
-      sub: <DeltaLine delta={delta("targets", added.targets)} label="this week" />,
-    },
-    {
-      label: "Portfolio",
-      value: metrics.portfolio,
-      icon: Briefcase,
-      to: "/portfolio",
-      sub: <DeltaLine delta={delta("portfolio", null)} label="this week" />,
-    },
-  ];
+  const waking = metrics.hotLeads + (added.contacts || 0);
+  const pulseValue = networkHealth;
 
   return (
-    <div className="p-6 max-w-[1400px] mx-auto space-y-8">
-      {/* Greeting */}
-      <div>
-        <h1 className="text-2xl font-bold text-foreground">
-          {greetingFor(now.getHours())}, {name}
-        </h1>
-        <p className="text-sm text-muted-foreground mt-1">
-          {longDate}
-          {metrics.openFollowUps > 0 ? (
-            <>
-              {" · "}
-              <span className="font-medium text-foreground">{metrics.openFollowUps}</span> follow-up
-              {metrics.openFollowUps !== 1 ? "s" : ""} need attention
-            </>
-          ) : (
-            " · you're all caught up"
-          )}
-        </p>
-      </div>
+    <div className="p-6 max-w-[1400px] mx-auto space-y-10">
+      {/* Hero — Relationship Pulse */}
+      <section className="flex flex-col lg:flex-row lg:items-center gap-8 lg:gap-12">
+        <div className="flex-1 min-w-0 space-y-3">
+          <h1 className="font-display text-3xl sm:text-[2rem] font-semibold text-foreground tracking-tight">
+            {greetingFor(now.getHours())}, {name}
+          </h1>
+          <p className="text-sm text-muted-foreground max-w-md">
+            {longDate}
+            {personalized ? " · your book" : ""}
+          </p>
+          <p className="text-sm text-foreground/80 max-w-lg leading-relaxed">
+            {openFollowUps > 0
+              ? `${openFollowUps} relationship${openFollowUps !== 1 ? "s" : ""} need judgment today. The network is already sorted.`
+              : "Your network is steady. Nothing pressing — stay ahead of the quiet ones."}
+          </p>
+        </div>
 
-      {/* Quick stats */}
-      <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
-        {stats.map((s) => {
-          const card = (
-            <Card className="h-full transition-all duration-200 hover:-translate-y-0.5 hover:shadow-(--shadow-elegant)">
-              <CardContent className="p-5">
-                <div className="flex items-center gap-2 mb-2">
-                  <div className="h-7 w-7 rounded-lg bg-primary/10 flex items-center justify-center shrink-0">
-                    <s.icon className="h-3.5 w-3.5 text-primary" />
-                  </div>
-                  <p className="text-[10px] uppercase tracking-widest font-semibold text-muted-foreground truncate">
-                    {s.label}
-                  </p>
-                </div>
-                <p className="text-2xl font-bold text-foreground leading-none">
-                  {s.value.toLocaleString()}
-                </p>
-                <div className="mt-2">{s.sub}</div>
-              </CardContent>
-            </Card>
-          );
-          return s.onActivate ? (
+        <div className="flex items-center gap-8 shrink-0">
+          <PulseRing
+            value={pulseValue}
+            size="hero"
+            breathe
+            label={`${pulseValue}`}
+            sublabel="network health"
+            strokeColor="var(--primary)"
+          />
+          <div className="flex flex-col gap-5 min-w-[7.5rem]">
             <button
-              key={s.label}
               type="button"
-              onClick={s.onActivate}
-              className="block w-full text-left"
+              onClick={() => goWithFilter({ followUpOnly: true, ownershipScope: "mine" })}
+              className="text-left group"
             >
-              {card}
+              <p className="text-[11px] font-medium text-[var(--copper-foreground)] tracking-wide">
+                Needs you
+              </p>
+              <p className="text-2xl font-semibold tabular-nums text-foreground leading-none mt-1 group-hover:text-primary transition-colors">
+                {attentionTotal}
+              </p>
             </button>
-          ) : (
-            <Link key={s.label} to={s.to} className="block">
-              {card}
-            </Link>
-          );
-        })}
+            <button
+              type="button"
+              onClick={() => goWithFilter({ temperature: ["Hot"] })}
+              className="text-left group"
+            >
+              <p className="text-[11px] font-medium text-muted-foreground tracking-wide">Waking</p>
+              <p className="text-2xl font-semibold tabular-nums text-foreground leading-none mt-1 group-hover:text-primary transition-colors">
+                {waking}
+              </p>
+            </button>
+            <div>
+              <p className="text-[11px] font-medium text-muted-foreground tracking-wide">Steady</p>
+              <p className="text-2xl font-semibold tabular-nums text-foreground leading-none mt-1">
+                {Math.max(0, metrics.contacts - metrics.hotLeads - openFollowUps)}
+              </p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* Quiet secondary metrics */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-px bg-border rounded-lg overflow-hidden border border-border">
+        {(
+          [
+            {
+              label: "Network",
+              value: metrics.contacts,
+              sub: <DeltaLine delta={delta("contacts", added.contacts)} label="this week" />,
+              onActivate: () => navigate({ to: "/crm" }),
+            },
+            {
+              label: "Hot",
+              value: metrics.hotLeads,
+              sub: <DeltaLine delta={delta("hotLeads", null)} label="this week" />,
+              onActivate: () => goWithFilter({ temperature: ["Hot"] }),
+            },
+            {
+              label: "Targets",
+              value: metrics.targets,
+              sub: <DeltaLine delta={delta("targets", added.targets)} label="this week" />,
+              onActivate: () => navigate({ to: "/targeting" }),
+            },
+            {
+              label: "Portfolio",
+              value: metrics.portfolio,
+              sub: <DeltaLine delta={delta("portfolio", null)} label="this week" />,
+              onActivate: () => navigate({ to: "/portfolio" }),
+            },
+          ] as const
+        ).map((s) => (
+          <button
+            key={s.label}
+            type="button"
+            onClick={s.onActivate}
+            className="bg-card px-4 py-3.5 text-left hover:bg-accent/60 transition-colors"
+          >
+            <p className="text-[11px] text-muted-foreground font-medium">{s.label}</p>
+            <p className="text-lg font-semibold tabular-nums text-foreground mt-0.5">
+              {s.value.toLocaleString()}
+            </p>
+            <div className="mt-1">{s.sub}</div>
+          </button>
+        ))}
       </div>
 
-      {/* Attention queue + signal digest */}
+      {/* Attention + signals */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {/* Needs your attention */}
-        <Card>
+        <Card className="border-border">
           <CardContent className="p-5">
             <div className="flex items-center justify-between mb-3">
               <h2 className="text-sm font-semibold flex items-center gap-1.5">
-                <AlertTriangle className="h-4 w-4 text-amber-500" />
+                <AlertTriangle className="h-3.5 w-3.5 text-[var(--copper)]" />
                 Needs your attention
               </h2>
-              <span className="text-[11px] text-muted-foreground">{attentionTotal} items</span>
+              <span className="text-[11px] text-muted-foreground inline-flex items-center gap-1">
+                {myBusy && <Loader2 className="h-3 w-3 animate-spin" />}
+                {attentionTotal} items
+                {personalized ? " · yours" : ""}
+              </span>
             </div>
             {attention.length === 0 ? (
               <p className="text-xs text-muted-foreground py-6 text-center">
-                Nothing needs chasing right now — nicely done.
+                {personalized
+                  ? "Nothing in your book needs chasing right now."
+                  : "Nothing needs chasing right now."}
               </p>
             ) : (
               <div className="divide-y divide-border">
-                {attention.map((a: AttentionItem) => {
+                {attention.map((a: AttentionItem, idx: number) => {
                   const r = REASON_STYLE[a.reason];
                   return (
                     <Link
                       key={a.id}
                       to="/crm"
                       search={a.email ? { contact: a.email } : undefined}
-                      className="flex items-center gap-3 py-2.5 -mx-1 px-1 rounded-md hover:bg-accent transition-colors"
+                      className={`flex items-center gap-3 py-2.5 -mx-1 px-1 rounded-md hover:bg-accent transition-colors ${
+                        idx === 0 ? "bg-[var(--copper)]/[0.04]" : ""
+                      }`}
                     >
-                      <ContactAvatar contact={{ name: a.name, email: a.email }} size="sm" />
+                      <ContactAvatar
+                        contact={{ name: a.name, email: a.email, company: a.company }}
+                        size="sm"
+                      />
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-2">
                           <span className="text-sm font-medium text-foreground truncate">
@@ -557,7 +545,7 @@ function HomePage() {
                         <p className="text-[11px] text-muted-foreground truncate">{a.detail}</p>
                       </div>
                       <span
-                        className={`shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded-full border ${r.cls}`}
+                        className={`shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded border ${r.cls}`}
                       >
                         {r.label}
                       </span>
@@ -569,6 +557,9 @@ function HomePage() {
             {attentionTotal > attention.length && (
               <Link
                 to="/crm"
+                onClick={() =>
+                  setFilters({ ...defaultFilters, ownershipScope: "mine", followUpOnly: false })
+                }
                 className="inline-flex items-center gap-1 text-xs text-primary hover:underline mt-3"
               >
                 View all {attentionTotal} <ArrowRight className="h-3 w-3" />
@@ -577,8 +568,7 @@ function HomePage() {
           </CardContent>
         </Card>
 
-        {/* Today's signals (deferred) */}
-        <Card>
+        <Card className="border-border">
           <CardContent className="p-5">
             <Suspense fallback={<DigestSkeleton />}>
               <Await promise={digest}>{(d) => <DigestBody digest={d as HomeDigest} />}</Await>
@@ -587,72 +577,35 @@ function HomePage() {
         </Card>
       </div>
 
-      {/* Daily briefing */}
       <DailyBriefing briefing={briefing} busy={briefingBusy} onGenerate={runBriefing} />
 
-      {/* Module navigation */}
       <WorkspaceGrid />
     </div>
   );
 }
 
-/**
- * The "Jump into a workspace" grid. Each card lifts on hover and its custom
- * icon animates on hover. A gentle idle choreography also fires one icon at a
- * time (every ~6s) so the page feels alive without constant motion.
- */
+/** Quiet workspace list — no pastel tiles, no idle icon loops. */
 function WorkspaceGrid() {
-  const [activeIdx, setActiveIdx] = useState<number | null>(null);
-
-  useEffect(() => {
-    // Respect reduced-motion: skip the idle loop entirely.
-    if (
-      typeof window !== "undefined" &&
-      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
-    ) {
-      return;
-    }
-    let i = -1;
-    let clearTimer: ReturnType<typeof setTimeout>;
-    const tick = () => {
-      i = (i + 1) % MODULES.length;
-      setActiveIdx(i);
-      // Hold the animation ~2.6s, then rest until the next tick.
-      clearTimer = setTimeout(() => setActiveIdx(null), 2600);
-    };
-    const interval = setInterval(tick, 6000);
-    return () => {
-      clearInterval(interval);
-      clearTimeout(clearTimer);
-    };
-  }, []);
-
   return (
     <div>
-      <h2 className="text-xs uppercase tracking-wider font-semibold text-muted-foreground mb-3">
-        Jump into a workspace
-      </h2>
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-        {MODULES.map((m, idx) => (
+      <h2 className="text-sm font-semibold text-foreground mb-3">Workspaces</h2>
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2">
+        {MODULES.map((m) => (
           <Link key={m.url} to={m.url} className="group block">
-            <Card className="h-full transition-all duration-200 ease-out group-hover:-translate-y-1.5 group-hover:shadow-(--shadow-elegant) group-hover:border-primary/40">
-              <CardContent className="p-5 flex items-start gap-3.5">
-                <div
-                  className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-linear-to-br ring-1 ring-transparent transition-all duration-200 ease-out group-hover:scale-[1.08] ${m.tile} ${m.glyph} ${
-                    activeIdx === idx ? "wsi--active" : ""
-                  }`}
-                >
-                  <m.Icon className="h-6 w-6" />
+            <div className="h-full rounded-lg border border-border bg-card px-3.5 py-3 surface-hover flex items-start gap-3">
+              <div className={`mt-0.5 ${m.accent}`}>
+                <m.Icon className="h-5 w-5" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center justify-between gap-2">
+                  <h3 className="text-sm font-medium text-foreground">{m.title}</h3>
+                  <ArrowRight className="h-3.5 w-3.5 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
                 </div>
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center justify-between gap-2">
-                    <h3 className="text-sm font-semibold text-foreground">{m.title}</h3>
-                    <ArrowRight className="h-4 w-4 text-muted-foreground opacity-0 -translate-x-1 transition-all group-hover:opacity-100 group-hover:translate-x-0" />
-                  </div>
-                  <p className="text-xs text-muted-foreground mt-0.5">{m.description}</p>
-                </div>
-              </CardContent>
-            </Card>
+                <p className="text-[11px] text-muted-foreground mt-0.5 leading-snug">
+                  {m.description}
+                </p>
+              </div>
+            </div>
           </Link>
         ))}
       </div>
@@ -665,7 +618,7 @@ function DigestBody({ digest }: { digest: HomeDigest }) {
     <>
       <div className="flex items-center justify-between mb-3">
         <h2 className="text-sm font-semibold flex items-center gap-1.5">
-          <Radar className="h-4 w-4 text-primary" />
+          <Radar className="h-3.5 w-3.5 text-primary" />
           Today's signals
         </h2>
         <span className="text-[11px] text-muted-foreground">
@@ -674,25 +627,12 @@ function DigestBody({ digest }: { digest: HomeDigest }) {
       </div>
       {digest.items.length === 0 ? (
         <p className="text-xs text-muted-foreground py-6 text-center">
-          No stored signals yet — run a scan from the Signals tab.
+          No stored signals yet — run a scan from Signals.
         </p>
       ) : (
         <div className="divide-y divide-border">
           {digest.items.map((it, i) => {
             const b = BADGE_STYLE[it.badge];
-            const inner = (
-              <>
-                <div className="min-w-0 flex-1">
-                  <p className="text-sm font-medium text-foreground truncate">{it.headline}</p>
-                  <p className="text-[11px] text-muted-foreground truncate">{it.sub}</p>
-                </div>
-                <span
-                  className={`shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded-full border ${b.cls}`}
-                >
-                  {b.label}
-                </span>
-              </>
-            );
             return (
               <Link
                 key={i}
@@ -700,7 +640,18 @@ function DigestBody({ digest }: { digest: HomeDigest }) {
                 search={{ q: it.headline }}
                 className="flex items-center gap-2 py-2.5 -mx-1 px-1 rounded-md hover:bg-accent transition-colors"
               >
-                {inner}
+                {i === 0 && digest.newCount > 0 && (
+                  <PulseRing value={72} size="xs" strokeColor="var(--primary)" />
+                )}
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-medium text-foreground truncate">{it.headline}</p>
+                  <p className="text-[11px] text-muted-foreground truncate">{it.sub}</p>
+                </div>
+                <span
+                  className={`shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded border ${b.cls}`}
+                >
+                  {b.label}
+                </span>
               </Link>
             );
           })}
@@ -721,7 +672,7 @@ function DigestSkeleton() {
     <div>
       <div className="flex items-center justify-between mb-3">
         <h2 className="text-sm font-semibold flex items-center gap-1.5">
-          <Radar className="h-4 w-4 text-primary" />
+          <Radar className="h-3.5 w-3.5 text-primary" />
           Today's signals
         </h2>
       </div>
@@ -732,7 +683,7 @@ function DigestSkeleton() {
               <div className="h-3 w-3/4 rounded bg-muted" />
               <div className="h-2.5 w-1/2 rounded bg-muted" />
             </div>
-            <div className="h-4 w-14 rounded-full bg-muted" />
+            <div className="h-4 w-14 rounded bg-muted" />
           </div>
         ))}
       </div>

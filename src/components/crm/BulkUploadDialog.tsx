@@ -21,10 +21,12 @@ import {
 } from "@/components/ui/select";
 import { EventPicker } from "@/components/events/EventPicker";
 import { MultiSelect } from "@/components/ui/multi-select";
-import { addContact, addEvent as addEventToSheet, addPortcoIntro, addNote, fetchContactEmails, logImportResult, fetchImportHistory } from "@/utils/sheets.functions";
+import { addContact, addEvent as addEventToSheet, addPortcoIntro, addNote, fetchContactEmails, logImportResult, fetchImportHistory, storeApolloRaw } from "@/utils/sheets.functions";
 import { enrichContact } from "@/utils/apollo.functions";
 import { toast } from "sonner";
 import { normalizeEmails } from "@/lib/email";
+import { normalizeLinkedinUrl } from "@/lib/linkedin";
+import { ENGAGEMENT_SOURCES, type EngagementSource } from "@/lib/types";
 
 interface BulkUploadDialogProps {
   open: boolean;
@@ -46,6 +48,7 @@ interface ParsedRow {
   location: string;
   prime: string;
   sector: string;
+  linkedin: string;
   // Apollo-enrichment-only (never mapped from CSV columns).
   headline: string;
   employmentHistory: string;
@@ -79,6 +82,7 @@ const FIELDS: { key: FieldKey; label: string; required?: boolean }[] = [
   { key: "location", label: "Location" },
   { key: "prime", label: "Prime" },
   { key: "sector", label: "Sector" },
+  { key: "linkedin", label: "LinkedIn" },
 ];
 
 const NO_COLUMN = -1;
@@ -94,7 +98,7 @@ function firstEmail(cell: string): string {
 }
 
 function emptyMapping(): Mapping {
-  return { name: NO_COLUMN, title: NO_COLUMN, company: NO_COLUMN, email: NO_COLUMN, phone: NO_COLUMN, location: NO_COLUMN, prime: NO_COLUMN, sector: NO_COLUMN };
+  return { name: NO_COLUMN, title: NO_COLUMN, company: NO_COLUMN, email: NO_COLUMN, phone: NO_COLUMN, location: NO_COLUMN, prime: NO_COLUMN, sector: NO_COLUMN, linkedin: NO_COLUMN };
 }
 
 // Sniff the delimiter from the first non-empty line by counting candidates
@@ -162,6 +166,12 @@ const HEADER_MAP: Record<string, FieldKey> = {
   "relationship prime": "prime",
   sector: "sector",
   industry: "sector",
+  linkedin: "linkedin",
+  "linkedin url": "linkedin",
+  "linkedin profile": "linkedin",
+  "linkedin profile url": "linkedin",
+  "li url": "linkedin",
+  "profile url": "linkedin",
 };
 
 // Best-guess mapping from the header row, leaving anything unrecognized unmapped.
@@ -196,7 +206,8 @@ function formatEmploymentHistory(
 // import never blocks.
 async function enrichRow(r: ParsedRow): Promise<{ row: ParsedRow; enriched: boolean }> {
   // Skip the Apollo call only when every enrichable field is already present.
-  if (r.title && r.company && r.phone && r.location && r.sector) return { row: r, enriched: false };
+  if (r.title && r.company && r.phone && r.location && r.sector && r.email && r.linkedin)
+    return { row: r, enriched: false };
   const parts = r.name.trim().split(/\s+/);
   const firstName = parts[0] || "";
   const lastName = parts.slice(1).join(" ");
@@ -207,6 +218,7 @@ async function enrichRow(r: ParsedRow): Promise<{ row: ParsedRow; enriched: bool
         firstName: firstName || undefined,
         lastName: lastName || undefined,
         company: r.company || undefined,
+        linkedinUrl: r.linkedin || undefined,
       },
     });
     if (!result.found) return { row: r, enriched: false };
@@ -215,17 +227,27 @@ async function enrichRow(r: ParsedRow): Promise<{ row: ParsedRow; enriched: bool
       ...r,
       title: r.title || result.title || "",
       company: r.company || result.company || "",
+      email: r.email || result.email || "",
       phone: r.phone || result.phone || "",
       location: r.location || apolloLocation,
       sector: r.sector || result.industry || "",
+      linkedin: r.linkedin || normalizeLinkedinUrl(result.linkedinUrl),
       headline: r.headline || result.headline || "",
       employmentHistory: r.employmentHistory || formatEmploymentHistory(result.employmentHistory),
     };
     const enriched =
-      row.title !== r.title || row.company !== r.company ||
-      row.phone !== r.phone || row.location !== r.location ||
-      row.sector !== r.sector || row.headline !== r.headline ||
+      row.title !== r.title ||
+      row.company !== r.company ||
+      row.email !== r.email ||
+      row.phone !== r.phone ||
+      row.location !== r.location ||
+      row.sector !== r.sector ||
+      row.linkedin !== r.linkedin ||
+      row.headline !== r.headline ||
       row.employmentHistory !== r.employmentHistory;
+    if (enriched && row.email) {
+      storeApolloRaw({ data: { email: row.email, payload: result } }).catch(() => {});
+    }
     return { row, enriched };
   } catch (e) {
     console.error("apollo enrich failed", r.email, e);
@@ -239,6 +261,9 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
   const [mapping, setMapping] = useState<Mapping>(emptyMapping());
   const [eventName, setEventName] = useState("");
   const [portcoNames, setPortcoNames] = useState<string[]>([]);
+  // How the tagged contacts came to engage the selected portcos — written to the
+  // "PortCos Introduced" tab's Engagement Source column (defaults to a direct intro).
+  const [portcoSource, setPortcoSource] = useState<EngagementSource>("direct introduction");
   const [source, setSource] = useState("");
   // Hands-off by default: imported contacts are auto-enriched unless unchecked.
   const [enrichOnImport, setEnrichOnImport] = useState(true);
@@ -290,6 +315,7 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
       location: cell(r, mapping.location),
       prime: cell(r, mapping.prime),
       sector: cell(r, mapping.sector),
+      linkedin: normalizeLinkedinUrl(cell(r, mapping.linkedin)),
       headline: "",
       employmentHistory: "",
     }));
@@ -317,6 +343,7 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
     setMapping(emptyMapping());
     setEventName("");
     setPortcoNames([]);
+    setPortcoSource("direct introduction");
     setSource("");
     setEnrichOnImport(true);
     setBusy(false);
@@ -368,6 +395,7 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
             location: r.location,
             prime: r.prime,
             sector: r.sector,
+            linkedinUrl: r.linkedin,
             headline: r.headline,
             employmentHistory: r.employmentHistory,
             temperature: "Warm",
@@ -391,7 +419,7 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
           let taggedAny = false;
           for (const portco of portcos) {
             try {
-              await addPortcoIntro({ data: { contactEmail: r.email, portcoName: portco } });
+              await addPortcoIntro({ data: { contactEmail: r.email, portcoName: portco, source: portcoSource } });
               taggedAny = true;
             } catch (e) {
               console.error("portco tag failed", r.email, portco, e);
@@ -547,6 +575,23 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
                         placeholder="Portfolio companies…"
                         className="h-9"
                       />
+                      {portcoNames.length > 0 && (
+                        <Select
+                          value={portcoSource}
+                          onValueChange={(v) => setPortcoSource(v as EngagementSource)}
+                        >
+                          <SelectTrigger className="h-8 text-xs mt-1.5">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {ENGAGEMENT_SOURCES.map((s) => (
+                              <SelectItem key={s} value={s} className="text-xs capitalize">
+                                {s}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      )}
                     </div>
                     <div>
                       <Label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">

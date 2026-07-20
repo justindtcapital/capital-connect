@@ -125,6 +125,7 @@ export function NetworkBuilderDialog({ open, onOpenChange, onAdded }: NetworkBui
           role: title,
           linkedin,
           email,
+          phone: revealed.phone || "",
           location,
           sector: "",
           stage: "Prospecting",

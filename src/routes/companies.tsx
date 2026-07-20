@@ -1,5 +1,5 @@
 import { createFileRoute, Link, useNavigate, useRouter } from "@tanstack/react-router";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   fetchContacts,
   fetchPortfolioCompanies,
@@ -12,7 +12,7 @@ import type { Contact, PortfolioCompany, TargetLead, EmailActivityRecord } from 
 import type { FeedCard } from "@/lib/signal-feed";
 import type { ScoredTarget } from "@/utils/broadcast.functions";
 import { buildFeed, relativeTime } from "@/lib/signal-feed";
-import { extractDomain } from "@/lib/domain-utils";
+import { companyLogoSources, extractDomain } from "@/lib/domain-utils";
 import { useFilters, defaultFilters } from "@/lib/filter-context";
 import { EmailDraftDialog } from "@/components/crm/EmailDraftDialog";
 import { BroadcastDialog } from "@/components/crm/BroadcastDialog";
@@ -180,21 +180,27 @@ function CompanyLogo({
 }) {
   const [stage, setStage] = useState(0);
   const px = size * 4;
-  // Confident domain: Clearbit → Google favicon → initials. Guessed domain: only
-  // try Clearbit (which 404s cleanly when it has no logo), then fall to initials —
-  // never a stray favicon from a domain we only guessed.
-  const maxStage = confident ? 2 : 1;
-  if (domain && stage < maxStage) {
-    const src =
-      stage === 0
-        ? `https://logo.clearbit.com/${domain}`
-        : `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=128`;
+  const sources = useMemo(() => {
+    if (!domain) return [] as string[];
+    // Guessed domains: still try Logo.dev/DDG; avoid treating missing as success.
+    return companyLogoSources(domain, confident ? "high" : "low");
+  }, [domain, confident]);
+
+  useEffect(() => {
+    setStage(0);
+  }, [sources.join("|")]);
+
+  if (domain && stage < sources.length) {
+    const src = sources[stage];
     return (
       <img
+        key={src}
         src={src}
         alt=""
         style={{ width: px, height: px }}
         className="rounded-md border border-border object-contain bg-white shrink-0"
+        referrerPolicy="no-referrer"
+        loading="lazy"
         onError={() => setStage((s) => s + 1)}
       />
     );
@@ -267,10 +273,28 @@ const REL_BADGE: Record<Relationship, string> = {
 // Order people are grouped in within the People card.
 const REL_ORDER: Relationship[] = ["works-here", "intro", "target", "team", "signal"];
 
-function PersonRow({ p, onEmail }: { p: RelatedPerson; onEmail: (p: RelatedPerson) => void }) {
+function PersonRow({
+  p,
+  companyName,
+  companyDomain,
+  onEmail,
+}: {
+  p: RelatedPerson;
+  companyName?: string;
+  companyDomain?: string;
+  onEmail: (p: RelatedPerson) => void;
+}) {
   const body = (
     <>
-      <ContactAvatar contact={{ name: p.name, email: p.email }} size="sm" />
+      <ContactAvatar
+        contact={{
+          name: p.name,
+          email: p.email,
+          company: companyName,
+          domain: companyDomain,
+        }}
+        size="sm"
+      />
       <div className="min-w-0 flex-1">
         <p className="text-sm font-medium text-foreground truncate">{p.name}</p>
         {(p.title || p.detail) && (
@@ -364,7 +388,13 @@ function PeopleCard({
                 </div>
                 <div className="space-y-1">
                   {g.items.slice(0, 8).map((p) => (
-                    <PersonRow key={`${p.relationship}-${p.id}`} p={p} onEmail={onEmail} />
+                    <PersonRow
+                      key={`${p.relationship}-${p.id}`}
+                      p={p}
+                      companyName={intel.name}
+                      companyDomain={intel.logoDomain}
+                      onEmail={onEmail}
+                    />
                   ))}
                   {g.items.length > 8 && (
                     <p className="text-[11px] text-muted-foreground pl-1">
@@ -684,7 +714,7 @@ function CompanyIndex({ companies }: { companies: CompanyIntel[] }) {
             const fresh = freshness(e.lastActivityTs);
             return (
               <Link key={e.key} to="/companies" search={{ c: e.name }} className="group block">
-                <Card className="relative h-full overflow-hidden transition-all duration-200 group-hover:-translate-y-1 group-hover:shadow-(--shadow-elegant) group-hover:border-primary/40">
+                <Card className="relative h-full overflow-hidden surface-hover">
                   {/* segment accent */}
                   <span
                     className={`absolute left-0 top-0 h-full w-1 ${SEG_ACCENT[e.segment] || SEG_ACCENT.Other}`}
@@ -922,7 +952,7 @@ function CompanyBrief({
           </Button>
           <Button
             size="sm"
-            className="text-xs bg-(image:--gradient-primary) shadow-(--shadow-elegant) hover:shadow-(--shadow-elegant) hover:brightness-110"
+            className="text-xs"
             onClick={runScan}
             disabled={scanning}
           >

@@ -1,0 +1,11 @@
+# Only .gs files and the manifest belong in Apps Script.
+#
+# Without this, `clasp push` uploads tests/*.js as Apps Script source. Those are
+# node scripts — their top-level require() throws as soon as ANY function in the
+# project runs, so the whole project breaks and the error points somewhere
+# unrelated. Ignore everything, then re-admit only what Apps Script can execute.
+
+**/**
+
+!*.gs
+!appsscript.json

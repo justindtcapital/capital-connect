@@ -4,6 +4,8 @@ import {
   buildTargets,
   buildPortfolioCompanies,
   buildAppEvents,
+  addPortfolioCompany as addPortfolioCompanyServer,
+  deletePortfolioCompany as deletePortfolioCompanyServer,
   addContactRow,
   appendSheetRow,
   appendInteractionRows,
@@ -26,23 +28,34 @@ import {
   buildEmailActivity as buildEmailActivityServer,
   fetchContactEmails as fetchContactEmailsServer,
   logImportResult as logImportResultServer,
+  logOpsEvent as logOpsEventServer,
   buildImportHistory,
+  buildOpsLog as buildOpsLogServer,
+  type OpsLogEntry,
+  buildOwnershipIndex as buildOwnershipIndexServer,
+  buildMyContacts as buildMyContactsServer,
   buildRatingTransitions,
   buildEventSynopses,
   setEventSynopsis as setEventSynopsisServer,
   appendTargetOutreach as appendTargetOutreachServer,
   saveTargetStrategy as saveTargetStrategyServer,
   updateTargetFields as updateTargetFieldsServer,
+  bulkUpdateTargetFields as bulkUpdateTargetFieldsServer,
+  repairTargetUrids as repairTargetUridsServer,
+  setPortcoIntroSource as setPortcoIntroSourceServer,
   appendTargetRows as appendTargetRowsServer,
   recordDailySnapshot as recordDailySnapshotServer,
+  ensureEventAttendanceBatch,
+  primarySheetEmail,
   type ImportResultInput,
+  type OpsLogInput,
   type DailyMetrics,
   type SnapshotResult,
   type BulkMergeUpdate,
 } from "./sheets.server";
 import { enrichPerson } from "./apollo.server";
 import { sampleContacts, sampleTargets, samplePortfolioCompanies } from "@/lib/sample-data";
-import { normalizeInteractionType } from "@/lib/types";
+import { normalizeInteractionType, targetKeyOf } from "@/lib/types";
 import type {
   AsanaEvent,
   Temperature,
@@ -77,6 +90,35 @@ export const fetchPortfolioCompanies = createServerFn({ method: "GET" }).handler
     return samplePortfolioCompanies;
   }
 });
+
+// Add a portfolio company (new row in the "Portfolio Companies" tab).
+export const addPortfolioCompany = createServerFn({ method: "POST" })
+  .inputValidator(
+    (data: {
+      name: string;
+      website?: string;
+      focusArea?: string;
+      location?: string;
+      description?: string;
+    }) => data,
+  )
+  .handler(async ({ data }) => {
+    if (!data.name?.trim()) throw new Error("Company name is required");
+    return await addPortfolioCompanyServer({
+      name: data.name,
+      website: data.website,
+      focusArea: data.focusArea,
+      location: data.location,
+      description: data.description,
+    });
+  });
+
+// Delete a portfolio company (by stable URID, falling back to exact name match).
+export const deletePortfolioCompany = createServerFn({ method: "POST" })
+  .inputValidator((data: { urid?: string; name?: string }) => data)
+  .handler(async ({ data }) => {
+    return await deletePortfolioCompanyServer(data);
+  });
 
 // App-added events (stored in the Sheet's "App Events" tab — never written to Asana).
 export const fetchAppEvents = createServerFn({ method: "GET" }).handler(
@@ -119,6 +161,20 @@ export const addAppEvent = createServerFn({ method: "POST" })
       (data.sectors || []).join(", "),
       (data.portcos || []).join(", "),
     ]);
+    await logOpsEventServer({
+      action: "sync",
+      source: "app_event",
+      status: "ok",
+      summary: `App event catalog · ${data.name}${data.date ? ` · ${data.date}` : ""}`,
+      records: 1,
+      details: {
+        name: data.name,
+        date: data.date,
+        type: data.type || "",
+        status: data.status || "",
+      },
+      items: [data.name],
+    });
     return { success: true };
   });
 
@@ -149,11 +205,51 @@ export const addNote = createServerFn({ method: "POST" })
   });
 
 export const addEvent = createServerFn({ method: "POST" })
-  .inputValidator((data: { contactEmail: string; eventName: string; type: string }) => data)
+  .inputValidator(
+    (data: {
+      contactEmail: string;
+      eventName: string;
+      type: string;
+      urid?: string;
+      date?: string;
+      /** Ensure App Events catalog row (default true). */
+      ensureCatalog?: boolean;
+    }) => data,
+  )
   .handler(async ({ data }) => {
-    const now = new Date().toISOString().split("T")[0];
-    await appendSheetRow(TAB_NAMES.events, [data.contactEmail, data.eventName, now, data.type]);
-    return { success: true };
+    const email = primarySheetEmail(data.contactEmail);
+    if (!email || !data.eventName.trim()) {
+      return { success: false as const, error: "Missing email or event name" };
+    }
+    const type = (data.type || "attended").toLowerCase() === "invited" ? "invited" : "attended";
+    const res = await ensureEventAttendanceBatch([
+      {
+        email,
+        eventName: data.eventName.trim(),
+        date: data.date,
+        type,
+        urid: data.urid,
+        ensureCatalog: data.ensureCatalog !== false,
+        catalogType: "meeting",
+      },
+    ]);
+    await logOpsEventServer({
+      action: "sync",
+      source: "event_attendance",
+      status: "ok",
+      summary: `Event ${type} · ${email} ← ${data.eventName.trim()}`,
+      records: res.attendanceWritten,
+      details: {
+        email,
+        event: data.eventName.trim(),
+        type,
+        attendanceWritten: res.attendanceWritten,
+        catalogWritten: res.catalogWritten,
+        skipped: res.skipped,
+      },
+      items: [`${email} ← ${data.eventName.trim()} [${type}]`],
+    });
+    return { success: true as const, ...res };
   });
 
 export const addPortcoIntro = createServerFn({ method: "POST" })
@@ -173,6 +269,17 @@ export const addPortcoIntro = createServerFn({ method: "POST" })
     return { success: true };
   });
 
+// Reclassify an existing portfolio engagement's source in place (inline edit on
+// the contact panel), without deleting/re-adding the intro.
+export const setPortcoIntroSource = createServerFn({ method: "POST" })
+  .inputValidator(
+    (data: { contactEmail: string; portcoName: string; source: EngagementSource; urid?: string }) =>
+      data,
+  )
+  .handler(async ({ data }) =>
+    setPortcoIntroSourceServer(data.contactEmail, data.portcoName, data.source, data.urid),
+  );
+
 export const addContact = createServerFn({ method: "POST" })
   .inputValidator(
     (data: {
@@ -191,13 +298,19 @@ export const addContact = createServerFn({ method: "POST" })
       /** Apollo enrichment extras. */
       headline?: string;
       employmentHistory?: string;
+      /** Sourced LinkedIn profile URL (written to the "LinkedIn" column). */
+      linkedinUrl?: string;
     }) => data,
   )
   .handler(async ({ data }) => {
     // Ensure the Source columns exist before the header-aware append writes them.
     await ensureColumn(TAB_NAMES.contacts, "Source");
     if (data.sourceContext) await ensureColumn(TAB_NAMES.contacts, "Source Context");
-    await addContactRow({ ...data, source: data.source || "Manual Entry" });
+    await addContactRow({
+      ...data,
+      linkedin: data.linkedinUrl,
+      source: data.source || "Manual Entry",
+    });
     return { success: true };
   });
 
@@ -210,6 +323,7 @@ export const addTarget = createServerFn({ method: "POST" })
       role: string;
       linkedin: string;
       email: string;
+      phone?: string;
       location: string;
       sector: string;
       stage: string;
@@ -228,6 +342,7 @@ export const addTarget = createServerFn({ method: "POST" })
         role: data.role,
         linkedin: data.linkedin,
         email: data.email,
+        phone: data.phone || "",
         location: data.location,
         sector: data.sector,
         stage: data.stage,
@@ -237,6 +352,92 @@ export const addTarget = createServerFn({ method: "POST" })
       },
     ]);
     return { success: true };
+  });
+
+// Batch import for the Targeting paste/upload flows. Dedupes each incoming row
+// against existing targets (by targetKeyOf) and within the batch, then appends
+// the survivors in one header-aware write. Returns added + duplicate counts.
+export const importTargets = createServerFn({ method: "POST" })
+  .inputValidator(
+    (data: {
+      targets: Array<{
+        firstName: string;
+        lastName: string;
+        company: string;
+        role: string;
+        linkedin: string;
+        email: string;
+        phone?: string;
+        location: string;
+        sector: string;
+        stage: string;
+        source: string;
+        researchPurpose: string;
+        reasonSurfaced?: string;
+      }>;
+    }) => data,
+  )
+  .handler(async ({ data }): Promise<{ added: number; duplicates: number }> => {
+    const incoming = (data.targets || []).filter(
+      (t) => t.firstName || t.lastName || t.email || t.linkedin,
+    );
+    if (incoming.length === 0) return { added: 0, duplicates: 0 };
+
+    // Authoritative dedup: re-read existing targets at commit time so a re-click
+    // (or a concurrent import) can't double-create the same person.
+    let existingKeys = new Set<string>();
+    try {
+      const existing = await buildTargets();
+      existingKeys = new Set(existing.map((t) => targetKeyOf(t)).filter(Boolean));
+    } catch (e) {
+      console.error("importTargets: dedup read failed (proceeding):", e);
+    }
+
+    const seen = new Set<string>();
+    const toAdd: typeof incoming = [];
+    let duplicates = 0;
+    for (const r of incoming) {
+      const name = `${r.firstName} ${r.lastName}`.trim();
+      const key = targetKeyOf({ email: r.email, name, company: r.company });
+      if (key && (existingKeys.has(key) || seen.has(key))) {
+        duplicates++;
+        continue;
+      }
+      if (key) seen.add(key);
+      toAdd.push(r);
+    }
+
+    if (toAdd.length > 0) {
+      await appendTargetRowsServer(
+        toAdd.map((t) => ({
+          firstName: t.firstName,
+          lastName: t.lastName,
+          company: t.company,
+          role: t.role,
+          linkedin: t.linkedin,
+          email: t.email,
+          phone: t.phone || "",
+          location: t.location,
+          sector: t.sector,
+          stage: t.stage,
+          source: t.source,
+          researchPurpose: t.researchPurpose,
+          reasonSurfaced: t.reasonSurfaced || "",
+        })),
+      );
+      await logOpsEventServer({
+        action: "import",
+        source: "targets",
+        status: "ok",
+        summary: `Imported ${toAdd.length} target${toAdd.length !== 1 ? "s" : ""}${duplicates ? ` · ${duplicates} duplicate${duplicates !== 1 ? "s" : ""} skipped` : ""}`,
+        records: toAdd.length,
+        details: { duplicates, source: toAdd[0]?.source },
+        items: toAdd.map((t) =>
+          [`${t.firstName} ${t.lastName}`.trim(), t.company].filter(Boolean).join(" · "),
+        ),
+      });
+    }
+    return { added: toAdd.length, duplicates };
   });
 
 // Persist a single outreach attempt for a target (Target Outreach tab).
@@ -270,6 +471,134 @@ export const updateTargetFields = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     if (!data.targetKey?.trim() && !data.urid?.trim()) return { success: false };
     return await updateTargetFieldsServer(data.targetKey, data.fields || {}, data.urid);
+  });
+
+// Backfill missing / de-duplicate URIDs on the Targets tab so every row is stably
+// keyable (URID column only — data columns untouched). Idempotent.
+export const repairTargetUrids = createServerFn({ method: "POST" }).handler(async () => {
+  const res = await repairTargetUridsServer();
+  if (res.filled > 0 || res.deduped > 0) {
+    await logOpsEventServer({
+      action: "maintenance",
+      source: "targets_urid",
+      status: "ok",
+      summary: `Repaired target IDs · ${res.filled} filled, ${res.deduped} de-duplicated (of ${res.total})`,
+      records: res.filled + res.deduped,
+      details: { filled: res.filled, deduped: res.deduped, total: res.total },
+    });
+  }
+  return res;
+});
+
+// Batch-set fields (e.g. Stage) across many targets in one write. Overwrites by
+// default; pass fillOnly to leave non-blank cells untouched.
+export const bulkUpdateTargetFields = createServerFn({ method: "POST" })
+  .inputValidator(
+    (data: {
+      entries: { key?: string; urid?: string; fields: Record<string, string | undefined> }[];
+      fillOnly?: boolean;
+    }) => data,
+  )
+  .handler(async ({ data }) => {
+    const res = await bulkUpdateTargetFieldsServer(data.entries, { fillOnly: data.fillOnly });
+    if (res.updated > 0) {
+      // Distinct field names touched across the batch (e.g. "stage").
+      const fields = [...new Set(data.entries.flatMap((e) => Object.keys(e.fields || {})))].join(
+        ", ",
+      );
+      await logOpsEventServer({
+        action: "edit",
+        source: "targets",
+        status: "ok",
+        summary: `Updated ${res.updated} target${res.updated !== 1 ? "s" : ""}${fields ? ` · ${fields}` : ""}`,
+        records: res.updated,
+        details: { fields },
+      });
+    }
+    return res;
+  });
+
+// Mass Apollo research over selected targets: enrich each person and
+// NON-DESTRUCTIVELY fill blank fields (role/company/phone/location/sector/linkedin,
+// plus name if the row is nameless) in ONE batched sheet write. Apollo never
+// overwrites curated cells. Matched by stable URID with a target-key fallback.
+export const bulkResearchTargets = createServerFn({ method: "POST" })
+  .inputValidator(
+    (data: {
+      targets: {
+        key?: string;
+        urid?: string;
+        name?: string;
+        email?: string;
+        company?: string;
+        linkedinUrl?: string;
+      }[];
+    }) => data,
+  )
+  .handler(async ({ data }) => {
+    const entries: {
+      key?: string;
+      urid?: string;
+      fields: Record<string, string | undefined>;
+    }[] = [];
+    let matched = 0;
+    let notFound = 0;
+    let failed = 0;
+
+    for (const t of data.targets) {
+      const parts = (t.name || "").trim().split(/\s+/).filter(Boolean);
+      // Nothing to match on → count as a miss rather than calling Apollo blind.
+      if (!t.email && !t.linkedinUrl && parts.length === 0) {
+        notFound++;
+        continue;
+      }
+      try {
+        const r = await enrichPerson({
+          email: t.email || undefined,
+          firstName: parts[0] || undefined,
+          lastName: parts.slice(1).join(" ") || undefined,
+          organizationName: t.company || undefined,
+          linkedinUrl: t.linkedinUrl || undefined,
+        });
+        if (!r.found) {
+          notFound++;
+          continue;
+        }
+        matched++;
+        const location = [r.city, r.state].filter(Boolean).join(", ");
+        const resolvedName = r.name || [r.firstName, r.lastName].filter(Boolean).join(" ");
+        entries.push({
+          key: t.key,
+          urid: t.urid,
+          fields: {
+            name: resolvedName || undefined,
+            title: r.title || undefined,
+            company: r.company || undefined,
+            email: r.email || undefined,
+            phone: r.phone || undefined,
+            location: location || undefined,
+            sector: r.industry || undefined,
+            linkedinUrl: r.linkedinUrl || undefined,
+          },
+        });
+      } catch (e) {
+        console.error("[bulkResearchTargets] enrich failed", e);
+        failed++;
+      }
+    }
+
+    const res = await bulkUpdateTargetFieldsServer(entries, { fillOnly: true });
+    if (matched > 0 || res.updated > 0) {
+      await logOpsEventServer({
+        action: "enrich",
+        source: "targets_apollo",
+        status: "ok",
+        summary: `Apollo research · matched ${matched}/${data.targets.length}, ${res.updated} updated${notFound ? `, ${notFound} no match` : ""}${failed ? `, ${failed} failed` : ""}`,
+        records: res.updated,
+        details: { matched, notFound, failed },
+      });
+    }
+    return { matched, notFound, failed, updated: res.updated };
   });
 
 // Persist the latest AI connection plan for a target (Target Strategy tab).
@@ -385,18 +714,57 @@ export const clearContactRatingOverride = createServerFn({ method: "POST" })
 // across many contacts, persisted to the Contacts sheet in one batched write.
 export const bulkUpdateContacts = createServerFn({ method: "POST" })
   .inputValidator((data: { emails: string[]; field: BulkEditField; value: string }) => data)
-  .handler(async ({ data }) => bulkUpdateContactsServer(data.emails, data.field, data.value));
+  .handler(async ({ data }) => {
+    const res = await bulkUpdateContactsServer(data.emails, data.field, data.value);
+    if (res.updated > 0) {
+      await logOpsEventServer({
+        action: "edit",
+        source: "contacts",
+        status: "ok",
+        summary: `Bulk-edited ${res.updated} contact${res.updated !== 1 ? "s" : ""} · ${data.field} → ${data.value}`,
+        records: res.updated,
+        details: { field: data.field, value: data.value },
+      });
+    }
+    return res;
+  });
 
 // Hard-delete the given contacts (by email) from the Contacts sheet. Permanent.
 export const bulkDeleteContacts = createServerFn({ method: "POST" })
   .inputValidator((data: { emails: string[] }) => data)
-  .handler(async ({ data }) => bulkDeleteContactsServer(data.emails));
+  .handler(async ({ data }) => {
+    const res = await bulkDeleteContactsServer(data.emails);
+    if (res.deleted > 0) {
+      await logOpsEventServer({
+        action: "delete",
+        source: "contacts",
+        status: "ok",
+        summary: `Deleted ${res.deleted} contact${res.deleted !== 1 ? "s" : ""}`,
+        records: res.deleted,
+        items: data.emails.filter(Boolean),
+      });
+    }
+    return res;
+  });
 
 // Hard-delete the given targets (by stable URID, or derived target key) from the
 // Targets sheet. Permanent.
 export const bulkDeleteTargets = createServerFn({ method: "POST" })
   .inputValidator((data: { entries: { key?: string; urid?: string }[] }) => data)
-  .handler(async ({ data }) => bulkDeleteTargetsServer(data.entries));
+  .handler(async ({ data }) => {
+    const res = await bulkDeleteTargetsServer(data.entries);
+    if (res.deleted > 0) {
+      await logOpsEventServer({
+        action: "delete",
+        source: "targets",
+        status: "ok",
+        summary: `Deleted ${res.deleted} target${res.deleted !== 1 ? "s" : ""}`,
+        records: res.deleted,
+        items: data.entries.map((e) => e.key || e.urid || "").filter(Boolean),
+      });
+    }
+    return res;
+  });
 
 // Non-destructive contact field merge. source "user" = human edit (writes all,
 // stamps user-owned); source "apollo" = fill-only enrichment that never
@@ -431,7 +799,8 @@ export const storeApolloRaw = createServerFn({ method: "POST" })
 // payload is archived per matched contact.
 export const bulkEnrichContacts = createServerFn({ method: "POST" })
   .inputValidator(
-    (data: { contacts: { email: string; name: string; company?: string; urid?: string }[] }) => data,
+    (data: { contacts: { email: string; name: string; company?: string; urid?: string }[] }) =>
+      data,
   )
   .handler(async ({ data }) => {
     const updates: BulkMergeUpdate[] = [];
@@ -441,7 +810,10 @@ export const bulkEnrichContacts = createServerFn({ method: "POST" })
 
     for (const c of data.contacts) {
       const email = (c.email || "").trim();
-      if (!email) { failed++; continue; }
+      if (!email) {
+        failed++;
+        continue;
+      }
       const parts = (c.name || "").trim().split(/\s+/);
       try {
         const r = await enrichPerson({
@@ -450,7 +822,10 @@ export const bulkEnrichContacts = createServerFn({ method: "POST" })
           lastName: parts.slice(1).join(" ") || undefined,
           organizationName: c.company || undefined,
         });
-        if (!r.found) { notFound++; continue; }
+        if (!r.found) {
+          notFound++;
+          continue;
+        }
         matched++;
         // Archive the raw payload (best-effort).
         storeApolloRawServer(email, r).catch(() => {});
@@ -462,17 +837,22 @@ export const bulkEnrichContacts = createServerFn({ method: "POST" })
           })
           .filter(Boolean)
           .join("; ");
+        const today = new Date().toISOString().split("T")[0];
         updates.push({
           email,
           urid: c.urid,
           fields: {
             title: r.title || undefined,
             company: r.company || undefined,
+            email: r.email || undefined,
             phone: r.phone || undefined,
             location: location || undefined,
             sector: r.industry || undefined,
+            linkedinUrl: r.linkedinUrl || undefined,
             headline: r.headline || undefined,
             employmentHistory: employment || undefined,
+            apolloEnriched: "TRUE",
+            apolloEnrichedDate: today,
           },
         });
       } catch (e) {
@@ -482,6 +862,20 @@ export const bulkEnrichContacts = createServerFn({ method: "POST" })
     }
 
     const res = await bulkMergeContactFieldsServer(updates, "apollo");
+    if (matched > 0 || res.updated > 0 || failed > 0 || notFound > 0) {
+      await logOpsEventServer({
+        action: "enrich",
+        source: "contacts_apollo",
+        status: failed > 0 && matched === 0 ? "error" : "ok",
+        summary: `Apollo enrich · matched ${matched}/${data.contacts.length}, ${res.updated} updated${notFound ? `, ${notFound} no match` : ""}${failed ? `, ${failed} failed` : ""}`,
+        records: res.updated,
+        details: { matched, notFound, failed, requested: data.contacts.length },
+        items: updates.slice(0, 40).map((u) => {
+          const fields = Object.keys(u.fields || {}).join(", ");
+          return `${u.email}${fields ? ` · ${fields}` : ""}`;
+        }),
+      });
+    }
     return { matched, notFound, failed, updated: res.updated };
   });
 
@@ -536,9 +930,63 @@ export const logImportResult = createServerFn({ method: "POST" })
     return { success: true };
   });
 
+// Append a row to the unified Ops Log (import / export / sync audit trail).
+export const logOpsEvent = createServerFn({ method: "POST" })
+  .inputValidator((data: OpsLogInput) => data)
+  .handler(async ({ data }) => {
+    await logOpsEventServer(data);
+    return { success: true };
+  });
+
+/** BD/GTM activity GIDs owned by the signed-in teammate. */
+export const fetchOwnershipIndex = createServerFn({ method: "POST" })
+  .inputValidator((data: { email: string }) => data)
+  .handler(async ({ data }) => buildOwnershipIndexServer(data.email));
+
+/** Personalized Home attention queue + follow-up count for the signed-in user. */
+export const fetchMyAttention = createServerFn({ method: "POST" })
+  .inputValidator((data: { email: string }) => data)
+  .handler(async ({ data }) => {
+    const { networkContacts, buildAttentionQueue, hasOpenFollowUp } =
+      await import("@/lib/attention-queue");
+    const { teamProfile } = await import("@/lib/user-ownership");
+    const profile = teamProfile(data.email);
+    const mine = networkContacts(await buildMyContactsServer(data.email));
+    const queue = buildAttentionQueue(mine);
+    return {
+      firstName: profile?.firstName || "there",
+      displayName: profile?.displayName || data.email,
+      myContactCount: mine.length,
+      openFollowUps: mine.filter(hasOpenFollowUp).length,
+      attention: queue.slice(0, 4),
+      attentionTotal: queue.length,
+      ownedGids: (await buildOwnershipIndexServer(data.email)).ownedGids,
+    };
+  });
+
+/** Contacts attributed to the signed-in user (for Network “My contacts”). */
+export const fetchMyContacts = createServerFn({ method: "POST" })
+  .inputValidator((data: { email: string }) => data)
+  .handler(async ({ data }) => {
+    const { networkContacts } = await import("@/lib/attention-queue");
+    return networkContacts(await buildMyContactsServer(data.email));
+  });
+
 // Recent imports for the Import History panel (newest first).
 export const fetchImportHistory = createServerFn({ method: "GET" }).handler(async () =>
   buildImportHistory(),
+);
+
+// The per-action audit trail (Ops Log tab), newest first — powers the /activity view.
+export const fetchOpsLog = createServerFn({ method: "GET" }).handler(
+  async (): Promise<OpsLogEntry[]> => {
+    try {
+      return await buildOpsLogServer();
+    } catch (error) {
+      console.error("Failed to fetch ops log from Google Sheets:", error);
+      return [];
+    }
+  },
 );
 
 // Per-event synopses (#3). { eventNameLower: synopsis }. Empty on failure.
@@ -588,4 +1036,96 @@ export const logEmailActivity = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     await logEmailActivityServer(data);
     return { success: true };
+  });
+
+/**
+ * Close the loop when a drafted email is opened/sent: Notes trail + Email
+ * Activity + Ops Log. Used by EmailDraftDialog so every entry point (CRM,
+ * Signals, Targeting, Home) persists the same way.
+ */
+export const recordEmailSent = createServerFn({ method: "POST" })
+  .inputValidator(
+    (data: {
+      contactEmail: string;
+      contactName?: string;
+      subject: string;
+      emailType: string;
+      linkedPortcos?: string[];
+      linkedEvent?: string;
+      urid?: string;
+    }) => data,
+  )
+  .handler(async ({ data }) => {
+    const email = (data.contactEmail || "").split(";")[0]?.trim() || "";
+    if (!email) return { ok: false as const, error: "No contact email" };
+
+    const portcos = (data.linkedPortcos || []).map((p) => p.trim()).filter(Boolean);
+    const tag =
+      portcos.length > 0
+        ? ` [PortCo: ${portcos.join(", ")}]`
+        : data.linkedEvent
+          ? ` [Event: ${data.linkedEvent}]`
+          : data.emailType && data.emailType !== "General"
+            ? ` [${data.emailType}]`
+            : "";
+    const subject = (data.subject || "").trim();
+    const summary =
+      (subject ? `Email sent: ${subject}` : `Email sent to ${email}`) + tag;
+    const today = new Date().toISOString().slice(0, 10);
+    const sourceRef = `email-sent:${email.toLowerCase()}:${today}:${subject.slice(0, 80).toLowerCase()}`;
+
+    await appendInteractionRows([
+      {
+        email,
+        date: today,
+        summary,
+        type: "email",
+        requiresFollowUp: false,
+        urid: data.urid,
+        sourceRef,
+      },
+    ]);
+
+    await logEmailActivityServer({
+      contactEmail: email,
+      subject,
+      emailType: data.emailType || "General",
+      linkedPortco: portcos.join("; ") || undefined,
+      linkedEvent: data.linkedEvent,
+    });
+
+    if (data.linkedEvent?.trim()) {
+      try {
+        await ensureEventAttendanceBatch([
+          {
+            email,
+            eventName: data.linkedEvent.trim(),
+            date: today,
+            type: "invited",
+            urid: data.urid,
+            ensureCatalog: true,
+            catalogType: "meeting",
+          },
+        ]);
+      } catch (e) {
+        console.error("[recordEmailSent] event attendance failed:", e);
+      }
+    }
+
+    await logOpsEventServer({
+      action: "sync",
+      source: "email_sent",
+      status: "ok",
+      summary: `Email sent · ${data.contactName || email} · ${subject || "(no subject)"}`,
+      records: 1,
+      details: {
+        email,
+        emailType: data.emailType || "General",
+        portcos: portcos.join("; ") || "",
+        event: data.linkedEvent || "",
+      },
+      items: [`${email} ← ${summary}`],
+    });
+
+    return { ok: true as const, summary };
   });

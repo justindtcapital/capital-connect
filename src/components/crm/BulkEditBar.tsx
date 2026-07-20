@@ -143,7 +143,7 @@ export function BulkEditBar() {
         return;
       }
       toast.success(
-        `Tech stack loaded for ${res.updated} contact${res.updated !== 1 ? "s" : ""} across ${res.resolved}/${res.companies} companies` +
+        `Tech stack saved for ${res.updated} contact${res.updated !== 1 ? "s" : ""} across ${res.resolved}/${res.companies} companies` +
           (res.creditsRemaining !== undefined ? ` · ${res.creditsRemaining} Sumble credits left` : ""),
       );
       await router.invalidate();
@@ -346,9 +346,10 @@ export function BulkEditBar() {
           <AlertDialogHeader>
             <AlertDialogTitle>Load tech stack for {count} contact{count !== 1 ? "s" : ""}?</AlertDialogTitle>
             <AlertDialogDescription>
-              This queries Sumble for {uniqueCompanies} unique compan{uniqueCompanies !== 1 ? "ies" : "y"}
-              {" "}(deduped, so shared employers are priced once) and writes each company's top
-              technologies to the contacts' “Tech Stack” column. Sumble job lookups consume credits.
+              This queries Sumble for {uniqueCompanies} unique compan{uniqueCompanies !== 1 ? "ies" : "y"}{" "}
+              (deduped, so shared employers are priced once) and saves each company's technologies —
+              including PortCo overlap notes — to the contacts' “Tech Stack” column so you can reopen
+              and act on them later. Sumble job lookups consume credits.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

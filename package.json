@@ -9,7 +9,8 @@
     "build:dev": "vite build --mode development",
     "preview": "vite preview",
     "lint": "eslint .",
-    "format": "prettier --write ."
+    "format": "prettier --write .",
+    "inngest:dev": "npx inngest-cli@latest dev -u http://localhost:8080/api/inngest"
   },
   "dependencies": {
     "@cloudflare/vite-plugin": "^1.25.5",
@@ -52,6 +53,7 @@
     "date-fns": "^4.1.0",
     "embla-carousel-react": "^8.6.0",
     "google-auth-library": "^10.7.0",
+    "inngest": "^4.12.1",
     "input-otp": "^1.4.2",
     "lucide-react": "^0.575.0",
     "nitro": "3.0.260603-beta",

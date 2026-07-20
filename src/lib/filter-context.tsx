@@ -13,6 +13,7 @@ export const defaultFilters: ContactFilters = {
   title: "",
   location: [],
   followUpOnly: false,
+  ownershipScope: "mine",
   dateField: "added",
   dateFrom: "",
   dateTo: "",

@@ -1,6 +1,6 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useMemo, useState } from "react";
-import { scanSignals, fetchSignals } from "@/utils/gemini.functions";
+import { useEffect, useMemo, useState } from "react";
+import { scanSignals, fetchSignals, fetchSignalBody } from "@/utils/gemini.functions";
 import { fetchLinkedInFeed } from "@/utils/linkedin.functions";
 import { fetchDriveDocs } from "@/utils/drive.functions";
 import { fetchGmailFeed } from "@/utils/gmail.functions";
@@ -14,6 +14,7 @@ import {
   INDUSTRIES,
   type FeedCard,
 } from "@/lib/signal-feed";
+import { companyLogoSources } from "@/lib/domain-utils";
 import type { ScoredTarget } from "@/utils/broadcast.functions";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -36,12 +37,14 @@ import {
   AlertTriangle,
   Loader2,
   Newspaper,
-  Megaphone,
+  Share2,
   Search,
   X,
   ChevronDown,
   ChevronRight,
   Building2,
+  Mail,
+  FileText,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -72,23 +75,29 @@ export const Route = createFileRoute("/signals")({
 });
 
 const sourceTypeClass: Record<string, string> = {
-  "Portco Blog": "bg-emerald-50 text-emerald-700 border-emerald-200",
-  "Public News Articles": "bg-sky-50 text-sky-700 border-sky-200",
-  "Press Release": "bg-blue-50 text-blue-700 border-blue-200",
+  "PortCo Blogs": "bg-emerald-50 text-emerald-700 border-emerald-200",
+  "PortCo News": "bg-sky-50 text-sky-700 border-sky-200",
+  "Industry Reports": "bg-amber-50 text-amber-700 border-amber-200",
+  "Industry News": "bg-indigo-50 text-indigo-700 border-indigo-200",
   LinkedIn: "bg-[#0a66c2]/5 text-[#0a66c2] border-[#0a66c2]/20",
-  Email: "bg-rose-50 text-rose-700 border-rose-200",
-  "Internal Report": "bg-amber-50 text-amber-700 border-amber-200",
-  "Industry Analysis": "bg-indigo-50 text-indigo-700 border-indigo-200",
 };
 
 const segmentClass: Record<string, string> = {
   Security: "bg-red-50 text-red-700 border-red-200",
   AI: "bg-violet-50 text-violet-700 border-violet-200",
   Data: "bg-blue-50 text-blue-700 border-blue-200",
+  "Supply Chain": "bg-teal-50 text-teal-700 border-teal-200",
   Cloud: "bg-cyan-50 text-cyan-700 border-cyan-200",
 };
 
-const DATE_RANGES: Record<string, number> = { "30": 30, "90": 90, "180": 180 };
+// Time filter windows (max age in days). "120+" has no upper bound → show all.
+const DATE_RANGES: Record<string, number> = {
+  "1": 1,
+  "7": 7,
+  "30": 30,
+  "60": 60,
+  "90": 90,
+};
 
 // ── Grounded score chips ─────────────────────────────────────────
 function oppClass(score: number): string {
@@ -177,19 +186,27 @@ function ScoreStrip({ card }: { card: FeedCard }) {
 }
 
 function CompanyAvatar({ card }: { card: FeedCard }) {
-  // Logo source ladder: Clearbit logo → Google favicon → initials.
   const [stage, setStage] = useState(0);
   const d = card.logoDomain;
-  if (d && stage < 2) {
-    const src =
-      stage === 0
-        ? `https://logo.clearbit.com/${d}`
-        : `https://www.google.com/s2/favicons?domain=${encodeURIComponent(d)}&sz=128`;
+  const confidence = card.logoConfident === false ? "low" : "high";
+  const sources = useMemo(
+    () => (d ? companyLogoSources(d, confidence) : []),
+    [d, confidence],
+  );
+  useEffect(() => {
+    setStage(0);
+  }, [sources.join("|")]);
+
+  if (d && stage < sources.length) {
+    const src = sources[stage];
     return (
       <img
+        key={src}
         src={src}
         alt=""
         className="h-9 w-9 rounded-md border border-border object-contain bg-white shrink-0"
+        referrerPolicy="no-referrer"
+        loading="lazy"
         onError={() => setStage((s) => s + 1)}
       />
     );
@@ -208,6 +225,15 @@ function FilterGroup({ title, children }: { title: string; children: React.React
         {title}
       </div>
       {children}
+    </div>
+  );
+}
+
+// Groups the filter rail into the user's top-level buckets (PortCo / Industry).
+function SectionHeader({ title }: { title: string }) {
+  return (
+    <div className="pt-1 border-b border-border pb-1 text-[11px] font-bold uppercase tracking-wider text-foreground/80">
+      {title}
     </div>
   );
 }
@@ -248,13 +274,33 @@ function SignalsPage() {
 
   // Filters (search seeded from a `?q=` deep-link, e.g. from the home page).
   const [search, setSearch] = useState(focusQuery ?? "");
-  const [dateRange, setDateRange] = useState("all");
+  const [dateRange, setDateRange] = useState("120"); // "120" = 120+ days = all
   const [sourceSel, setSourceSel] = useState<string[]>([]);
   const [segSel, setSegSel] = useState<string[]>([]);
   const [coSel, setCoSel] = useState<string[]>([]);
+  const [invSel, setInvSel] = useState<string[]>([]);
   const [indSel, setIndSel] = useState<string[]>([]);
+  const [keyCompaniesOnly, setKeyCompaniesOnly] = useState(false);
 
   const [expanded, setExpanded] = useState<string | null>(null);
+
+  // Lazily-fetched outreach bodies (elided from the feed load to keep it light),
+  // keyed by card id, plus in-flight tracking.
+  const [bodies, setBodies] = useState<Record<string, string>>({});
+  const [bodyBusy, setBodyBusy] = useState<Record<string, boolean>>({});
+
+  const loadBody = async (card: FeedCard) => {
+    if (!card.storedId || bodies[card.id] != null || bodyBusy[card.id]) return;
+    setBodyBusy((b) => ({ ...b, [card.id]: true }));
+    try {
+      const r = await fetchSignalBody({ data: { id: card.storedId } });
+      setBodies((m) => ({ ...m, [card.id]: r.body || "" }));
+    } catch {
+      setBodies((m) => ({ ...m, [card.id]: "" }));
+    } finally {
+      setBodyBusy((b) => ({ ...b, [card.id]: false }));
+    }
+  };
 
   // Broadcast + email dialogs
   const [broadcastCard, setBroadcastCard] = useState<FeedCard | null>(null);
@@ -288,6 +334,16 @@ function SignalsPage() {
     return [...list].map((p) => p.name).sort((a, b) => a.localeCompare(b));
   }, [portfolio, segSel]);
 
+  // DTC investor names, from the portfolio companies' "Lead Investor" Asana field.
+  const investors = useMemo(() => {
+    const set = new Set<string>();
+    for (const p of portfolio ?? []) {
+      const raw = p.asanaFields?.["Lead Investor"]?.trim();
+      if (raw) set.add(raw);
+    }
+    return [...set].sort((a, b) => a.localeCompare(b));
+  }, [portfolio]);
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     const minTs = dateRange in DATE_RANGES ? Date.now() - DATE_RANGES[dateRange] * 86_400_000 : 0;
@@ -297,7 +353,9 @@ function SignalsPage() {
       if (sourceSel.length && !sourceSel.includes(c.sourceType)) return false;
       if (segSel.length && !segSel.includes(c.segmentBucket)) return false;
       if (coSel.length && !coSel.includes(c.company)) return false;
+      if (invSel.length && (!c.investor || !invSel.includes(c.investor))) return false;
       if (indSel.length && (!c.industry || !indSel.includes(c.industry))) return false;
+      if (keyCompaniesOnly && !(c.insight && c.insight.scores.network.count > 0)) return false;
       return true;
     });
     if (sortBy === "opportunity") {
@@ -307,22 +365,26 @@ function SignalsPage() {
       );
     }
     return out;
-  }, [feed, search, dateRange, sourceSel, segSel, coSel, indSel, sortBy]);
+  }, [feed, search, dateRange, sourceSel, segSel, coSel, invSel, indSel, keyCompaniesOnly, sortBy]);
 
   const activeFilters =
     sourceSel.length +
     segSel.length +
     coSel.length +
+    invSel.length +
     indSel.length +
     (search ? 1 : 0) +
-    (dateRange !== "all" ? 1 : 0);
+    (dateRange !== "120" ? 1 : 0) +
+    (keyCompaniesOnly ? 1 : 0);
   const clearFilters = () => {
     setSearch("");
-    setDateRange("all");
+    setDateRange("120");
     setSourceSel([]);
     setSegSel([]);
     setCoSel([]);
+    setInvSel([]);
     setIndSel([]);
+    setKeyCompaniesOnly(false);
   };
   const toggle = (arr: string[], set: (v: string[]) => void, val: string) =>
     set(arr.includes(val) ? arr.filter((x) => x !== val) : [...arr, val]);
@@ -385,15 +447,22 @@ function SignalsPage() {
     setDraftOpen(true);
   };
 
-  // Email the person already attached to a recommendation card.
-  const emailRecPerson = (card: FeedCard) => {
-    if (!card.email) return;
+  // Email a network connection surfaced on a card (the attached person or anyone
+  // in the "who might care" list) — seeds EmailDraftDialog with the signal.
+  const emailConnection = (
+    card: FeedCard,
+    conn: { name?: string; title?: string; email?: string },
+  ) => {
+    if (!conn.email) {
+      toast.error("No email on file for this contact.");
+      return;
+    }
     setDraftContact({
-      id: `signal-${card.email}`,
-      name: card.person || "",
-      title: "",
+      id: `signal-${conn.email}`,
+      name: conn.name || "",
+      title: conn.title || "",
       company: card.company,
-      email: card.email,
+      email: conn.email,
       phone: "",
       address: "",
       prime: "",
@@ -412,6 +481,22 @@ function SignalsPage() {
     setDraftOpen(true);
   };
 
+  // The "who might care" connections shown at the bottom of an expanded card:
+  // the attached person plus any network contacts at the company (deduped).
+  const connectionsFor = (card: FeedCard): { name: string; title: string; email: string }[] => {
+    const out: { name: string; title: string; email: string }[] = [];
+    const seen = new Set<string>();
+    const add = (name: string, title: string, email: string) => {
+      const key = (email || name).toLowerCase();
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      out.push({ name, title, email });
+    };
+    if (card.email) add(card.person || "Contact", "", card.email);
+    for (const c of card.insight?.scores.network.contacts ?? []) add(c.name, c.title, c.email);
+    return out;
+  };
+
   const nothingAtAll = feed.length === 0;
 
   return (
@@ -424,7 +509,7 @@ function SignalsPage() {
           </h1>
           <p className="text-xs text-muted-foreground mt-0.5">
             Real signals across your network — Gemini web-search + LinkedIn + shared-drive docs,
-            with one-click Broadcast.
+            with one-click Share.
           </p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
@@ -479,21 +564,23 @@ function SignalsPage() {
             </div>
           </FilterGroup>
 
-          <FilterGroup title="Date range">
+          <FilterGroup title="Time">
             <Select value={dateRange} onValueChange={setDateRange}>
               <SelectTrigger className="h-9 text-xs">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="all">All time</SelectItem>
-                <SelectItem value="30">Last 30 days</SelectItem>
+                <SelectItem value="1">Last day</SelectItem>
+                <SelectItem value="7">Last week</SelectItem>
+                <SelectItem value="30">Last month</SelectItem>
+                <SelectItem value="60">Last 60 days</SelectItem>
                 <SelectItem value="90">Last 90 days</SelectItem>
-                <SelectItem value="180">Last 180 days</SelectItem>
+                <SelectItem value="120">Last 120+ days</SelectItem>
               </SelectContent>
             </Select>
           </FilterGroup>
 
-          <FilterGroup title="Source type">
+          <FilterGroup title="Sources">
             {SOURCE_TYPES.map((s) => (
               <CheckRow
                 key={s}
@@ -503,6 +590,8 @@ function SignalsPage() {
               />
             ))}
           </FilterGroup>
+
+          <SectionHeader title="PortCo Filters" />
 
           <FilterGroup title="Segment">
             {SEGMENTS.map((s) => (
@@ -515,7 +604,7 @@ function SignalsPage() {
             ))}
           </FilterGroup>
 
-          <FilterGroup title="Portfolio company">
+          <FilterGroup title="Port Co">
             {companies.length > 0 ? (
               <div className="max-h-56 overflow-auto rounded-md border border-border p-2">
                 {companies.map((s) => (
@@ -534,6 +623,27 @@ function SignalsPage() {
             )}
           </FilterGroup>
 
+          <FilterGroup title="Investor">
+            {investors.length > 0 ? (
+              <div className="max-h-56 overflow-auto rounded-md border border-border p-2">
+                {investors.map((s) => (
+                  <CheckRow
+                    key={s}
+                    checked={invSel.includes(s)}
+                    onChange={() => toggle(invSel, setInvSel, s)}
+                    label={s}
+                  />
+                ))}
+              </div>
+            ) : (
+              <p className="text-[11px] text-muted-foreground">
+                No investors on the portfolio records yet.
+              </p>
+            )}
+          </FilterGroup>
+
+          <SectionHeader title="Industry Filters" />
+
           <FilterGroup title="Industry">
             {INDUSTRIES.map((s) => (
               <CheckRow
@@ -543,6 +653,14 @@ function SignalsPage() {
                 label={s}
               />
             ))}
+          </FilterGroup>
+
+          <FilterGroup title="Key companies">
+            <CheckRow
+              checked={keyCompaniesOnly}
+              onChange={setKeyCompaniesOnly}
+              label="Only companies in my network"
+            />
           </FilterGroup>
         </aside>
 
@@ -631,29 +749,48 @@ function SignalsPage() {
                   No signals match these filters.
                 </p>
               ) : (
-                <div className="mx-auto max-w-4xl space-y-3">
+                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3 items-start">
                   {filtered.map((card) => {
                     const isOpen = expanded === card.id;
                     return (
                       <article
                         key={card.id}
-                        className={`rounded-xl border bg-card overflow-hidden transition-colors ${
+                        className={`rounded-xl border bg-card overflow-hidden transition-colors flex flex-col ${
                           isOpen ? "border-primary/40 ring-1 ring-primary/20" : "border-border"
                         }`}
                       >
                         <button
                           type="button"
-                          onClick={() => setExpanded(isOpen ? null : card.id)}
-                          className="w-full text-left p-5 hover:bg-accent/30 transition-colors"
+                          onClick={() => {
+                            const opening = !isOpen;
+                            setExpanded(opening ? card.id : null);
+                            if (opening && card.bodyElided) loadBody(card);
+                          }}
+                          className="w-full text-left p-4 hover:bg-accent/30 transition-colors flex-1"
                         >
-                          <div className="flex items-start gap-4">
+                          <div className="flex items-start gap-3">
                             <CompanyAvatar card={card} />
                             <div className="min-w-0 flex-1">
-                              <div className="flex items-center gap-2 flex-wrap">
+                              <div className="flex items-center gap-1.5 flex-wrap">
                                 <span className="text-sm font-semibold text-foreground shrink-0">
                                   {card.company}
                                 </span>
-                                <span className="text-muted-foreground/60">·</span>
+                                <div className="ml-auto flex items-center gap-1.5 shrink-0">
+                                  {card.timeLabel && (
+                                    <span className="text-[11px] text-muted-foreground">
+                                      {card.timeLabel}
+                                    </span>
+                                  )}
+                                  <span className="text-muted-foreground">
+                                    {isOpen ? (
+                                      <ChevronDown className="h-4 w-4" />
+                                    ) : (
+                                      <ChevronRight className="h-4 w-4" />
+                                    )}
+                                  </span>
+                                </div>
+                              </div>
+                              <div className="flex items-center gap-1.5 flex-wrap mt-1.5">
                                 <Badge
                                   variant="outline"
                                   className={`text-[10px] ${sourceTypeClass[card.sourceType] || ""}`}
@@ -673,136 +810,132 @@ function SignalsPage() {
                                     {card.industry}
                                   </Badge>
                                 )}
-                                <div className="ml-auto flex items-center gap-2 shrink-0">
-                                  {card.timeLabel && (
-                                    <span className="text-[11px] text-muted-foreground">
-                                      {card.timeLabel}
-                                    </span>
-                                  )}
-                                  <span className="text-muted-foreground">
-                                    {isOpen ? (
-                                      <ChevronDown className="h-4 w-4" />
-                                    ) : (
-                                      <ChevronRight className="h-4 w-4" />
-                                    )}
-                                  </span>
-                                </div>
                               </div>
-                              <h3 className="text-lg font-bold tracking-tight mt-2 leading-snug">
+                              <h3 className="text-sm font-bold tracking-tight mt-2 leading-snug line-clamp-3">
                                 {card.headline}
                               </h3>
-                              {card.summary && (
-                                <p
-                                  className={`text-sm text-muted-foreground mt-1.5 ${
-                                    isOpen ? "" : "line-clamp-2"
-                                  }`}
-                                >
+                              {card.summary && !isOpen && (
+                                <p className="text-xs text-muted-foreground mt-1.5 line-clamp-3">
                                   {card.summary}
                                 </p>
+                              )}
+                              {!isOpen && card.insight?.scores && (
+                                <div className="mt-2">
+                                  <ScoreStrip card={card} />
+                                </div>
                               )}
                             </div>
                           </div>
                         </button>
 
                         {isOpen && (
-                          <div className="px-5 pb-5 pt-0 space-y-3 border-t border-border/60">
-                            <div className="pt-3">
-                              <ScoreStrip card={card} />
-                            </div>
-                            {card.insight && (
-                              <div className="pt-3 grid gap-2 sm:grid-cols-2">
-                                <div className="rounded-md border border-border bg-muted/20 p-2.5">
-                                  <div className="text-[10px] uppercase tracking-wider font-semibold text-primary mb-1">
-                                    Why now
-                                  </div>
-                                  <p className="text-xs text-foreground leading-snug">
-                                    {card.insight.whyNow}
-                                  </p>
-                                </div>
-                                <div className="rounded-md border border-border bg-muted/20 p-2.5">
-                                  <div className="text-[10px] uppercase tracking-wider font-semibold text-primary mb-1">
-                                    Why it matters
-                                  </div>
-                                  <p className="text-xs text-foreground leading-snug">
-                                    {card.insight.whyItMatters}
-                                  </p>
-                                </div>
-                              </div>
-                            )}
-
-                            {card.insight && card.insight.suggestedPortcos.length > 0 && (
-                              <div className="flex items-center gap-1.5 flex-wrap">
-                                <span className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground">
-                                  Suggested PortCos
-                                </span>
-                                {card.insight.suggestedPortcos.map((p) => (
-                                  <Badge
-                                    key={p}
-                                    variant="outline"
-                                    className="text-[10px] bg-primary/5 text-primary border-primary/20"
-                                  >
-                                    {p}
-                                  </Badge>
-                                ))}
-                              </div>
-                            )}
-
-                            {card.insight && card.insight.scores.network.contacts.length > 0 && (
-                              <div className="flex items-center gap-1.5 flex-wrap">
-                                <span className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground">
-                                  Who can intro
-                                </span>
-                                {card.insight.scores.network.contacts.map((c) => (
-                                  <Badge
-                                    key={c.email || c.name}
-                                    variant="secondary"
-                                    className="text-[10px]"
-                                  >
-                                    {c.name}
-                                    {c.title ? ` · ${c.title}` : ""}
-                                  </Badge>
-                                ))}
-                              </div>
-                            )}
-
-                            <div className="pt-1">
+                          <div className="border-t border-border/60">
+                            {/* Reading pane — the AI summary + link to the original, kept clean. */}
+                            <div className="px-4 pt-3 pb-4 space-y-3">
+                              {card.summary && (
+                                <p className="text-xs text-muted-foreground">{card.summary}</p>
+                              )}
                               <MarkdownMessage text={card.body || card.summary || "_No detail._"} />
-                            </div>
-                            <div className="flex items-center gap-2 flex-wrap pt-1">
-                              {card.sourceUrl && (
-                                <Button
-                                  asChild
-                                  variant="outline"
-                                  size="sm"
-                                  className="h-9"
-                                >
-                                  <a href={card.sourceUrl} target="_blank" rel="noopener noreferrer">
-                                    <ExternalLink className="h-4 w-4" />
-                                    {card.sourceIsSearch ? "Find source" : "Open source"}
+                              {card.bodyElided &&
+                                (bodyBusy[card.id] ? (
+                                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                                    <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading
+                                    outreach…
+                                  </div>
+                                ) : bodies[card.id] ? (
+                                  <MarkdownMessage text={bodies[card.id]} />
+                                ) : null)}
+                              <div className="flex items-center gap-2 flex-wrap">
+                                {card.sourceUrl && (
+                                  <a
+                                    href={card.sourceUrl}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="inline-flex items-center gap-1.5 text-xs font-medium text-primary hover:underline"
+                                  >
+                                    {card.sourceIsSearch ? "Find the original source" : "Read more"}
+                                    <ExternalLink className="h-3.5 w-3.5" />
                                   </a>
-                                </Button>
-                              )}
-                              <Button size="sm" className="h-9" onClick={() => setBroadcastCard(card)}>
-                                <Megaphone className="h-4 w-4" /> Broadcast
-                              </Button>
-                              {card.email && (
+                                )}
+                                {card.docUrl && card.docUrl !== card.sourceUrl && (
+                                  <a
+                                    href={card.docUrl}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="inline-flex items-center gap-1.5 text-xs font-medium text-primary hover:underline"
+                                    title="Archived copy saved to Drive"
+                                  >
+                                    Saved copy
+                                    <FileText className="h-3.5 w-3.5" />
+                                  </a>
+                                )}
                                 <Button
-                                  variant="outline"
                                   size="sm"
-                                  className="h-9"
-                                  onClick={() => emailRecPerson(card)}
+                                  className="h-8 ml-auto text-xs"
+                                  onClick={() => setBroadcastCard(card)}
                                 >
-                                  Email {card.person || "contact"}
+                                  <Share2 className="h-3.5 w-3.5" /> Share
                                 </Button>
-                              )}
-                              <Link
-                                to="/companies"
-                                search={{ c: card.company }}
-                                className="inline-flex items-center gap-1 h-9 px-3 rounded-md border border-border text-sm hover:bg-accent transition-colors"
-                              >
-                                <Building2 className="h-4 w-4" /> Company intel
-                              </Link>
+                              </div>
                             </div>
+
+                            {/* Why it matters + scoring + who might care — pushed to the bottom
+                                to preserve readability, actionable in place. */}
+                            {card.insight && (
+                              <div className="border-t border-border/60 bg-muted/20 px-4 py-3 space-y-3">
+                                {card.insight.whyItMatters && (
+                                  <div>
+                                    <div className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1">
+                                      Why it matters
+                                    </div>
+                                    <p className="text-xs text-foreground leading-snug">
+                                      {card.insight.whyItMatters}
+                                    </p>
+                                  </div>
+                                )}
+
+                                <ScoreStrip card={card} />
+
+                                {card.insight.suggestedPortcos.length > 0 && (
+                                  <div className="flex items-center gap-1.5 flex-wrap">
+                                    <span className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground">
+                                      PortCos that might care
+                                    </span>
+                                    {card.insight.suggestedPortcos.map((p) => (
+                                      <Link
+                                        key={p}
+                                        to="/companies"
+                                        search={{ c: p }}
+                                        className="inline-flex items-center gap-1 rounded-md border border-primary/20 bg-primary/5 px-1.5 py-0.5 text-[10px] text-primary hover:bg-primary/10 transition-colors"
+                                      >
+                                        <Building2 className="h-3 w-3" /> {p}
+                                      </Link>
+                                    ))}
+                                  </div>
+                                )}
+
+                                {connectionsFor(card).length > 0 && (
+                                  <div className="flex items-center gap-1.5 flex-wrap">
+                                    <span className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground">
+                                      Connections that might care
+                                    </span>
+                                    {connectionsFor(card).map((c) => (
+                                      <button
+                                        key={c.email || c.name}
+                                        type="button"
+                                        onClick={() => emailConnection(card, c)}
+                                        title={`Email ${c.name}`}
+                                        className="inline-flex items-center gap-1 rounded-md border border-border bg-card px-1.5 py-0.5 text-[10px] hover:bg-accent transition-colors"
+                                      >
+                                        <Mail className="h-3 w-3 text-muted-foreground" />
+                                        {c.name}
+                                        {c.title ? ` · ${c.title}` : ""}
+                                      </button>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            )}
                           </div>
                         )}
                       </article>

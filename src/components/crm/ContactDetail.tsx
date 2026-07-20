@@ -1,10 +1,27 @@
 import { useState } from "react";
-import { addNote, addEvent as addEventToSheet, addPortcoIntro, resolveFollowUp, mergeContactFields, storeApolloRaw, setContactRating, clearContactRatingOverride, logEmailActivity } from "@/utils/sheets.functions";
+import {
+  addNote,
+  addEvent as addEventToSheet,
+  addPortcoIntro,
+  setPortcoIntroSource,
+  resolveFollowUp,
+  mergeContactFields,
+  storeApolloRaw,
+  setContactRating,
+  clearContactRatingOverride,
+  logOpsEvent,
+} from "@/utils/sheets.functions";
 import { enrichContact } from "@/utils/apollo.functions";
 import type { ApolloEnrichmentResult } from "@/utils/apollo.server";
 import { toast } from "sonner";
-import type { Contact, Interaction, InteractionType, Temperature, EngagementSource } from "@/lib/types";
-import { ENGAGEMENT_SOURCES, CONTACT_TYPES, RECORD_SOURCES, isAsanaSourced, asanaTaskUrl } from "@/lib/types";
+import type {
+  Contact,
+  Interaction,
+  InteractionType,
+  Temperature,
+  EngagementSource,
+} from "@/lib/types";
+import { ENGAGEMENT_SOURCES, CONTACT_TYPES, RECORD_SOURCES, interactionSource } from "@/lib/types";
 import { inferInterestAreas } from "@/lib/interest-domains";
 import { suggestAreasOfInterest } from "@/utils/gemini.functions";
 import {
@@ -22,6 +39,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { TemperatureBadge } from "./TemperatureBadge";
 import { EngagementBreakdown } from "./EngagementScore";
 import { ContactAvatar } from "./ContactAvatar";
+import { LocationCombobox } from "@/components/ui/location-combobox";
 import {
   Building2,
   Mail,
@@ -106,7 +124,9 @@ function RatingControl({
     }
     setBusy(true);
     try {
-      const res = await setContactRating({ data: { email: contact.email, tier, urid: contact.urid } });
+      const res = await setContactRating({
+        data: { email: contact.email, tier, urid: contact.urid },
+      });
       if (res.success) {
         onContactUpdate?.({ ...contact, temperature: tier, ratingLocked: true });
         toast.success(`Rating set to ${tier} and locked.`);
@@ -170,7 +190,7 @@ function RatingControl({
         <DropdownMenuLabel className="text-[10px]">Set rating (locks it)</DropdownMenuLabel>
         {TIERS.map((t) => (
           <DropdownMenuItem key={t} onClick={() => setTier(t)}>
-            <TemperatureBadge temperature={t} className="mr-2" />
+            <TemperatureBadge temperature={t} className="mr-2" showLabel={false} />
             {t}
           </DropdownMenuItem>
         ))}
@@ -229,19 +249,30 @@ const interactionIcons: Record<InteractionType, typeof MessageSquare> = {
 // Consistent small outline button style for all action buttons
 const actionBtnClass = "h-7 text-[11px] font-medium";
 
-export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: ContactDetailProps) {
+export function ContactDetail({
+  contact,
+  open,
+  onOpenChange,
+  onContactUpdate,
+}: ContactDetailProps) {
   const { options: filterOpts } = useFilterOptions();
   const portfolioCompanies = filterOpts.portfolioCompanies;
   const [editing, setEditing] = useState(false);
   const [editData, setEditData] = useState<Partial<Contact>>({});
   const [addInteractionOpen, setAddInteractionOpen] = useState(false);
   const [editingInteractionId, setEditingInteractionId] = useState<string | null>(null);
-  const [editInteractionData, setEditInteractionData] = useState({ type: "" as InteractionType, summary: "" });
+  const [editInteractionData, setEditInteractionData] = useState({
+    type: "" as InteractionType,
+    summary: "",
+  });
   const [addPortCoOpen, setAddPortCoOpen] = useState(false);
   const [newPortCo, setNewPortCo] = useState("");
   const [newPortCoSource, setNewPortCoSource] = useState<EngagementSource>("direct introduction");
   const [addEventOpen, setAddEventOpen] = useState(false);
-  const [newEvent, setNewEvent] = useState({ name: "", type: "attended" as "attended" | "invited" });
+  const [newEvent, setNewEvent] = useState({
+    name: "",
+    type: "attended" as "attended" | "invited",
+  });
   const [addAreaOpen, setAddAreaOpen] = useState(false);
   const [newArea, setNewArea] = useState("");
   const [suggestingAreas, setSuggestingAreas] = useState(false);
@@ -254,7 +285,9 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
   const [enriching, setEnriching] = useState(false);
   const [apolloResult, setApolloResult] = useState<ApolloEnrichmentResult | null>(null);
   const [apolloReviewOpen, setApolloReviewOpen] = useState(false);
-  const [apolloMessage, setApolloMessage] = useState<{ title: string; description: string } | null>(null);
+  const [apolloMessage, setApolloMessage] = useState<{ title: string; description: string } | null>(
+    null,
+  );
   const [selectedFields, setSelectedFields] = useState<Record<string, boolean>>({});
   const [emailDraftOpen, setEmailDraftOpen] = useState(false);
   const { activities, loading: activitiesLoading } = useAsanaActivities();
@@ -302,11 +335,16 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
       result.phone
         ? {
             key: "phone",
-            label: result.phoneSource === "mobile" ? "Phone (Mobile)"
-              : result.phoneSource === "personal" ? "Phone (Personal)"
-              : result.phoneSource === "work" ? "Phone (Work Direct)"
-              : result.phoneSource === "company" ? "Phone (Company main)"
-              : "Phone",
+            label:
+              result.phoneSource === "mobile"
+                ? "Phone (Mobile)"
+                : result.phoneSource === "personal"
+                  ? "Phone (Personal)"
+                  : result.phoneSource === "work"
+                    ? "Phone (Work Direct)"
+                    : result.phoneSource === "company"
+                      ? "Phone (Company main)"
+                      : "Phone",
             apolloValue: result.phone,
             currentValue: contact.phone || "",
             contactField: "phone" as keyof Contact,
@@ -459,18 +497,23 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
     // Archive the full Apollo payload first so nothing is ever lost.
     if (apolloResult) {
       storeApolloRaw({ data: { email: primaryEmail, payload: apolloResult } }).catch((e) =>
-        console.error("Failed to archive Apollo payload:", e)
+        console.error("Failed to archive Apollo payload:", e),
       );
     }
 
     // Persist enriched fields through the non-destructive merge: Apollo never
     // overwrites a field you've edited by hand. Fields with a Contacts column:
-    // title, company, phone, location. LinkedIn has no column (UI-only).
+    // title, company, email, phone, location, LinkedIn.
+    // Email is also the merge match key, but the row is matched on the CURRENT
+    // email (primaryEmail) BEFORE this write, so writing a new value is safe.
     const sheetUpdates: Record<string, string | undefined> = {};
     if (typeof updates.title === "string") sheetUpdates.title = updates.title;
     if (typeof updates.company === "string") sheetUpdates.company = updates.company;
+    if (typeof updates.email === "string" && updates.email) sheetUpdates.email = updates.email;
     if (typeof updates.phone === "string") sheetUpdates.phone = updates.phone;
     if (typeof updates.location === "string") sheetUpdates.location = updates.location;
+    if (typeof updates.linkedinUrl === "string" && updates.linkedinUrl)
+      sheetUpdates.linkedinUrl = updates.linkedinUrl;
     // Sector: when applied, also send company so the merge can apply the
     // portfolio-company override ("Portfolio") server-side.
     if (typeof updates.sector === "string") {
@@ -490,6 +533,9 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
       .filter(Boolean)
       .join("; ");
     if (history) sheetUpdates.employmentHistory = history;
+    // Persist Apollo sync badge so it survives refresh.
+    sheetUpdates.apolloEnriched = "TRUE";
+    sheetUpdates.apolloEnrichedDate = updates.apolloEnrichedDate || new Date().toISOString().split("T")[0];
 
     if (Object.keys(sheetUpdates).length === 0) {
       toast.success(`Applied ${count} field${count !== 1 ? "s" : ""} from Apollo`);
@@ -505,15 +551,29 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
       });
       if (res.success) {
         const wrote = res.written.length;
-        toast.success(
-          `Saved ${wrote} field${wrote !== 1 ? "s" : ""} from Apollo to the sheet.`,
-        );
+        toast.success(`Saved ${wrote} field${wrote !== 1 ? "s" : ""} from Apollo to the sheet.`);
+        void logOpsEvent({
+          data: {
+            action: "enrich",
+            source: "contact_apollo",
+            status: "ok",
+            summary: `Apollo enrich · ${contact.name || primaryEmail} · ${wrote} field${wrote !== 1 ? "s" : ""}`,
+            records: wrote,
+            details: {
+              email: primaryEmail,
+              fields: res.written.join(", "),
+            },
+            items: res.written.map((f) => `${primaryEmail} · ${f}`),
+          },
+        }).catch((e) => console.error("logOpsEvent contact_apollo failed", e));
       } else {
         toast.warning("Couldn't find this contact's row to save — showing locally only.");
       }
     } catch (e) {
       console.error("Failed to save Apollo fields to Contacts sheet:", e);
-      toast.warning(`Applied ${count} field${count !== 1 ? "s" : ""} from Apollo locally — saving failed (see console)`);
+      toast.warning(
+        `Applied ${count} field${count !== 1 ? "s" : ""} from Apollo locally — saving failed (see console)`,
+      );
     }
   };
 
@@ -550,16 +610,30 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
     // fields could clobber good data with blanks. Email is the match key.
     const fields: Record<string, string | undefined> = {};
     if (editData.name !== undefined && editData.name !== contact.name) fields.name = editData.name;
-    if (editData.title !== undefined && editData.title !== contact.title) fields.title = editData.title;
-    if (editData.company !== undefined && editData.company !== contact.company) fields.company = editData.company;
-    if (editData.phone !== undefined && editData.phone !== contact.phone) fields.phone = editData.phone;
-    if (editData.prime !== undefined && editData.prime !== contact.prime) fields.prime = editData.prime;
-    if (editData.sector !== undefined && editData.sector !== contact.sector) fields.sector = editData.sector;
-    if (editData.contactType !== undefined && editData.contactType !== (contact.contactType || "")) fields.contactType = editData.contactType;
-    if (editData.source !== undefined && editData.source !== (contact.source || "Manual Entry")) fields.source = editData.source;
-    if (editData.sourceContext !== undefined && editData.sourceContext !== (contact.sourceContext || "")) fields.sourceContext = editData.sourceContext;
+    if (editData.title !== undefined && editData.title !== contact.title)
+      fields.title = editData.title;
+    if (editData.company !== undefined && editData.company !== contact.company)
+      fields.company = editData.company;
+    if (editData.phone !== undefined && editData.phone !== contact.phone)
+      fields.phone = editData.phone;
+    if (editData.prime !== undefined && editData.prime !== contact.prime)
+      fields.prime = editData.prime;
+    if (editData.sector !== undefined && editData.sector !== contact.sector)
+      fields.sector = editData.sector;
+    if (editData.contactType !== undefined && editData.contactType !== (contact.contactType || ""))
+      fields.contactType = editData.contactType;
+    if (editData.source !== undefined && editData.source !== (contact.source || "Manual Entry"))
+      fields.source = editData.source;
+    if (
+      editData.sourceContext !== undefined &&
+      editData.sourceContext !== (contact.sourceContext || "")
+    )
+      fields.sourceContext = editData.sourceContext;
+    if (editData.linkedinUrl !== undefined && editData.linkedinUrl !== (contact.linkedinUrl || ""))
+      fields.linkedinUrl = editData.linkedinUrl;
     const curLocation = contact.location || contact.address || "";
-    if (editData.address !== undefined && editData.address !== curLocation) fields.location = editData.address;
+    if (editData.address !== undefined && editData.address !== curLocation)
+      fields.location = editData.address;
 
     if (Object.keys(fields).length === 0) return;
     try {
@@ -589,9 +663,10 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
       isFollowUp: newInteraction.isFollowUp,
       followUpComplete: false,
     };
-    const updatedPortCoIntros = newInteraction.portCoIntro && !contact.portCoIntros.includes(newInteraction.portCoIntro)
-      ? [...contact.portCoIntros, newInteraction.portCoIntro]
-      : contact.portCoIntros;
+    const updatedPortCoIntros =
+      newInteraction.portCoIntro && !contact.portCoIntros.includes(newInteraction.portCoIntro)
+        ? [...contact.portCoIntros, newInteraction.portCoIntro]
+        : contact.portCoIntros;
     const updated = {
       ...contact,
       interactions: [interaction, ...contact.interactions],
@@ -605,9 +680,18 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
 
     // Write to Google Sheets
     try {
-      await addNote({ data: { contactEmail: contact.email, noteContent: interaction.summary, requiresFollowUp: newInteraction.isFollowUp, type: newInteraction.type } });
+      await addNote({
+        data: {
+          contactEmail: contact.email,
+          noteContent: interaction.summary,
+          requiresFollowUp: newInteraction.isFollowUp,
+          type: newInteraction.type,
+        },
+      });
       if (newInteraction.portCoIntro) {
-        await addPortcoIntro({ data: { contactEmail: contact.email, portcoName: newInteraction.portCoIntro } });
+        await addPortcoIntro({
+          data: { contactEmail: contact.email, portcoName: newInteraction.portCoIntro },
+        });
       }
     } catch (e) {
       console.error("Failed to write interaction to sheet:", e);
@@ -626,7 +710,7 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
       interactions: contact.interactions.map((i) =>
         i.id === editingInteractionId
           ? { ...i, type: editInteractionData.type, summary: editInteractionData.summary }
-          : i
+          : i,
       ),
     };
     if (onContactUpdate) onContactUpdate(updated);
@@ -640,16 +724,20 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
     const updated = {
       ...contact,
       interactions: contact.interactions.map((i) =>
-        i.id === interactionId ? { ...i, followUpComplete: newResolved } : i
+        i.id === interactionId ? { ...i, followUpComplete: newResolved } : i,
       ),
     };
-    updated.followUpPending = updated.interactions.some(
-      (i) => i.isFollowUp && !i.followUpComplete
-    );
+    updated.followUpPending = updated.interactions.some((i) => i.isFollowUp && !i.followUpComplete);
     if (onContactUpdate) onContactUpdate(updated);
 
     try {
-      await resolveFollowUp({ data: { contactEmail: contact.email, noteContent: interaction.summary, resolved: newResolved } });
+      await resolveFollowUp({
+        data: {
+          contactEmail: contact.email,
+          noteContent: interaction.summary,
+          resolved: newResolved,
+        },
+      });
     } catch (e) {
       console.error("Failed to update follow-up resolved in sheet:", e);
     }
@@ -684,12 +772,14 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
     if (!newEvent.name.trim()) return;
     const updated = {
       ...contact,
-      eventsAttended: newEvent.type === "attended"
-        ? [...contact.eventsAttended, newEvent.name]
-        : contact.eventsAttended,
-      eventsInvited: newEvent.type === "invited"
-        ? [...contact.eventsInvited, newEvent.name]
-        : contact.eventsInvited,
+      eventsAttended:
+        newEvent.type === "attended"
+          ? [...contact.eventsAttended, newEvent.name]
+          : contact.eventsAttended,
+      eventsInvited:
+        newEvent.type === "invited"
+          ? [...contact.eventsInvited, newEvent.name]
+          : contact.eventsInvited,
     };
     if (onContactUpdate) onContactUpdate(updated);
     const eventName = newEvent.name;
@@ -698,7 +788,14 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
     setAddEventOpen(false);
 
     try {
-      await addEventToSheet({ data: { contactEmail: contact.email, eventName, type: eventType } });
+      await addEventToSheet({
+        data: {
+          contactEmail: (contact.email || "").split(/[;,]/)[0]?.trim() || contact.email,
+          eventName,
+          type: eventType,
+          urid: contact.urid,
+        },
+      });
     } catch (e) {
       console.error("Failed to write event to sheet:", e);
     }
@@ -717,7 +814,8 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
           urid: contact.urid,
         },
       });
-      if (!res.success) toast.warning("Couldn't find this contact's row — change shown locally only.");
+      if (!res.success)
+        toast.warning("Couldn't find this contact's row — change shown locally only.");
     } catch (e) {
       console.error("Failed to save areas of interest:", e);
       toast.error("Saving areas of interest failed — see console.");
@@ -778,17 +876,40 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
     if (onContactUpdate) onContactUpdate(updated);
   };
 
+  // Reclassify a portfolio engagement's source inline (persisted in place).
+  const updatePortcoSource = async (co: string, source: EngagementSource) => {
+    const engagements = contact.portCoEngagements || [];
+    const nextEngagements = engagements.some((e) => e.portco === co)
+      ? engagements.map((e) => (e.portco === co ? { ...e, source } : e))
+      : [...engagements, { portco: co, date: new Date().toISOString().split("T")[0], source }];
+    if (onContactUpdate) onContactUpdate({ ...contact, portCoEngagements: nextEngagements });
+    try {
+      await setPortcoIntroSource({
+        data: { contactEmail: contact.email, portcoName: co, source, urid: contact.urid },
+      });
+    } catch (e) {
+      console.error("setPortcoIntroSource failed", e);
+      toast.error("Updated locally, but saving to the sheet failed — see console.");
+    }
+  };
+
   const removeEvent = (name: string, type: "attended" | "invited") => {
     const updated = {
       ...contact,
-      eventsAttended: type === "attended" ? contact.eventsAttended.filter((e) => e !== name) : contact.eventsAttended,
-      eventsInvited: type === "invited" ? contact.eventsInvited.filter((e) => e !== name) : contact.eventsInvited,
+      eventsAttended:
+        type === "attended"
+          ? contact.eventsAttended.filter((e) => e !== name)
+          : contact.eventsAttended,
+      eventsInvited:
+        type === "invited"
+          ? contact.eventsInvited.filter((e) => e !== name)
+          : contact.eventsInvited,
     };
     if (onContactUpdate) onContactUpdate(updated);
   };
 
   const sortedInteractions = [...contact.interactions].sort(
-    (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()
+    (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime(),
   );
 
   return (
@@ -828,7 +949,12 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                   <div className="flex items-center gap-1">
                     {editing ? (
                       <>
-                        <Button variant="ghost" size="sm" className={actionBtnClass} onClick={cancelEditing}>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className={actionBtnClass}
+                          onClick={cancelEditing}
+                        >
                           <X className="h-3 w-3 mr-1" />
                           Cancel
                         </Button>
@@ -839,13 +965,28 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                       </>
                     ) : (
                       <>
-                        <Button variant="outline" size="sm" className={actionBtnClass} onClick={startEditing}>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className={actionBtnClass}
+                          onClick={startEditing}
+                        >
                           <Pencil className="h-3 w-3 mr-1" />
                           Edit
                         </Button>
-                        <Button variant="outline" size="sm" className={actionBtnClass} onClick={handleEnrichWithApollo} disabled={enriching}>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className={actionBtnClass}
+                          onClick={handleEnrichWithApollo}
+                          disabled={enriching}
+                        >
                           <Telescope className="h-3 w-3 mr-1" />
-                          {enriching ? "Enriching…" : contact.apolloEnriched ? "Re-sync Apollo" : "Update with Apollo"}
+                          {enriching
+                            ? "Enriching…"
+                            : contact.apolloEnriched
+                              ? "Re-sync Apollo"
+                              : "Update with Apollo"}
                         </Button>
                       </>
                     )}
@@ -855,73 +996,150 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                 {editing ? (
                   <div className="grid grid-cols-2 gap-3">
                     <div>
-                      <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">Name</label>
-                      <Input className="h-8 text-sm" value={editData.name || ""} onChange={(e) => setEditData({ ...editData, name: e.target.value })} />
+                      <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+                        Name
+                      </label>
+                      <Input
+                        className="h-8 text-sm"
+                        value={editData.name || ""}
+                        onChange={(e) => setEditData({ ...editData, name: e.target.value })}
+                      />
                     </div>
                     <div>
-                      <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">Title</label>
-                      <Input className="h-8 text-sm" value={editData.title || ""} onChange={(e) => setEditData({ ...editData, title: e.target.value })} />
+                      <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+                        Title
+                      </label>
+                      <Input
+                        className="h-8 text-sm"
+                        value={editData.title || ""}
+                        onChange={(e) => setEditData({ ...editData, title: e.target.value })}
+                      />
                     </div>
                     <div>
-                      <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">Company</label>
-                      <Input className="h-8 text-sm" value={editData.company || ""} onChange={(e) => setEditData({ ...editData, company: e.target.value })} />
+                      <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+                        Company
+                      </label>
+                      <Input
+                        className="h-8 text-sm"
+                        value={editData.company || ""}
+                        onChange={(e) => setEditData({ ...editData, company: e.target.value })}
+                      />
                     </div>
                     <div>
-                      <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">Email</label>
-                      <Input className="h-8 text-sm" value={editData.email || ""} onChange={(e) => setEditData({ ...editData, email: e.target.value })} />
+                      <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+                        Email
+                      </label>
+                      <Input
+                        className="h-8 text-sm"
+                        value={editData.email || ""}
+                        onChange={(e) => setEditData({ ...editData, email: e.target.value })}
+                      />
                     </div>
                     <div>
-                      <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">Phone</label>
-                      <Input className="h-8 text-sm" value={editData.phone || ""} onChange={(e) => setEditData({ ...editData, phone: e.target.value })} />
+                      <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+                        Phone
+                      </label>
+                      <Input
+                        className="h-8 text-sm"
+                        value={editData.phone || ""}
+                        onChange={(e) => setEditData({ ...editData, phone: e.target.value })}
+                      />
                     </div>
                     <div>
-                      <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">Address</label>
-                      <Input className="h-8 text-sm" value={editData.address || ""} onChange={(e) => setEditData({ ...editData, address: e.target.value })} />
+                      <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+                        Location
+                      </label>
+                      <LocationCombobox
+                        value={editData.address || ""}
+                        onChange={(v) => setEditData({ ...editData, address: v })}
+                      />
                     </div>
                     <div>
-                      <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">Contact Prime</label>
-                      <Input className="h-8 text-sm" value={editData.prime || ""} onChange={(e) => setEditData({ ...editData, prime: e.target.value })} />
+                      <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+                        Contact Prime
+                      </label>
+                      <Input
+                        className="h-8 text-sm"
+                        value={editData.prime || ""}
+                        onChange={(e) => setEditData({ ...editData, prime: e.target.value })}
+                      />
                     </div>
                     <div>
-                      <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">Sector</label>
-                      <Input className="h-8 text-sm" value={editData.sector || ""} onChange={(e) => setEditData({ ...editData, sector: e.target.value })} />
+                      <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+                        Sector
+                      </label>
+                      <Input
+                        className="h-8 text-sm"
+                        value={editData.sector || ""}
+                        onChange={(e) => setEditData({ ...editData, sector: e.target.value })}
+                      />
                     </div>
                     <div>
-                      <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">Contact Type</label>
+                      <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+                        Contact Type
+                      </label>
                       <Select
                         value={editData.contactType || "none"}
-                        onValueChange={(v) => setEditData({ ...editData, contactType: v === "none" ? "" : v })}
+                        onValueChange={(v) =>
+                          setEditData({ ...editData, contactType: v === "none" ? "" : v })
+                        }
                       >
-                        <SelectTrigger className="h-8 text-sm"><SelectValue placeholder="—" /></SelectTrigger>
+                        <SelectTrigger className="h-8 text-sm">
+                          <SelectValue placeholder="—" />
+                        </SelectTrigger>
                         <SelectContent>
                           <SelectItem value="none">—</SelectItem>
                           {CONTACT_TYPES.map((t) => (
-                            <SelectItem key={t} value={t}>{t}</SelectItem>
+                            <SelectItem key={t} value={t}>
+                              {t}
+                            </SelectItem>
                           ))}
                         </SelectContent>
                       </Select>
                     </div>
                     <div className="col-span-2">
-                      <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">LinkedIn URL</label>
-                      <Input className="h-8 text-sm" value={editData.linkedinUrl || ""} onChange={(e) => setEditData({ ...editData, linkedinUrl: e.target.value })} placeholder="https://linkedin.com/in/..." />
+                      <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+                        LinkedIn URL
+                      </label>
+                      <Input
+                        className="h-8 text-sm"
+                        value={editData.linkedinUrl || ""}
+                        onChange={(e) => setEditData({ ...editData, linkedinUrl: e.target.value })}
+                        placeholder="https://linkedin.com/in/..."
+                      />
                     </div>
                     <div>
-                      <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">Source</label>
-                      <Select value={editData.source || "Manual Entry"} onValueChange={(v) => setEditData({ ...editData, source: v as Contact["source"] })}>
-                        <SelectTrigger className="h-8 text-sm"><SelectValue /></SelectTrigger>
+                      <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+                        Source
+                      </label>
+                      <Select
+                        value={editData.source || "Manual Entry"}
+                        onValueChange={(v) =>
+                          setEditData({ ...editData, source: v as Contact["source"] })
+                        }
+                      >
+                        <SelectTrigger className="h-8 text-sm">
+                          <SelectValue />
+                        </SelectTrigger>
                         <SelectContent>
                           {RECORD_SOURCES.map((s) => (
-                            <SelectItem key={s} value={s}>{s}</SelectItem>
+                            <SelectItem key={s} value={s}>
+                              {s}
+                            </SelectItem>
                           ))}
                         </SelectContent>
                       </Select>
                     </div>
                     <div className="col-span-2">
-                      <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">Source Context</label>
+                      <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+                        Source Context
+                      </label>
                       <Textarea
                         className="text-sm min-h-[56px]"
                         value={editData.sourceContext || ""}
-                        onChange={(e) => setEditData({ ...editData, sourceContext: e.target.value })}
+                        onChange={(e) =>
+                          setEditData({ ...editData, sourceContext: e.target.value })
+                        }
                         placeholder="Why surfaced — e.g. Uses Salesforce · Hiring security engineers"
                       />
                     </div>
@@ -990,7 +1208,8 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                     <div className="flex items-center gap-2 text-muted-foreground">
                       <User className="h-3.5 w-3.5 shrink-0" />
                       <span>
-                        <span className="font-medium text-foreground">{contact.prime}</span> (Contact Prime)
+                        <span className="font-medium text-foreground">{contact.prime}</span>{" "}
+                        (Contact Prime)
                       </span>
                       <FieldSource source={contact.fieldProvenance?.prime} />
                     </div>
@@ -1002,7 +1221,9 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                     {contact.contactType && (
                       <div className="flex items-center gap-2 text-muted-foreground">
                         <Tag className="h-3.5 w-3.5 shrink-0" />
-                        <Badge variant="secondary" className="text-[10px]">{contact.contactType}</Badge>
+                        <Badge variant="secondary" className="text-[10px]">
+                          {contact.contactType}
+                        </Badge>
                       </div>
                     )}
                     {contact.dateAdded && (
@@ -1014,7 +1235,12 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                     <div className="flex items-center gap-2 text-muted-foreground">
                       <Link2 className="h-3.5 w-3.5 shrink-0" />
                       {contact.linkedinUrl ? (
-                        <a href={contact.linkedinUrl} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline inline-flex items-center gap-1">
+                        <a
+                          href={contact.linkedinUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-primary hover:underline inline-flex items-center gap-1"
+                        >
                           LinkedIn Profile <ExternalLink className="h-3 w-3" />
                         </a>
                       ) : (
@@ -1031,12 +1257,19 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                     )}
                     <div className="flex items-center gap-2 text-muted-foreground">
                       <Search className="h-3.5 w-3.5 shrink-0" />
-                      <span>Source: <span className="font-medium text-foreground">{contact.source || "Manual Entry"}</span></span>
+                      <span>
+                        Source:{" "}
+                        <span className="font-medium text-foreground">
+                          {contact.source || "Manual Entry"}
+                        </span>
+                      </span>
                     </div>
                     {/* V2: supporting reasoning behind why this contact was surfaced. */}
                     {contact.sourceContext && (
                       <div className="mt-2 rounded-md border border-primary/20 bg-primary/5 p-2">
-                        <div className="text-[10px] uppercase tracking-wider font-semibold text-primary mb-0.5">Why surfaced</div>
+                        <div className="text-[10px] uppercase tracking-wider font-semibold text-primary mb-0.5">
+                          Why surfaced
+                        </div>
                         <div className="text-xs text-foreground">{contact.sourceContext}</div>
                       </div>
                     )}
@@ -1051,13 +1284,27 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                     Areas of Interest
                   </h3>
                   <div className="flex items-center gap-1.5">
-                    <Button variant="ghost" size="sm" className={actionBtnClass} onClick={() => void suggestAreas()} disabled={suggestingAreas} title="Infer domains from title + company">
-                      {suggestingAreas
-                        ? <Loader2 className="h-3 w-3 mr-1 animate-spin" />
-                        : <Sparkles className="h-3 w-3 mr-1" />}
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className={actionBtnClass}
+                      onClick={() => void suggestAreas()}
+                      disabled={suggestingAreas}
+                      title="Infer domains from title + company"
+                    >
+                      {suggestingAreas ? (
+                        <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                      ) : (
+                        <Sparkles className="h-3 w-3 mr-1" />
+                      )}
                       {suggestingAreas ? "Suggesting…" : "Suggest"}
                     </Button>
-                    <Button variant="outline" size="sm" className={actionBtnClass} onClick={() => setAddAreaOpen(true)}>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className={actionBtnClass}
+                      onClick={() => setAddAreaOpen(true)}
+                    >
                       <Plus className="h-3 w-3 mr-1" />
                       Add
                     </Button>
@@ -1066,7 +1313,11 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                 {contact.areasOfInterest.length > 0 ? (
                   <div className="flex flex-wrap gap-1.5">
                     {contact.areasOfInterest.map((area) => (
-                      <Badge key={area} variant="secondary" className="text-xs font-medium bg-accent border border-border text-foreground gap-1 pr-1">
+                      <Badge
+                        key={area}
+                        variant="secondary"
+                        className="text-xs font-medium bg-accent border border-border text-foreground gap-1 pr-1"
+                      >
                         {area}
                         <button
                           type="button"
@@ -1084,27 +1335,32 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                 )}
               </section>
 
-              {/* Tech Stack (contact's company, via Sumble) */}
+              {/* Tech Stack (contact's company, via Sumble — persisted to sheet) */}
               <section className="border-b border-border pb-6">
-                {contact.techStack ? (
-                  <div className="mb-4">
-                    <p className="text-xs font-medium text-muted-foreground mb-2">Tech Stack (loaded)</p>
-                    <div className="flex flex-wrap gap-1.5">
-                      {contact.techStack.split(",").map((t) => t.trim()).filter(Boolean).map((t) => (
-                        <span key={t} className="rounded-full bg-muted px-2 py-0.5 text-xs text-foreground">
-                          {t}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                ) : null}
-                <TechStackSection company={contact.company} email={primaryEmail} compact />
+                <TechStackSection
+                  company={contact.company}
+                  email={primaryEmail}
+                  title={contact.title}
+                  savedTechStack={contact.techStack}
+                  contactEmail={primaryEmail}
+                  contactUrid={contact.urid}
+                  onTechStackSaved={(serialized) => {
+                    onContactUpdate?.({ ...contact, techStack: serialized });
+                  }}
+                  compact
+                />
               </section>
 
               {/* BD / GTM activity from Asana, matched to this contact */}
               {(activitiesLoading || contactActivities.length > 0) && (
                 <section className="border-b border-border pb-6">
-                  <ActivitySection activities={contactActivities} loading={activitiesLoading} compact enableSourcing defaultCompany={contact.company} />
+                  <ActivitySection
+                    activities={contactActivities}
+                    loading={activitiesLoading}
+                    compact
+                    enableSourcing
+                    defaultCompany={contact.company}
+                  />
                 </section>
               )}
 
@@ -1114,7 +1370,12 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                   <h3 className="text-[10px] uppercase tracking-widest font-semibold text-muted-foreground">
                     Portfolio Engagement
                   </h3>
-                  <Button variant="outline" size="sm" className={actionBtnClass} onClick={() => setAddPortCoOpen(true)}>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className={actionBtnClass}
+                    onClick={() => setAddPortCoOpen(true)}
+                  >
                     <Plus className="h-3 w-3 mr-1" />
                     Add
                   </Button>
@@ -1122,7 +1383,9 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                 {contact.portCoIntros.length > 0 ? (
                   <div className="space-y-1.5">
                     {contact.portCoIntros.map((co) => {
-                      const src = (contact.portCoEngagements || []).find((e) => e.portco === co)?.source;
+                      const src = (contact.portCoEngagements || []).find(
+                        (e) => e.portco === co,
+                      )?.source;
                       return (
                         <div
                           key={co}
@@ -1130,9 +1393,23 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                         >
                           <div className="min-w-0">
                             <div className="text-xs font-medium text-primary truncate">{co}</div>
-                            {src && (
-                              <div className="text-[10px] text-muted-foreground capitalize">{src}</div>
-                            )}
+                            <Select
+                              value={src || "direct introduction"}
+                              onValueChange={(v) =>
+                                void updatePortcoSource(co, v as EngagementSource)
+                              }
+                            >
+                              <SelectTrigger className="h-4 mt-0.5 w-auto gap-1 border-0 bg-transparent px-0 text-[10px] capitalize text-muted-foreground shadow-none hover:text-foreground focus:ring-0 [&>svg]:h-3 [&>svg]:w-3">
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                {ENGAGEMENT_SOURCES.map((s) => (
+                                  <SelectItem key={s} value={s} className="text-xs capitalize">
+                                    {s}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
                           </div>
                           <button
                             type="button"
@@ -1157,18 +1434,29 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                   <h3 className="text-[10px] uppercase tracking-widest font-semibold text-muted-foreground">
                     Events
                   </h3>
-                  <Button variant="outline" size="sm" className={actionBtnClass} onClick={() => setAddEventOpen(true)}>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className={actionBtnClass}
+                    onClick={() => setAddEventOpen(true)}
+                  >
                     <Plus className="h-3 w-3 mr-1" />
                     Add Events
                   </Button>
                 </div>
                 <div className="grid grid-cols-2 gap-4">
                   <div>
-                    <p className="text-[10px] uppercase tracking-wider font-medium text-muted-foreground mb-2">Attended</p>
+                    <p className="text-[10px] uppercase tracking-wider font-medium text-muted-foreground mb-2">
+                      Attended
+                    </p>
                     {contact.eventsAttended.length > 0 ? (
                       <div className="flex flex-wrap gap-1.5">
                         {contact.eventsAttended.map((ev) => (
-                          <Badge key={ev} variant="outline" className="text-xs font-medium border-emerald-200 bg-emerald-50 text-emerald-700 gap-1 pr-1">
+                          <Badge
+                            key={ev}
+                            variant="outline"
+                            className="text-xs font-medium border-emerald-200 bg-emerald-50 text-emerald-700 gap-1 pr-1"
+                          >
                             {ev}
                             <button
                               type="button"
@@ -1186,11 +1474,17 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                     )}
                   </div>
                   <div>
-                    <p className="text-[10px] uppercase tracking-wider font-medium text-muted-foreground mb-2">Invited</p>
+                    <p className="text-[10px] uppercase tracking-wider font-medium text-muted-foreground mb-2">
+                      Invited
+                    </p>
                     {contact.eventsInvited.length > 0 ? (
                       <div className="flex flex-wrap gap-1.5">
                         {contact.eventsInvited.map((ev) => (
-                          <Badge key={`inv-${ev}`} variant="outline" className="text-xs font-medium gap-1 pr-1">
+                          <Badge
+                            key={`inv-${ev}`}
+                            variant="outline"
+                            className="text-xs font-medium gap-1 pr-1"
+                          >
                             {ev}
                             <button
                               type="button"
@@ -1233,8 +1527,10 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                   <div className="space-y-3">
                     {sortedInteractions.map((interaction) => {
                       const Icon = interactionIcons[interaction.type] || MessageSquare;
-                      const colorClass = interactionColors[interaction.type] || interactionColors.note;
-                      const readOnly = isAsanaSourced(interaction);
+                      const colorClass =
+                        interactionColors[interaction.type] || interactionColors.note;
+                      const source = interactionSource(interaction);
+                      const readOnly = source !== null;
                       const isEditingThis = editingInteractionId === interaction.id && !readOnly;
 
                       return (
@@ -1247,7 +1543,15 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                           <div className="flex-1 min-w-0">
                             {isEditingThis ? (
                               <div className="space-y-2">
-                                <Select value={editInteractionData.type} onValueChange={(v) => setEditInteractionData({ ...editInteractionData, type: v as InteractionType })}>
+                                <Select
+                                  value={editInteractionData.type}
+                                  onValueChange={(v) =>
+                                    setEditInteractionData({
+                                      ...editInteractionData,
+                                      type: v as InteractionType,
+                                    })
+                                  }
+                                >
                                   <SelectTrigger className="h-7 text-xs w-32">
                                     <SelectValue />
                                   </SelectTrigger>
@@ -1264,17 +1568,37 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                                 <Input
                                   className="h-7 text-xs"
                                   value={editInteractionData.summary}
-                                  onChange={(e) => setEditInteractionData({ ...editInteractionData, summary: e.target.value })}
+                                  onChange={(e) =>
+                                    setEditInteractionData({
+                                      ...editInteractionData,
+                                      summary: e.target.value,
+                                    })
+                                  }
                                 />
                                 <div className="flex gap-1">
-                                  <Button size="sm" className="h-6 text-[10px] px-2" onClick={saveInteractionEdit}>Save</Button>
-                                  <Button variant="ghost" size="sm" className="h-6 text-[10px] px-2" onClick={() => setEditingInteractionId(null)}>Cancel</Button>
+                                  <Button
+                                    size="sm"
+                                    className="h-6 text-[10px] px-2"
+                                    onClick={saveInteractionEdit}
+                                  >
+                                    Save
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="h-6 text-[10px] px-2"
+                                    onClick={() => setEditingInteractionId(null)}
+                                  >
+                                    Cancel
+                                  </Button>
                                 </div>
                               </div>
                             ) : (
                               <>
                                 <div className="flex items-center gap-2">
-                                  <span className={`text-xs font-medium capitalize px-1.5 py-0.5 rounded ${colorClass}`}>
+                                  <span
+                                    className={`text-xs font-medium capitalize px-1.5 py-0.5 rounded ${colorClass}`}
+                                  >
                                     {interaction.type}
                                   </span>
                                   <span className="text-[10px] text-muted-foreground">
@@ -1284,7 +1608,11 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                                     <button
                                       onClick={() => toggleFollowUpComplete(interaction.id)}
                                       className="flex items-center gap-1"
-                                      title={interaction.followUpComplete ? "Mark incomplete" : "Mark complete"}
+                                      title={
+                                        interaction.followUpComplete
+                                          ? "Mark incomplete"
+                                          : "Mark complete"
+                                      }
                                     >
                                       {interaction.followUpComplete ? (
                                         <CheckCircle2 className="h-4 w-4 text-emerald-600" />
@@ -1293,16 +1621,25 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                                       )}
                                     </button>
                                   )}
-                                  {readOnly ? (
-                                    <a
-                                      href={asanaTaskUrl(interaction.sourceRef)}
-                                      target="_blank"
-                                      rel="noopener noreferrer"
-                                      className="ml-auto inline-flex items-center gap-1 text-[9px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded-full border border-border text-muted-foreground hover:text-foreground"
-                                      title="Synced from Asana (read-only) — open the task"
-                                    >
-                                      Asana <ExternalLink className="h-2.5 w-2.5" />
-                                    </a>
+                                  {source ? (
+                                    source.url ? (
+                                      <a
+                                        href={source.url}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="ml-auto inline-flex items-center gap-1 text-[9px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded-full border border-border text-muted-foreground hover:text-foreground"
+                                        title={`Synced from ${source.label} (read-only) — open the source`}
+                                      >
+                                        {source.label} <ExternalLink className="h-2.5 w-2.5" />
+                                      </a>
+                                    ) : (
+                                      <span
+                                        className="ml-auto inline-flex items-center gap-1 text-[9px] uppercase tracking-wider font-medium px-1.5 py-0.5 rounded-full border border-border text-muted-foreground"
+                                        title={`Synced from ${source.label} (read-only)`}
+                                      >
+                                        {source.label}
+                                      </span>
+                                    )
                                   ) : (
                                     <button
                                       onClick={() => startEditingInteraction(interaction)}
@@ -1343,7 +1680,9 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
               </label>
               <Select
                 value={newInteraction.type}
-                onValueChange={(v) => setNewInteraction({ ...newInteraction, type: v as InteractionType })}
+                onValueChange={(v) =>
+                  setNewInteraction({ ...newInteraction, type: v as InteractionType })
+                }
               >
                 <SelectTrigger className="h-9 text-sm">
                   <SelectValue />
@@ -1374,7 +1713,9 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                   </SelectTrigger>
                   <SelectContent>
                     {portfolioCompanies.map((co) => (
-                      <SelectItem key={co} value={co}>{co}</SelectItem>
+                      <SelectItem key={co} value={co}>
+                        {co}
+                      </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
@@ -1401,7 +1742,10 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                   setNewInteraction({ ...newInteraction, isFollowUp: checked === true })
                 }
               />
-              <label htmlFor="is-followup" className="text-sm font-medium text-foreground cursor-pointer">
+              <label
+                htmlFor="is-followup"
+                className="text-sm font-medium text-foreground cursor-pointer"
+              >
                 Schedule as follow-up
               </label>
             </div>
@@ -1436,7 +1780,9 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                   {portfolioCompanies
                     .filter((co) => !contact.portCoIntros.includes(co))
                     .map((co) => (
-                      <SelectItem key={co} value={co}>{co}</SelectItem>
+                      <SelectItem key={co} value={co}>
+                        {co}
+                      </SelectItem>
                     ))}
                 </SelectContent>
               </Select>
@@ -1454,15 +1800,21 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                 </SelectTrigger>
                 <SelectContent>
                   {ENGAGEMENT_SOURCES.map((s) => (
-                    <SelectItem key={s} value={s} className="capitalize">{s}</SelectItem>
+                    <SelectItem key={s} value={s} className="capitalize">
+                      {s}
+                    </SelectItem>
                   ))}
                 </SelectContent>
               </Select>
             </div>
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setAddPortCoOpen(false)}>Cancel</Button>
-            <Button onClick={addPortCoIntro} disabled={!newPortCo}>Add</Button>
+            <Button variant="outline" onClick={() => setAddPortCoOpen(false)}>
+              Cancel
+            </Button>
+            <Button onClick={addPortCoIntro} disabled={!newPortCo}>
+              Add
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -1475,12 +1827,24 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
           </DialogHeader>
           <div className="space-y-3 py-2">
             <div>
-              <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">Event Name</label>
-              <EventPicker value={newEvent.name} onChange={(name) => setNewEvent({ ...newEvent, name })} />
+              <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+                Event Name
+              </label>
+              <EventPicker
+                value={newEvent.name}
+                onChange={(name) => setNewEvent({ ...newEvent, name })}
+              />
             </div>
             <div>
-              <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">Type</label>
-              <Select value={newEvent.type} onValueChange={(v) => setNewEvent({ ...newEvent, type: v as "attended" | "invited" })}>
+              <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+                Type
+              </label>
+              <Select
+                value={newEvent.type}
+                onValueChange={(v) =>
+                  setNewEvent({ ...newEvent, type: v as "attended" | "invited" })
+                }
+              >
                 <SelectTrigger className="h-9 text-sm">
                   <SelectValue />
                 </SelectTrigger>
@@ -1492,8 +1856,12 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
             </div>
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setAddEventOpen(false)}>Cancel</Button>
-            <Button onClick={addEventHandler} disabled={!newEvent.name.trim()}>Add Event</Button>
+            <Button variant="outline" onClick={() => setAddEventOpen(false)}>
+              Cancel
+            </Button>
+            <Button onClick={addEventHandler} disabled={!newEvent.name.trim()}>
+              Add Event
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -1513,8 +1881,12 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
             />
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setAddAreaOpen(false)}>Cancel</Button>
-            <Button onClick={addAreaOfInterest} disabled={!newArea.trim()}>Add</Button>
+            <Button variant="outline" onClick={() => setAddAreaOpen(false)}>
+              Cancel
+            </Button>
+            <Button onClick={addAreaOfInterest} disabled={!newArea.trim()}>
+              Add
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -1540,7 +1912,8 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
               {apolloResult && (
                 <>
                   <p className="text-sm text-muted-foreground">
-                    Select the fields you want to apply to <span className="font-medium text-foreground">{contact.name}</span>:
+                    Select the fields you want to apply to{" "}
+                    <span className="font-medium text-foreground">{contact.name}</span>:
                   </p>
                   {getEnrichmentFields(apolloResult).map((field) => {
                     const changed = field.apolloValue !== field.currentValue;
@@ -1561,20 +1934,31 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
                           ) : (
                             <div className="h-4 w-4 rounded-sm border border-border bg-muted" />
                           )}
-                          <label htmlFor={`apollo-${field.key}`} className="text-xs font-semibold uppercase tracking-wider text-muted-foreground cursor-pointer">
+                          <label
+                            htmlFor={`apollo-${field.key}`}
+                            className="text-xs font-semibold uppercase tracking-wider text-muted-foreground cursor-pointer"
+                          >
                             {field.label}
                           </label>
                           {changed && (
-                            <Badge variant="secondary" className="text-[10px] h-4 px-1.5">New</Badge>
+                            <Badge variant="secondary" className="text-[10px] h-4 px-1.5">
+                              New
+                            </Badge>
                           )}
                           {!field.canApply && (
-                            <Badge variant="outline" className="text-[10px] h-4 px-1.5">Preview only</Badge>
+                            <Badge variant="outline" className="text-[10px] h-4 px-1.5">
+                              Preview only
+                            </Badge>
                           )}
                         </div>
                         <div className="ml-6 space-y-0.5">
-                          <div className="text-sm font-medium text-foreground break-all">{field.apolloValue}</div>
+                          <div className="text-sm font-medium text-foreground break-all">
+                            {field.apolloValue}
+                          </div>
                           {field.currentValue && field.currentValue !== field.apolloValue && (
-                            <div className="text-xs text-muted-foreground line-through break-all">{field.currentValue}</div>
+                            <div className="text-xs text-muted-foreground line-through break-all">
+                              {field.currentValue}
+                            </div>
                           )}
                         </div>
                       </div>
@@ -1583,11 +1967,17 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
 
                   {apolloResult.employmentHistory && apolloResult.employmentHistory.length > 0 && (
                     <div className="rounded-md border border-border p-3 space-y-2">
-                      <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Employment History</div>
+                      <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                        Employment History
+                      </div>
                       {apolloResult.employmentHistory.map((job, i) => (
                         <div key={i} className="ml-2 text-sm">
                           <span className="font-medium">{job.title}</span> at {job.company}
-                          {job.current && <Badge variant="secondary" className="text-[10px] h-4 px-1.5 ml-2">Current</Badge>}
+                          {job.current && (
+                            <Badge variant="secondary" className="text-[10px] h-4 px-1.5 ml-2">
+                              Current
+                            </Badge>
+                          )}
                         </div>
                       ))}
                     </div>
@@ -1607,7 +1997,10 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
             >
               Close
             </Button>
-            <Button onClick={applySelectedApolloFields} disabled={!apolloResult || !Object.values(selectedFields).some(Boolean)}>
+            <Button
+              onClick={applySelectedApolloFields}
+              disabled={!apolloResult || !Object.values(selectedFields).some(Boolean)}
+            >
               Apply Selected
             </Button>
           </DialogFooter>
@@ -1620,13 +2013,14 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
         contact={contact}
         onSent={(info) => {
           const date = new Date().toISOString().split("T")[0];
-          const tag = info.linkedPortcos && info.linkedPortcos.length
-            ? ` [PortCo: ${info.linkedPortcos.join(", ")}]`
-            : info.linkedEvent
-              ? ` [Event: ${info.linkedEvent}]`
-              : info.emailType && info.emailType !== "General"
-                ? ` [${info.emailType}]`
-                : "";
+          const tag =
+            info.linkedPortcos && info.linkedPortcos.length
+              ? ` [PortCo: ${info.linkedPortcos.join(", ")}]`
+              : info.linkedEvent
+                ? ` [Event: ${info.linkedEvent}]`
+                : info.emailType && info.emailType !== "General"
+                  ? ` [${info.emailType}]`
+                  : "";
           const summary =
             (info.subject ? `Email sent: ${info.subject}` : `Email sent to ${primaryEmail}`) + tag;
           const interaction: Interaction = {
@@ -1637,27 +2031,13 @@ export function ContactDetail({ contact, open, onOpenChange, onContactUpdate }: 
             isFollowUp: false,
             followUpComplete: false,
           };
+          // Local UI only — Notes / Email Activity / Ops are written by
+          // EmailDraftDialog → recordEmailSent.
           onContactUpdate?.({
             ...contact,
             interactions: [interaction, ...contact.interactions],
             lastContact: date,
           });
-          // Persist: a note (shows in history, survives reload) + a structured
-          // Email Activity row for action tracking.
-          if (primaryEmail) {
-            addNote({
-              data: { contactEmail: primaryEmail, noteContent: summary, requiresFollowUp: false, type: "email" },
-            }).catch((e) => console.error("Failed to log email note:", e));
-            logEmailActivity({
-              data: {
-                contactEmail: primaryEmail,
-                subject: info.subject || "",
-                emailType: info.emailType,
-                linkedPortco: info.linkedPortcos?.join("; "),
-                linkedEvent: info.linkedEvent,
-              },
-            }).catch((e) => console.error("Failed to log email activity:", e));
-          }
         }}
       />
     </>

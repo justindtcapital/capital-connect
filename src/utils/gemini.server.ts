@@ -13,7 +13,6 @@
 // it all and the answer comes back empty. We therefore cap thinkingBudget and size
 // maxOutputTokens = answerTokens + thinkingBudget on every call (see genConfig).
 
-import { GoogleAuth } from "google-auth-library";
 import { getVertexProject, getVertexLocation, getServiceAccountJson } from "./google.server";
 
 export const GEMINI_MODEL = "gemini-2.5-flash";
@@ -37,9 +36,6 @@ function vertexUrl(model: string): string {
   return `https://${host}/v1/projects/${VERTEX_PROJECT}/locations/${VERTEX_LOCATION}/publishers/google/models/${model}:generateContent`;
 }
 
-// Cached GoogleAuth client — discovers credentials via ADC and refreshes tokens
-// internally, so getAccessToken() is cheap to call per request.
-let vertexAuth: GoogleAuth | null = null;
 // Parse a service-account JSON that may have been pasted with real newlines
 // inside the private_key (which is invalid JSON). We try strict parse first,
 // then fall back to escaping raw newlines that appear inside string values.
@@ -92,39 +88,113 @@ function parseServiceAccountJson(raw: string): Record<string, unknown> {
   }
 }
 
-async function getVertexToken(): Promise<string> {
-  if (!vertexAuth) {
-    const credsJson = getServiceAccountJson();
-    const opts: ConstructorParameters<typeof GoogleAuth>[0] = {
-      scopes: "https://www.googleapis.com/auth/cloud-platform",
-    };
-    if (credsJson) {
-      try {
-        const creds = parseServiceAccountJson(credsJson) as { private_key?: string };
-        // Normalize literal "\n" sequences in the private_key that some UIs
-        // strip newlines from — the PEM MUST have real newlines to decode.
-        if (
-          creds.private_key &&
-          !creds.private_key.includes("\n") &&
-          creds.private_key.includes("\\n")
-        ) {
-          creds.private_key = creds.private_key.replace(/\\n/g, "\n");
-        }
-        (opts as { credentials?: unknown }).credentials = creds;
-      } catch (e) {
-        throw new Error(
-          `GOOGLE_APPLICATION_CREDENTIALS_JSON is not valid JSON: ${e instanceof Error ? e.message : String(e)}`,
-        );
-      }
-    }
-    vertexAuth = new GoogleAuth(opts);
+type ServiceAccountCredentials = {
+  client_email?: string;
+  private_key?: string;
+  token_uri?: string;
+  project_id?: string;
+};
+
+let cachedVertexToken: { token: string; expiresAt: number } | null = null;
+
+function base64Url(input: string | Uint8Array): string {
+  const bytes = typeof input === "string" ? Buffer.from(input, "utf8") : Buffer.from(input);
+  return bytes.toString("base64").replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+}
+
+function pemToArrayBuffer(pem: string): ArrayBuffer {
+  const body = pem
+    .replace(/-----BEGIN PRIVATE KEY-----/g, "")
+    .replace(/-----END PRIVATE KEY-----/g, "")
+    .replace(/\s+/g, "");
+  return Buffer.from(body, "base64");
+}
+
+async function signJwtRs256(unsignedJwt: string, privateKeyPem: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "pkcs8",
+    pemToArrayBuffer(privateKeyPem),
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign(
+    "RSASSA-PKCS1-v1_5",
+    key,
+    new TextEncoder().encode(unsignedJwt),
+  );
+  return `${unsignedJwt}.${base64Url(new Uint8Array(signature))}`;
+}
+
+async function mintServiceAccountAccessToken(creds: ServiceAccountCredentials): Promise<string> {
+  const clientEmail = creds.client_email?.trim();
+  let privateKey = creds.private_key?.trim();
+  const tokenUri = creds.token_uri?.trim() || "https://oauth2.googleapis.com/token";
+
+  if (!clientEmail || !privateKey) {
+    throw new Error(
+      "GOOGLE_APPLICATION_CREDENTIALS_JSON must be the full service-account JSON, including client_email and private_key.",
+    );
   }
-  const token = await vertexAuth.getAccessToken();
-  if (!token)
+  if (!privateKey.includes("\n") && privateKey.includes("\\n")) {
+    privateKey = privateKey.replace(/\\n/g, "\n");
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const header = base64Url(JSON.stringify({ alg: "RS256", typ: "JWT" }));
+  const claims = base64Url(
+    JSON.stringify({
+      iss: clientEmail,
+      scope: "https://www.googleapis.com/auth/cloud-platform",
+      aud: tokenUri,
+      iat: now,
+      exp: now + 3600,
+    }),
+  );
+  const assertion = await signJwtRs256(`${header}.${claims}`, privateKey);
+
+  const res = await fetch(tokenUri, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion,
+    }),
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`Google service-account token refresh failed [${res.status}]: ${text}`);
+  }
+  const data = JSON.parse(text) as { access_token?: string; expires_in?: number };
+  if (!data.access_token) throw new Error("Google service-account token response missing access_token");
+  cachedVertexToken = {
+    token: data.access_token,
+    expiresAt: Date.now() + (data.expires_in ?? 3600) * 1000,
+  };
+  return data.access_token;
+}
+
+async function getVertexToken(): Promise<string> {
+  if (cachedVertexToken && Date.now() < cachedVertexToken.expiresAt - 60_000) {
+    return cachedVertexToken.token;
+  }
+
+  const credsJson = getServiceAccountJson();
+  if (!credsJson) {
     throw new Error(
       "Could not obtain a Google Cloud access token — set GOOGLE_APPLICATION_CREDENTIALS_JSON to a service-account key JSON",
     );
-  return token;
+  }
+
+  try {
+    const creds = parseServiceAccountJson(credsJson) as ServiceAccountCredentials;
+    return await mintServiceAccountAccessToken(creds);
+  } catch (e) {
+    if (e instanceof SyntaxError) {
+      throw new Error(`GOOGLE_APPLICATION_CREDENTIALS_JSON is not valid JSON: ${e.message}`);
+    }
+    throw e;
+  }
 }
 
 // ── Wire types (subset of the Gemini REST shape we use) ──────────

@@ -1313,6 +1313,26 @@ function TargetingPage() {
               </DropdownMenuContent>
             </DropdownMenu>
 
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="sm" className="text-xs">
+                  <Download className="h-3.5 w-3.5 mr-1.5" />
+                  Export
+                  <ChevronDown className="h-3.5 w-3.5 ml-1.5" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-44">
+                <DropdownMenuItem onClick={() => exportTargetsXlsx(filtered)}>
+                  <FileSpreadsheet className="h-3.5 w-3.5 mr-2" />
+                  Export as Excel
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => exportTargetsCsv(filtered)}>
+                  <FileText className="h-3.5 w-3.5 mr-2" />
+                  Export as CSV
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+
             <Button
               size="sm"
               className="text-xs"

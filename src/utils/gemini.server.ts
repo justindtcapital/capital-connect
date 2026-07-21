@@ -102,18 +102,18 @@ function base64Url(input: string | Uint8Array): string {
   return bytes.toString("base64").replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
 }
 
-function pemToArrayBuffer(pem: string): ArrayBuffer {
+function pemToPkcs8Bytes(pem: string): Uint8Array<ArrayBuffer> {
   const body = pem
     .replace(/-----BEGIN PRIVATE KEY-----/g, "")
     .replace(/-----END PRIVATE KEY-----/g, "")
     .replace(/\s+/g, "");
-  return Buffer.from(body, "base64");
+  return Uint8Array.from(Buffer.from(body, "base64"));
 }
 
 async function signJwtRs256(unsignedJwt: string, privateKeyPem: string): Promise<string> {
   const key = await crypto.subtle.importKey(
     "pkcs8",
-    pemToArrayBuffer(privateKeyPem),
+    pemToPkcs8Bytes(privateKeyPem),
     { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
     false,
     ["sign"],

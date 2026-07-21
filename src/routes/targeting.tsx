@@ -36,7 +36,11 @@ import {
   CheckCircle2,
   Trash2,
   Wrench,
+  Download,
+  FileSpreadsheet,
+  FileText,
 } from "lucide-react";
+import * as XLSX from "xlsx";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { ContactAvatar } from "@/components/crm/ContactAvatar";

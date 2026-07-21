@@ -265,6 +265,76 @@ function targetSortValue(t: TargetLead, key: TSortKey): string | number {
   }
 }
 
+const EXPORT_COLUMNS: { key: keyof TargetLead | "outreachCount"; label: string }[] = [
+  { key: "name", label: "Name" },
+  { key: "title", label: "Title" },
+  { key: "company", label: "Company" },
+  { key: "email", label: "Email" },
+  { key: "phone", label: "Phone" },
+  { key: "location", label: "Location" },
+  { key: "sector", label: "Sector" },
+  { key: "stage", label: "Stage" },
+  { key: "originSource", label: "Source" },
+  { key: "dateAdded", label: "Date Added" },
+  { key: "linkedinUrl", label: "LinkedIn URL" },
+  { key: "reasonSurfaced", label: "Reason Surfaced" },
+  { key: "notes", label: "Notes" },
+  { key: "outreachCount", label: "Outreach Attempts" },
+];
+
+function escapeCsvCell(value: string): string {
+  const text = String(value ?? "").replace(/"/g, '""');
+  if (/[",\n\r]/.test(text)) return `"${text}"`;
+  return text;
+}
+
+function buildTargetExportRows(targets: TargetLead[]): Record<string, string>[] {
+  return targets.map((t) => {
+    const row: Record<string, string> = {};
+    for (const col of EXPORT_COLUMNS) {
+      if (col.key === "outreachCount") {
+        row[col.label] = String(t.outreach.length);
+      } else {
+        const value = t[col.key as keyof TargetLead];
+        row[col.label] = Array.isArray(value)
+          ? value.map((o) => (typeof o === "object" ? `${o.method}: ${o.summary}` : String(o))).join("; ")
+          : String(value ?? "");
+      }
+    }
+    return row;
+  });
+}
+
+function downloadFile(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function exportTargetsCsv(targets: TargetLead[]) {
+  const rows = buildTargetExportRows(targets);
+  const headers = EXPORT_COLUMNS.map((c) => escapeCsvCell(c.label)).join(",");
+  const lines = rows.map((r) => EXPORT_COLUMNS.map((c) => escapeCsvCell(r[c.label])).join(","));
+  const csv = [headers, ...lines].join("\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const date = new Date().toISOString().split("T")[0];
+  downloadFile(blob, `targets-${date}.csv`);
+}
+
+function exportTargetsXlsx(targets: TargetLead[]) {
+  const rows = buildTargetExportRows(targets);
+  const worksheet = XLSX.utils.json_to_sheet(rows);
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, worksheet, "Targets");
+  const date = new Date().toISOString().split("T")[0];
+  XLSX.writeFile(workbook, `targets-${date}.xlsx`);
+}
+
 // Target card — mirrors the Network ContactCard layout (avatar + identity, an
 // email/location block, and a footer of stats) but with target-specific fields.
 function TargetCard({ target, onClick }: { target: TargetLead; onClick: () => void }) {

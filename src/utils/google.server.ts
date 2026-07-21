@@ -7,6 +7,31 @@ function present(v: string | undefined): boolean {
   return Boolean(v && v.trim());
 }
 
+function cleanSecret(value: string | undefined, names: string[]): string | undefined {
+  if (!value) return undefined;
+  let cleaned = value.trim().replace(/^\uFEFF/, "");
+
+  // Secret forms expect the raw value, but pasted .env lines like
+  // GOOGLE_REFRESH_TOKEN=1//... are easy to submit by mistake. Normalize those
+  // here so every Google consumer (Sheets, Drive, Gmail) keeps working.
+  for (const name of names) {
+    const prefix = `${name}=`;
+    if (cleaned.startsWith(prefix)) {
+      cleaned = cleaned.slice(prefix.length).trim();
+      break;
+    }
+  }
+
+  if (
+    (cleaned.startsWith('"') && cleaned.endsWith('"')) ||
+    (cleaned.startsWith("'") && cleaned.endsWith("'"))
+  ) {
+    cleaned = cleaned.slice(1, -1).trim();
+  }
+
+  return cleaned || undefined;
+}
+
 export interface GoogleOAuthCreds {
   clientId?: string;
   clientSecret?: string;
@@ -17,9 +42,15 @@ export interface GoogleOAuthCreds {
 // Accepts either the GOOGLE_* or GOOGLE_OAUTH_* naming.
 export function getGoogleOAuthCreds(): GoogleOAuthCreds {
   return {
-    clientId: process.env.GOOGLE_CLIENT_ID || process.env.GOOGLE_OAUTH_CLIENT_ID,
-    clientSecret: process.env.GOOGLE_CLIENT_SECRET || process.env.GOOGLE_OAUTH_CLIENT_SECRET,
-    refreshToken: process.env.GOOGLE_REFRESH_TOKEN,
+    clientId: cleanSecret(process.env.GOOGLE_CLIENT_ID || process.env.GOOGLE_OAUTH_CLIENT_ID, [
+      "GOOGLE_CLIENT_ID",
+      "GOOGLE_OAUTH_CLIENT_ID",
+    ]),
+    clientSecret: cleanSecret(process.env.GOOGLE_CLIENT_SECRET || process.env.GOOGLE_OAUTH_CLIENT_SECRET, [
+      "GOOGLE_CLIENT_SECRET",
+      "GOOGLE_OAUTH_CLIENT_SECRET",
+    ]),
+    refreshToken: cleanSecret(process.env.GOOGLE_REFRESH_TOKEN, ["GOOGLE_REFRESH_TOKEN"]),
   };
 }
 

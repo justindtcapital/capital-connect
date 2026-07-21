@@ -82,7 +82,9 @@ export function getVertexLocation(): string {
 // Inline service-account key JSON for Vertex auth (optional — ADC is the
 // fallback when this is unset).
 export function getServiceAccountJson(): string | undefined {
-  return process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
+  return cleanSecret(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON, [
+    "GOOGLE_APPLICATION_CREDENTIALS_JSON",
+  ]);
 }
 
 // One-line, value-free config summary for diagnosing the "could not refresh

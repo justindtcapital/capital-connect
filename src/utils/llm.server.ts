@@ -991,6 +991,11 @@ async function executeTool(
         relevance: get(r, "relevance"),
         urgency: get(r, "urgency"),
         sourceUrl: get(r, "source url"),
+        // Signals v2 event layer (blank on legacy rows).
+        eventId: get(r, "event id"),
+        materiality: get(r, "materiality"),
+        rankScore: get(r, "rank score"),
+        badges: get(r, "badges"),
       }));
       return {
         content: JSON.stringify({ count: lean.length, signals: lean }),

@@ -435,6 +435,7 @@ function configRows(cfg: SignalConfig): string[][] {
         detectedBeforePressAgeDays: cfg.fusion.detectedBeforePressAgeDays,
         detectedBeforePressMinConfidence: cfg.fusion.detectedBeforePressMinConfidence,
         detectedBeforePressBoost: cfg.fusion.detectedBeforePressBoost,
+        intelStateTaxonomy: cfg.fusion.intelStateTaxonomy,
       },
     ],
   ];

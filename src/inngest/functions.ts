@@ -90,4 +90,33 @@ export const dailyIntelSweep = inngest.createFunction(
   },
 );
 
-export const functions = [dailySignalScan, dailyIntelSweep];
+/**
+ * Nightly Signals v2 reconciliation at 9:30 PM America/New_York (WS3/WS5):
+ * late news↔intel merges, DETECTED BEFORE PRESS badging, constituent-row
+ * rescore sync. Also triggered by event `signals/reconcile.requested`
+ * (from POST /api/cron/signals-reconcile).
+ * Disable with SIGNALS_RECONCILE_ENABLED=false.
+ */
+export const nightlySignalsReconcile = inngest.createFunction(
+  {
+    id: "nightly-signals-reconcile",
+    name: "Nightly Signals Reconcile",
+    triggers: [
+      cron("TZ=America/New_York 30 21 * * *"),
+      { event: "signals/reconcile.requested" },
+    ],
+    retries: 2,
+  },
+  async ({ step }) => {
+    if ((process.env["SIGNALS_RECONCILE_ENABLED"] || "true").toLowerCase() === "false") {
+      return { skipped: true, reason: "SIGNALS_RECONCILE_ENABLED=false" };
+    }
+    const result = await step.run("signals-reconcile", async () => {
+      const { runSignalsReconcile } = await import("@/utils/signal-reconcile.server");
+      return runSignalsReconcile();
+    });
+    return result;
+  },
+);
+
+export const functions = [dailySignalScan, dailyIntelSweep, nightlySignalsReconcile];

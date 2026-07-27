@@ -47,6 +47,9 @@ import {
   Building2,
   Mail,
   FileText,
+  Zap,
+  BadgeCheck,
+  Layers,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -185,6 +188,59 @@ function ScoreStrip({ card }: { card: FeedCard }) {
       />
     </div>
   );
+}
+
+// ── Event badges (Signals v2) ────────────────────────────────────
+// DETECTED BEFORE PRESS is the alpha class — intel-engine evidence with no
+// press coverage yet — and renders visibly distinct from everything else.
+function EventBadges({ card }: { card: FeedCard }) {
+  const badges = card.badges ?? [];
+  const chips: React.ReactNode[] = [];
+  if (badges.includes("DETECTED_BEFORE_PRESS")) {
+    chips.push(
+      <span
+        key="dbp"
+        title="The intel engine measured this development directly — no press coverage exists yet. The firm knows before the market does."
+        className="inline-flex items-center gap-1 rounded-md border border-violet-400 bg-violet-600 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-white shadow-sm"
+      >
+        <Zap className="h-3 w-3" /> Detected before press
+      </span>,
+    );
+  }
+  if (badges.includes("CONFIRMED_BY_PRESS")) {
+    chips.push(
+      <span
+        key="cbp"
+        title="The intel engine detected this first; press coverage has since confirmed it."
+        className="inline-flex items-center gap-1 rounded-md border border-emerald-300 bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700"
+      >
+        <BadgeCheck className="h-3 w-3" /> Confirmed by press
+      </span>,
+    );
+  } else if (badges.includes("INTEL_CORROBORATED")) {
+    chips.push(
+      <span
+        key="ic"
+        title="Independent intel-engine observations corroborate this story."
+        className="inline-flex items-center gap-1 rounded-md border border-sky-300 bg-sky-50 px-1.5 py-0.5 text-[10px] font-semibold text-sky-700"
+      >
+        <BadgeCheck className="h-3 w-3" /> Intel corroborated
+      </span>,
+    );
+  }
+  if ((card.sourceCount ?? 1) > 1) {
+    chips.push(
+      <span
+        key="src"
+        title={`${card.sourceCount} corroborating sources collapsed into this card`}
+        className="inline-flex items-center gap-1 rounded-md border border-border bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
+      >
+        <Layers className="h-3 w-3" /> ×{card.sourceCount} sources
+      </span>,
+    );
+  }
+  if (chips.length === 0) return null;
+  return <div className="flex items-center gap-1.5 flex-wrap mt-1.5">{chips}</div>;
 }
 
 function CompanyAvatar({ card }: { card: FeedCard }) {
@@ -835,6 +891,7 @@ function SignalsPage() {
                                   </Badge>
                                 )}
                               </div>
+                              <EventBadges card={card} />
                               <h3 className="text-sm font-bold tracking-tight mt-2 leading-snug line-clamp-3">
                                 {card.headline}
                               </h3>

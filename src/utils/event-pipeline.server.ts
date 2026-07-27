@@ -10,13 +10,19 @@
 // stored. Clustering and every score are deterministic and reproducible from
 // the stored rows alone.
 
-import type { StoredSignal } from "./signal-store.server";
+import {
+  fetchStoredSignals,
+  rowFromStored,
+  type StoredSignal,
+} from "./signal-store.server";
 import { loadIntelEntities, INTEL_TABS } from "./intel.server";
 import {
   buildPortfolioCompanies,
   buildContacts,
   fetchSheetTab,
+  writeSheetRow,
   logOpsEvent,
+  TAB_NAMES,
 } from "./sheets.server";
 import { buildRadarWatchlist } from "./platform.server";
 import { isGeminiConfigured, geminiGenerate, responseText } from "./gemini.server";
@@ -58,6 +64,12 @@ import {
   type MagnitudeProposal,
   type ValidatedMagnitude,
 } from "@/lib/materiality";
+import {
+  matchIntelCorroboration,
+  mergeBadges,
+  BADGE,
+  type IntelEventLite,
+} from "@/lib/fusion";
 
 export interface PipelineResult {
   /** Candidates with eventId + scores stamped — append THESE. */
@@ -70,7 +82,7 @@ const today = () => new Date().toISOString().split("T")[0];
 
 // ── Context loading ──────────────────────────────────────────────
 
-interface CompanyFacts {
+export interface CompanyFacts {
   isPortco: boolean;
   isWatch: boolean;
   domain?: string;
@@ -82,12 +94,12 @@ interface CompanyFacts {
   daysSinceLastContact: number | null;
 }
 
-interface PipelineContext {
+export interface PipelineContext {
   cfg: SignalConfig;
   facts: Map<string, CompanyFacts>; // key = normCompanyKey
 }
 
-function factsFor(ctx: PipelineContext, company: string): CompanyFacts {
+export function factsFor(ctx: PipelineContext, company: string): CompanyFacts {
   return (
     ctx.facts.get(normCompanyKey(company)) || {
       isPortco: false,
@@ -101,7 +113,7 @@ function factsFor(ctx: PipelineContext, company: string): CompanyFacts {
   );
 }
 
-async function buildContext(): Promise<PipelineContext> {
+export async function buildContext(): Promise<PipelineContext> {
   const cfg = await loadSignalConfig();
   const facts = new Map<string, CompanyFacts>();
   const get = (name: string): CompanyFacts => {
@@ -180,6 +192,60 @@ async function buildContext(): Promise<PipelineContext> {
     /* intel registry unavailable */
   }
   return { cfg, facts };
+}
+
+// ── Intel Events loader (WS3 fusion input) ───────────────────────
+
+interface IntelEvidenceItem {
+  date?: string;
+  metric?: string;
+  prev?: number;
+  next?: number;
+  z?: number;
+  reason?: string;
+}
+
+/** Parse the Intel Events tab into the fusion-lite shape. Read-only. */
+export async function loadIntelEventsLite(): Promise<IntelEventLite[]> {
+  let rows: string[][] = [];
+  try {
+    rows = await fetchSheetTab(INTEL_TABS.events);
+  } catch {
+    return [];
+  }
+  const out: IntelEventLite[] = [];
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i] || [];
+    const eventId = (r[0] || "").trim();
+    if (!eventId) continue;
+    let evidenceLines: string[] = [];
+    try {
+      const items = JSON.parse(r[9] || "[]") as IntelEvidenceItem[];
+      evidenceLines = items
+        .slice(-6)
+        .map(
+          (ev) =>
+            `${ev.date || ""} ${ev.metric || ""}: ${ev.prev ?? "?"} → ${ev.next ?? "?"}${
+              ev.z ? ` (z=${ev.z})` : ""
+            }`,
+        );
+    } catch {
+      /* evidence unavailable — lines stay empty */
+    }
+    out.push({
+      eventId,
+      urid: (r[1] || "").trim(),
+      entity: (r[2] || "").trim(),
+      state: (r[3] || "").trim(),
+      status: (r[4] || "emerging").trim().toLowerCase(),
+      firstDetected: (r[5] || "").trim(),
+      lastUpdated: (r[6] || "").trim(),
+      confidence: Number(r[7]) || 0,
+      evidenceLines,
+      signalId: (r[10] || "").trim(),
+    });
+  }
+  return out;
 }
 
 // ── Classification (LLM proposes, closed-set validator disposes) ─
@@ -482,15 +548,57 @@ export async function processCandidatesIntoEvents(
       }
     }
 
-    // ── Score every event touched this run (WS2) ──
+    // ── Fusion (WS3): cross-reference the intel engine's events ──
+    const intelEvents = await loadIntelEventsLite();
+    // intel signal row ID → news eventId it merged into (stamped post-persist).
+    const intelSignalStamps = new Map<string, { eventId: string; badge: string }>();
+
+    // ── Score every event touched this run (WS2 + WS3) ──
     const touched = new Set<SignalEventRow>([...created, ...updated]);
     for (const ev of touched) {
       const facts = factsFor(ctx, ev.company);
+      let corroborationMultiplier = 1;
+      const fuse = matchIntelCorroboration(
+        {
+          newsType: ev.eventType,
+          company: ev.company,
+          entityUrid: ev.entityUrid,
+          newsFirstSeen: ev.firstSeen,
+        },
+        intelEvents,
+        cfg,
+      );
+      if (fuse) {
+        ev.intelEventId = fuse.intel.eventId;
+        corroborationMultiplier = cfg.fusion.materialityMultiplier;
+        ev.scoreBreakdown.corroboration = {
+          intelEventId: fuse.intel.eventId,
+          state: fuse.intel.state,
+          firstDetected: fuse.intel.firstDetected,
+          observations: fuse.intel.evidenceLines,
+        };
+        if (fuse.intelWasFirst) {
+          // The intel event was first — MERGE: it keeps first_seen_at, and the
+          // press coverage confirms it.
+          if (fuse.intel.firstDetected && fuse.intel.firstDetected < ev.firstSeen) {
+            ev.firstSeen = fuse.intel.firstDetected;
+          }
+          ev.badges = mergeBadges(ev.badges, BADGE.confirmedByPress);
+          if (fuse.intel.signalId) {
+            intelSignalStamps.set(fuse.intel.signalId, {
+              eventId: ev.eventId,
+              badge: BADGE.confirmedByPress,
+            });
+          }
+        } else {
+          ev.badges = mergeBadges(ev.badges, BADGE.intelCorroborated);
+        }
+      }
       ev.confidence = eventConfidence(ev.sourceCount, ev.topTier, Boolean(ev.intelEventId), cfg);
       // Previously-scored relevance stays a candidate so joins never lower it.
       const rels = [...(recRelByEvent.get(ev.eventId) || [])];
       if (ev.relevance > 0) rels.push(ev.relevance);
-      scoreEvent(ev, facts, rels, cfg);
+      scoreEvent(ev, facts, rels, cfg, { corroborationMultiplier });
     }
 
     // ── Stamp candidates from their (now scored) events ──
@@ -500,10 +608,25 @@ export async function processCandidatesIntoEvents(
       const cls = clsByEvent.get(ev.eventId) || fallbackClassification(cand);
       cand.materiality = ev.materialityAdj;
       cand.rankScore = ev.rankScore;
+      cand.badges = ev.badges;
       cand.scoreBreakdown = rowBreakdown(ev, cls);
+      // Corroborating observations belong on the card, in prose.
+      const corr = ev.scoreBreakdown.corroboration as
+        | { state?: string; observations?: string[] }
+        | undefined;
+      if (corr?.observations?.length) {
+        const line = `Corroborated by intel (${corr.state}): ${corr.observations.slice(-3).join("; ")}`;
+        if (!(cand.justification || "").includes("Corroborated by intel")) {
+          cand.justification = [cand.justification, line].filter(Boolean).join(" — ");
+        }
+      }
     }
 
     await persistSignalEvents({ created, updated: [...updated] });
+
+    // The intel engine's own feed card for a press-confirmed event joins the
+    // news event's card group (one card per real-world event, WS3.2).
+    if (intelSignalStamps.size > 0) await stampIntelSignalRows(intelSignalStamps);
 
     if (created.length > 0 || updated.size > 0) {
       await logOpsEvent({
@@ -530,6 +653,62 @@ export async function processCandidatesIntoEvents(
   } catch (err) {
     console.error("[signal-events] pipeline failed (signals stored unenriched):", err);
     return { enriched: candidates, eventsCreated: 0, eventsUpdated: 0 };
+  }
+}
+
+// ── Signal-row stamping ──────────────────────────────────────────
+// Rewrites existing Signals-tab rows with v2 columns. Reads WITH Body so an
+// in-place rewrite never wipes the (lazily-loaded) outreach body column.
+
+export interface SignalRowStamp {
+  eventId?: string;
+  addBadges?: string[];
+  materiality?: number;
+  rankScore?: number;
+  scoreBreakdown?: string;
+}
+
+export async function stampSignalRowsById(
+  stamps: Map<string, SignalRowStamp>,
+): Promise<number> {
+  if (stamps.size === 0) return 0;
+  const all = await fetchStoredSignals({ withBody: true });
+  // Row numbers by position: re-read the raw tab to locate each ID's sheet row.
+  const raw = await fetchSheetTab(TAB_NAMES.signals);
+  const rowById = new Map<string, number>();
+  for (let i = 0; i < raw.length; i++) {
+    const id = (raw[i][0] || "").trim();
+    if (id && !rowById.has(id)) rowById.set(id, i + 1);
+  }
+  let stamped = 0;
+  for (const s of all) {
+    const stamp = stamps.get(s.id);
+    if (!stamp) continue;
+    const rowNum = rowById.get(s.id);
+    if (!rowNum) continue;
+    if (stamp.eventId) s.eventId = stamp.eventId;
+    if (stamp.addBadges?.length) s.badges = mergeBadges(s.badges || "", ...stamp.addBadges);
+    if (stamp.materiality != null) s.materiality = stamp.materiality;
+    if (stamp.rankScore != null) s.rankScore = stamp.rankScore;
+    if (stamp.scoreBreakdown != null) s.scoreBreakdown = stamp.scoreBreakdown;
+    await writeSheetRow(TAB_NAMES.signals, rowNum, rowFromStored(s));
+    stamped++;
+  }
+  return stamped;
+}
+
+async function stampIntelSignalRows(
+  stamps: Map<string, { eventId: string; badge: string }>,
+): Promise<void> {
+  try {
+    const mapped = new Map<string, SignalRowStamp>();
+    for (const [id, s] of stamps) {
+      mapped.set(id, { eventId: s.eventId, addBadges: [s.badge] });
+    }
+    const n = await stampSignalRowsById(mapped);
+    if (n > 0) console.log(`[signal-events] stamped ${n} intel signal row(s) into news events`);
+  } catch (e) {
+    console.error("[signal-events] intel signal stamping failed:", e);
   }
 }
 

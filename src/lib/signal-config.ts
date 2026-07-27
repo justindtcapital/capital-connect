@@ -139,6 +139,9 @@ export interface SignalConfig {
   /** WS3 — news↔intel fusion. */
   fusion: {
     corroborationMap: CorroborationRule[];
+    /** Intel Events `state` → taxonomy type, for ranking intel-only cards
+     *  (DETECTED BEFORE PRESS) on the same materiality scale as news. */
+    intelStateTaxonomy: Record<string, SignalEventType>;
     /** Multiplier applied to materiality when intel corroborates a news event. */
     materialityMultiplier: number;
     /** DETECTED BEFORE PRESS: intel event age ≥ this with no news match. */
@@ -329,6 +332,19 @@ export const DEFAULT_SIGNAL_CONFIG: SignalConfig = {
         windowDays: 90,
       },
     ],
+    intelStateTaxonomy: {
+      "Fundraising evidence": "funding_round",
+      "Product launch preparation": "product_launch",
+      "Enterprise go-to-market expansion": "strategy_pivot",
+      "Expansion preparation": "strategy_pivot",
+      "Commercial maturation": "strategy_pivot",
+      "Hiring acceleration": "other",
+      "Hiring contraction": "layoffs_restructuring",
+      "Engineering acceleration": "other",
+      "Engineering slowdown": "other",
+      "Infrastructure expansion": "other",
+      "Operational slowdown": "layoffs_restructuring",
+    },
     materialityMultiplier: 1.25,
     detectedBeforePressAgeDays: 3,
     detectedBeforePressMinConfidence: 0.6,

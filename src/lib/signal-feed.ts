@@ -97,6 +97,17 @@ export interface FeedCard {
   urgency?: string;
   /** Grounded strength scores + "why it matters / why now" (attached post-dedup). */
   insight?: SignalInsight;
+  // ── Signals v2 event layer ──
+  /** Real-world event this card belongs to — the feed shows ONE card per event. */
+  eventId?: string;
+  /** Adjusted materiality 0–10 (event pipeline). */
+  materiality?: number | null;
+  /** Final rank score 0–100 (materiality^α × relevance^β × actionability^γ). */
+  rankScore?: number | null;
+  /** Badge slugs (DETECTED_BEFORE_PRESS, CONFIRMED_BY_PRESS, PROMOTED, …). */
+  badges?: string[];
+  /** Corroborating sources collapsed into this card (≥1). */
+  sourceCount?: number;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -228,10 +239,13 @@ function dedupeCards(cards: FeedCard[]): FeedCard[] {
       return u.toLowerCase();
     }
   };
-  // Real URL → dedup by URL. No real URL → dedup by company + the SPECIFIC content
-  // (headline + summary), not the generic "Company — Category" headline, so
-  // distinct awareness items about the same company aren't wrongly collapsed.
+  // Event-clustered rows (v2) → ONE card per real-world event, regardless of
+  // how many sources/rows the event has. Then: real URL → dedup by URL. No real
+  // URL → dedup by company + the SPECIFIC content (headline + summary), not the
+  // generic "Company — Category" headline, so distinct awareness items about
+  // the same company aren't wrongly collapsed.
   const keyOf = (c: FeedCard): string => {
+    if (c.eventId) return `e:${c.eventId}`;
     if (c.sourceUrl && !c.sourceIsSearch && /^https?:\/\//.test(c.sourceUrl))
       return `u:${normUrl(c.sourceUrl)}`;
     const content = `${c.headline || ""} ${c.summary || ""}`
@@ -243,13 +257,26 @@ function dedupeCards(cards: FeedCard[]): FeedCard[] {
   };
 
   const best = new Map<string, FeedCard>();
+  const groupSize = new Map<string, number>();
   for (const c of cards) {
     const k = keyOf(c);
+    groupSize.set(k, (groupSize.get(k) || 0) + 1);
     const cur = best.get(k);
-    if (!cur || rank(c) < rank(cur)) best.set(k, c);
+    // Within an event group prefer the highest rank score, then actionability.
+    const better =
+      !cur ||
+      (c.rankScore ?? -1) > (cur.rankScore ?? -1) ||
+      ((c.rankScore ?? -1) === (cur.rankScore ?? -1) && rank(c) < rank(cur));
+    if (better) best.set(k, c);
   }
   const kept = new Set(best.values());
-  return cards.filter((c) => kept.has(c)); // preserve original (sorted) order
+  const surviving = cards.filter((c) => kept.has(c)); // preserve original (sorted) order
+  // The kept card carries how many corroborating rows it absorbed.
+  for (const c of surviving) {
+    const n = groupSize.get(keyOf(c)) || 1;
+    if (n > 1) c.sourceCount = Math.max(c.sourceCount ?? 1, n);
+  }
+  return surviving;
 }
 
 // ── Mapper ───────────────────────────────────────────────────────
@@ -370,6 +397,10 @@ export function buildFeed(input: BuildFeedInput): FeedCard[] {
       relevance: r.relevance,
       category: r.category,
       urgency: r.urgency,
+      eventId: r.eventId || undefined,
+      materiality: r.materiality ?? null,
+      rankScore: r.rankScore ?? null,
+      badges: (r.badges || "").split(";").map((b) => b.trim()).filter(Boolean),
     });
   });
 
@@ -401,6 +432,11 @@ export function buildFeed(input: BuildFeedInput): FeedCard[] {
       sortTs: ts,
       timeLabel: relativeTime(ts),
       category: s.category,
+      storedId: s.storedId,
+      eventId: s.eventId || undefined,
+      materiality: s.materiality ?? null,
+      rankScore: s.rankScore ?? null,
+      badges: (s.badges || "").split(";").map((b) => b.trim()).filter(Boolean),
     });
   });
 

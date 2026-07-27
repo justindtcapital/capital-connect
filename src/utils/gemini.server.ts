@@ -597,6 +597,14 @@ export interface SignalRecommendation {
   storedId?: string;
   /** Whether a (possibly elided) Body exists for this signal. */
   hasBody?: boolean;
+  /** Signals v2: real-world event this row belongs to (Signal Events FK). */
+  eventId?: string;
+  /** Signals v2: adjusted materiality 0–10 stamped by the event pipeline. */
+  materiality?: number | null;
+  /** Signals v2: final rank score 0–100. */
+  rankScore?: number | null;
+  /** Signals v2: semicolon-separated badge slugs. */
+  badges?: string;
 }
 
 export interface SignalAwarenessItem {
@@ -614,6 +622,16 @@ export interface SignalAwarenessItem {
   sourceType?: string;
   /** Durable link to a saved Drive doc/PDF for this signal, when one exists. */
   docUrl?: string;
+  /** Signals v2: real-world event this row belongs to (Signal Events FK). */
+  eventId?: string;
+  /** Signals v2: adjusted materiality 0–10 stamped by the event pipeline. */
+  materiality?: number | null;
+  /** Signals v2: final rank score 0–100. */
+  rankScore?: number | null;
+  /** Signals v2: semicolon-separated badge slugs. */
+  badges?: string;
+  /** Signals v2: stored-signal ID (recommendations carry storedId already). */
+  storedId?: string;
 }
 
 export interface SignalScanResult {

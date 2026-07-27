@@ -37,10 +37,12 @@ import {
   deleteSheetRows,
   ensureTab,
   ensureHeaderRow,
+  ensureHeaderWidth,
   logOpsEvent,
   TAB_NAMES,
   SIGNAL_HEADERS,
 } from "./sheets.server";
+import { processCandidatesIntoEvents } from "./event-pipeline.server";
 
 // Draft an outreach email with Gemini. Runs server-side so the API key stays secret.
 export const draftEmail = createServerFn({ method: "POST" })
@@ -232,6 +234,10 @@ function resultFromStored(
       docUrl: s.docUrl,
       storedId: s.id,
       hasBody: s.hasBody,
+      eventId: s.eventId,
+      materiality: s.materiality,
+      rankScore: s.rankScore,
+      badges: s.badges,
     }));
   const otherSignals: SignalAwarenessItem[] = stored
     .filter((s) => s.type === "awareness")
@@ -246,6 +252,11 @@ function resultFromStored(
       dateFound: s.dateFound,
       sourceType: s.sourceType,
       docUrl: s.docUrl,
+      eventId: s.eventId,
+      materiality: s.materiality,
+      rankScore: s.rankScore,
+      badges: s.badges,
+      storedId: s.id,
     }));
   return { found: true, recommendations, otherSignals, compliance, newCount };
 }
@@ -525,7 +536,12 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
     if (toAppend.length > 0) {
       await ensureTab(TAB_NAMES.signals, SIGNAL_HEADERS);
       await ensureHeaderRow(TAB_NAMES.signals, SIGNAL_HEADERS);
-      await appendSheetRows(TAB_NAMES.signals, toAppend.map(rowFromStored));
+      // Widen pre-v2 sheets so the appended event/score columns get header cells.
+      await ensureHeaderWidth(TAB_NAMES.signals, SIGNAL_HEADERS);
+      // Event clustering (WS1): one real-world event per card — candidates get
+      // an eventId FK; new sources for known events join the existing event.
+      const { enriched } = await processCandidatesIntoEvents(toAppend);
+      await appendSheetRows(TAB_NAMES.signals, enriched.map(rowFromStored));
     }
 
     await logOpsEvent({

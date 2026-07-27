@@ -3,6 +3,11 @@
 // gemini.functions.ts so the Gmail digest pipeline can also archive signals
 // without importing the scan module (which imports gmail.functions — cycle).
 
+// NOTE: this module is retained in the CLIENT bundle (via gmail.functions), so
+// it must never import the event pipeline (whose chain reaches node-only
+// google-auth-library). Digest rows are stored unenriched here; the nightly
+// signals-reconcile job (server-only) clusters any recent rows missing an
+// Event ID.
 import type { SignalRecommendation, SignalAwarenessItem } from "./gemini.server";
 import type { GmailSignal } from "./gmail.functions";
 import { newsSourceType } from "@/lib/signal-feed";
@@ -31,6 +36,17 @@ export interface StoredSignal {
   docUrl: string;
   /** Whether the stored row has a non-empty Body (drives lazy-load on the feed). */
   hasBody: boolean;
+  // ── Signals v2 event layer (additive columns; "" / null on legacy rows) ──
+  /** Real-world event this row belongs to (Signal Events tab FK). */
+  eventId?: string;
+  /** Adjusted materiality 0–10 stamped by the event pipeline. */
+  materiality?: number | null;
+  /** Final rank score 0–100 (materiality^α × relevance^β × actionability^γ). */
+  rankScore?: number | null;
+  /** Semicolon-separated badge slugs (DETECTED_BEFORE_PRESS, CONFIRMED_BY_PRESS…). */
+  badges?: string;
+  /** JSON component breakdown — every stored score reconstructible from this. */
+  scoreBreakdown?: string;
 }
 
 // Write-time size caps that keep the hot read path light. The Summary is the
@@ -154,6 +170,11 @@ export function rowFromStored(s: StoredSignal): string[] {
     s.timing,
     s.sourceType,
     s.docUrl,
+    s.eventId || "",
+    s.materiality == null ? "" : String(s.materiality),
+    s.rankScore == null ? "" : String(s.rankScore),
+    s.badges || "",
+    (s.scoreBreakdown || "").slice(0, 4000),
   ];
 }
 
@@ -202,6 +223,11 @@ export async function fetchStoredSignals(
         sourceType: g(row, 16),
         docUrl: g(row, 17),
         hasBody: g(row, 11).length > 0,
+        eventId: g(row, 18),
+        materiality: g(row, 19) ? Number(g(row, 19)) : null,
+        rankScore: g(row, 20) ? Number(g(row, 20)) : null,
+        badges: g(row, 21),
+        scoreBreakdown: g(row, 22),
       }))
       // Keep only rows that are real signals (valid type + some content).
       .filter(
@@ -276,6 +302,8 @@ export async function appendDigestLinkSignals(
     toAppend.push(stored);
   }
   if (toAppend.length > 0) {
+    // Stored WITHOUT event clustering — see module header. The nightly
+    // reconcile clusters rows that arrive here missing an Event ID.
     await appendSheetRows(TAB_NAMES.signals, toAppend.map(rowFromStored));
   }
   return toAppend.length;

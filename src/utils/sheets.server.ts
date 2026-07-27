@@ -1189,6 +1189,12 @@ export const SIGNAL_HEADERS = [
   "Timing",
   "Source Type",
   "Doc URL",
+  // Signals v2 event layer (additive — older rows read "" for these).
+  "Event ID",
+  "Materiality",
+  "Rank Score",
+  "Badges",
+  "Score Breakdown",
 ];
 
 const CONTACT_COLS: Record<string, string> = {

@@ -9,7 +9,18 @@ import { fetchLinkedInFeed } from "@/utils/linkedin.functions";
 import { fetchDriveDocs } from "@/utils/drive.functions";
 import { fetchGmailFeed } from "@/utils/gmail.functions";
 import { fetchPortfolioCompanies, fetchContacts } from "@/utils/sheets.functions";
-import { recordVerdict } from "@/utils/intel.functions";
+import {
+  recordVerdict,
+  fetchWatchUniverse,
+  setWatchTier,
+  type WatchEntity,
+} from "@/utils/intel.functions";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { useAuth } from "@/lib/auth-context";
 import type { Contact, PortfolioCompany } from "@/lib/types";
 import {
@@ -253,6 +264,137 @@ function EventBadges({ card }: { card: FeedCard }) {
   return <div className="flex items-center gap-1.5 flex-wrap mt-1.5">{chips}</div>;
 }
 
+// ── WS6 — watch-universe tier editor ─────────────────────────────
+// Tier 1: portcos/active targets — everything, daily. Tier 2: watchlist —
+// intel daily, news weekly. Tier 3: broad universe — ATS + Form D only.
+// Auto-promotion T3→T2 is signal-driven; edits here are the reversal path.
+const TIER_LABEL: Record<number, string> = {
+  1: "1 — full, daily",
+  2: "2 — intel daily · news weekly",
+  3: "3 — ATS + Form D only",
+};
+
+function WatchUniverseDialog({
+  open,
+  onOpenChange,
+  user,
+}: {
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  user?: string;
+}) {
+  const [entities, setEntities] = useState<WatchEntity[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [q, setQ] = useState("");
+  useEffect(() => {
+    if (!open) return;
+    setLoading(true);
+    fetchWatchUniverse()
+      .then((r) => setEntities(r.entities))
+      .catch(() => toast.error("Could not load the watch universe."))
+      .finally(() => setLoading(false));
+  }, [open]);
+
+  const shown = useMemo(() => {
+    const needle = q.trim().toLowerCase();
+    const list = needle
+      ? entities.filter(
+          (e) => e.name.toLowerCase().includes(needle) || e.domain.includes(needle),
+        )
+      : entities;
+    return [...list].sort((a, b) => a.watchTier - b.watchTier || a.name.localeCompare(b.name));
+  }, [entities, q]);
+
+  const changeTier = async (e: WatchEntity, wt: number) => {
+    const prev = e.watchTier;
+    setEntities((list) =>
+      list.map((x) => (x.urid === e.urid ? { ...x, watchTier: wt } : x)),
+    );
+    const r = await setWatchTier({ data: { urid: e.urid, watchTier: wt, user } }).catch(
+      () => ({ ok: false as const }),
+    );
+    if (!r.ok) {
+      setEntities((list) =>
+        list.map((x) => (x.urid === e.urid ? { ...x, watchTier: prev } : x)),
+      );
+      toast.error(`Could not update ${e.name}.`);
+    }
+  };
+
+  const counts = useMemo(() => {
+    const c: Record<number, number> = { 1: 0, 2: 0, 3: 0 };
+    for (const e of entities) c[e.watchTier] = (c[e.watchTier] || 0) + 1;
+    return c;
+  }, [entities]);
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-2xl">
+        <DialogHeader>
+          <DialogTitle className="text-base">Watch universe</DialogTitle>
+        </DialogHeader>
+        <p className="text-xs text-muted-foreground -mt-1">
+          Tier 1 full+daily · Tier 2 intel daily, news weekly · Tier 3 cheap
+          high-precision only (ATS + SEC Form D). Tier-3 companies that trip ≥2
+          detector families in 30 days auto-promote to Tier 2 — demoting here
+          reverses that and resets the evidence.
+        </p>
+        <div className="flex items-center gap-2">
+          <Input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="Search companies…"
+            className="h-8 text-xs"
+          />
+          <span className="text-[10px] text-muted-foreground whitespace-nowrap tabular-nums">
+            T1 {counts[1]} · T2 {counts[2]} · T3 {counts[3]}
+          </span>
+        </div>
+        <div className="max-h-[50vh] overflow-auto rounded-md border border-border divide-y divide-border/60">
+          {loading ? (
+            <div className="p-6 text-center text-xs text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin mx-auto mb-2" /> Loading…
+            </div>
+          ) : shown.length === 0 ? (
+            <div className="p-6 text-center text-xs text-muted-foreground">
+              No tracked companies match.
+            </div>
+          ) : (
+            shown.slice(0, 300).map((e) => (
+              <div key={e.urid} className="flex items-center gap-2 px-3 py-1.5 text-xs">
+                <span className="font-medium truncate">{e.name}</span>
+                {e.domain && (
+                  <span className="text-muted-foreground truncate">{e.domain}</span>
+                )}
+                <Badge variant="outline" className="text-[9px] uppercase shrink-0">
+                  {e.tier}
+                </Badge>
+                <div className="ml-auto shrink-0">
+                  <Select
+                    value={String(e.watchTier)}
+                    onValueChange={(v) => changeTier(e, Number(v))}
+                  >
+                    <SelectTrigger className="h-7 w-52 text-[11px]">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {[1, 2, 3].map((t) => (
+                        <SelectItem key={t} value={String(t)} className="text-xs">
+                          {TIER_LABEL[t]}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function CompanyAvatar({ card }: { card: FeedCard }) {
   const [stage, setStage] = useState(0);
   const d = card.logoDomain;
@@ -404,6 +546,7 @@ function SignalsPage() {
   };
 
   // Broadcast + email dialogs
+  const [watchOpen, setWatchOpen] = useState(false);
   const [broadcastCard, setBroadcastCard] = useState<FeedCard | null>(null);
   const [draftOpen, setDraftOpen] = useState(false);
   const [draftContact, setDraftContact] = useState<Contact | null>(null);
@@ -701,6 +844,9 @@ function SignalsPage() {
           </p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
+          <Button variant="outline" onClick={() => setWatchOpen(true)}>
+            <Building2 className="h-4 w-4" /> Watch universe
+          </Button>
           <Select value={windowDays} onValueChange={setWindowDays}>
             <SelectTrigger className="h-9 w-32 text-sm">
               <SelectValue />
@@ -1212,6 +1358,11 @@ function SignalsPage() {
         </main>
       </div>
 
+      <WatchUniverseDialog
+        open={watchOpen}
+        onOpenChange={setWatchOpen}
+        user={authEmail || undefined}
+      />
       <BroadcastDialog
         open={!!broadcastCard}
         onOpenChange={(o) => {

@@ -5,6 +5,8 @@ import {
   seedIntelEntities,
   intelStatus,
   recordSignalVerdict,
+  setEntityWatchTier,
+  loadIntelEntities,
   type IntelSweepResult,
   type IntelStatus,
   type SignalVerdict,
@@ -48,3 +50,37 @@ export const recordVerdict = createServerFn({ method: "POST" })
       note: data.note,
     }),
   );
+
+// ── WS6 — watch-universe tier editor ─────────────────────────────
+
+export interface WatchEntity {
+  urid: string;
+  name: string;
+  domain: string;
+  tier: string;
+  watchTier: number;
+  lastScanned: string;
+}
+
+/** The tracked-entity registry, lean, for the tier editor. */
+export const fetchWatchUniverse = createServerFn({ method: "GET" }).handler(
+  async (): Promise<{ entities: WatchEntity[] }> => {
+    const entities = await loadIntelEntities();
+    return {
+      entities: entities.map((e) => ({
+        urid: e.urid,
+        name: e.name,
+        domain: e.domain,
+        tier: e.tier,
+        watchTier: e.watchTier,
+        lastScanned: e.lastScanned,
+      })),
+    };
+  },
+);
+
+/** Set an entity's watch tier (1/2/3). Manual demotion to 3 resets the
+ *  promotion evidence so the auto-rule doesn't instantly re-fire. */
+export const setWatchTier = createServerFn({ method: "POST" })
+  .inputValidator((data: { urid: string; watchTier: number; user?: string }) => data)
+  .handler(async ({ data }) => setEntityWatchTier(data));

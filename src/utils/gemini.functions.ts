@@ -43,6 +43,7 @@ import {
   SIGNAL_HEADERS,
 } from "./sheets.server";
 import { processCandidatesIntoEvents } from "./event-pipeline.server";
+import { loadSignalConfig } from "./event-store.server";
 
 // Draft an outreach email with Gemini. Runs server-side so the API key stays secret.
 export const draftEmail = createServerFn({ method: "POST" })
@@ -283,6 +284,8 @@ type SignalScanInput = {
   maxPeople?: number;
   maxCompanies?: number;
   companyName?: string;
+  /** True for cron-driven scans — enables WS6 tier cadence (Tier 2 weekly). */
+  scheduled?: boolean;
 };
 
 /**
@@ -337,18 +340,36 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
       }));
 
     // Broad network companies only matter for an unscoped scan.
+    // WS6 tier cadence (scheduled scans only): most-connected + watchlist
+    // companies are the Tier-2 band — news-scanned weekly on the configured
+    // ISO weekday, not daily. Portcos (Tier 1) stay daily. Tier 3 never.
     let companies: string[] = [];
+    let tier2Skipped = false;
     if (!scoped) {
-      const counts = new Map<string, number>();
-      for (const c of contacts) {
-        const name = (c.company || "").trim();
-        if (!name || portcoNames.has(name.toLowerCase())) continue;
-        counts.set(name, (counts.get(name) || 0) + 1);
+      let tier2Day = true;
+      if (data.scheduled) {
+        try {
+          const cfg = await loadSignalConfig();
+          const isoDay = ((new Date().getUTCDay() + 6) % 7) + 1; // 1=Mon…7=Sun
+          tier2Day = isoDay === cfg.watchTiers.tier2NewsScanIsoDay;
+        } catch {
+          tier2Day = true; // config unavailable — fail open, never dark
+        }
       }
-      companies = [...counts.entries()]
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, maxCompanies)
-        .map(([name]) => name);
+      if (tier2Day) {
+        const counts = new Map<string, number>();
+        for (const c of contacts) {
+          const name = (c.company || "").trim();
+          if (!name || portcoNames.has(name.toLowerCase())) continue;
+          counts.set(name, (counts.get(name) || 0) + 1);
+        }
+        companies = [...counts.entries()]
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, maxCompanies)
+          .map(([name]) => name);
+      } else {
+        tier2Skipped = true;
+      }
     } else if (portcos.length === 0 && data.companyName) {
       // Scoped to a name that isn't a portfolio company — scan it as a company.
       companies = [data.companyName.trim()];
@@ -559,6 +580,8 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
         people: people.length,
         portcos: portcos.length,
         companies: companies.length,
+        // WS6 cadence audit trail: true on scheduled non-Tier-2 days.
+        tier2Skipped,
         articles: articles.length,
         emailLinks: emailLinks.length,
         documents: documents.length,

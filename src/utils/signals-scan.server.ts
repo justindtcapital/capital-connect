@@ -10,5 +10,8 @@ export async function runScheduledSignalScan(input: {
   maxCompanies?: number;
   companyName?: string;
 } = {}) {
-  return scanSignals({ data: input });
+  // WS6 — tier cadence applies only to SCHEDULED scans: Tier 1 daily; Tier 2
+  // joins on its configured weekday; Tier 3 is never news-scanned. Manual
+  // scans from the UI stay unrestricted.
+  return scanSignals({ data: { ...input, scheduled: true } });
 }

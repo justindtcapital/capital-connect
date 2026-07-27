@@ -121,6 +121,24 @@ export function taxonomyTypeForIntelState(
   return cfg.fusion.intelStateTaxonomy[state] || "other";
 }
 
+// ── WS6 — signal-driven promotion (Tier 3 → 2) ───────────────────
+
+/**
+ * A Tier-3 company auto-promotes when ≥ promotionMinFamilies DISTINCT intel
+ * evidence families fired within the trailing window. `firedFamilies` is the
+ * per-entity {family: lastFiredDate} map stamped by the sweep.
+ */
+export function promotionCheck(
+  firedFamilies: Record<string, string>,
+  todayIso: string,
+  cfg: SignalConfig,
+): { promote: boolean; evidence: Array<[string, string]> } {
+  const recent = Object.entries(firedFamilies).filter(
+    ([, d]) => d && dayDiff(todayIso, d) <= cfg.watchTiers.promotionWindowDays,
+  );
+  return { promote: recent.length >= cfg.watchTiers.promotionMinFamilies, evidence: recent };
+}
+
 // ── Badges (shared slugs; feed renders them distinctly) ──────────
 
 export const BADGE = {

@@ -18,6 +18,7 @@
 import {
   ensureTab,
   ensureHeaderRow,
+  ensureHeaderWidth,
   fetchSheetTab,
   appendSheetRows,
   writeSheetRow,
@@ -26,6 +27,8 @@ import {
   logOpsEvent,
   TAB_NAMES,
 } from "./sheets.server";
+import { loadSignalConfig } from "./event-store.server";
+import { BADGE, promotionCheck } from "@/lib/fusion";
 import { buildRadarWatchlist } from "./platform.server";
 import {
   fetchStoredSignals,
@@ -79,6 +82,12 @@ export const INTEL_ENTITY_HEADERS = [
   "Added",
   "Last Scanned",
   "Note",
+  // WS6 — depth-tiered watch universe (appended; blank rows default by Tier):
+  //   1 = portcos + active targets: all collectors, daily; news daily.
+  //   2 = watchlist + most-connected: all collectors daily; news weekly.
+  //   3 = broad sourcing universe: cheap high-precision collectors only
+  //       (config watchTiers.tier3Collectors — ATS + EDGAR Form D); no news.
+  "Watch Tier",
 ];
 // v2 appends columns AFTER the v1 set — existing rows stay valid (shorter).
 export const INTEL_METRIC_LOG_HEADERS = [
@@ -164,8 +173,15 @@ export interface IntelEntity {
   added: string;
   lastScanned: string;
   note: string;
+  /** WS6 collection depth (1/2/3) — editable in the UI, auto-promotable 3→2. */
+  watchTier: number;
   /** 1-based sheet row (header = 1). */
   rowNumber: number;
+}
+
+/** Default watch tier when the column is blank, from the legacy source tier. */
+export function defaultWatchTier(tier: string): number {
+  return tier === "portco" ? 1 : tier === "watch" ? 2 : 3;
 }
 
 interface SeriesState {
@@ -257,21 +273,34 @@ function entityFromRow(row: string[], rowNumber: number): IntelEntity | null {
   const urid = (row[0] || "").trim();
   const name = (row[1] || "").trim();
   if (!urid || !name) return null;
+  const tier = (row[3] || "watch").trim();
+  const wt = Number((row[8] || "").trim());
   return {
     urid,
     name,
     domain: (row[2] || "").trim().toLowerCase(),
-    tier: (row[3] || "watch").trim(),
+    tier,
     xref: parseJson<Record<string, string>>(row[4] || "", {}),
     added: (row[5] || "").trim(),
     lastScanned: (row[6] || "").trim(),
     note: (row[7] || "").trim(),
+    watchTier: wt >= 1 && wt <= 3 ? wt : defaultWatchTier(tier),
     rowNumber,
   };
 }
 
 function rowFromEntity(e: IntelEntity): string[] {
-  return [e.urid, e.name, e.domain, e.tier, JSON.stringify(e.xref), e.added, e.lastScanned, e.note];
+  return [
+    e.urid,
+    e.name,
+    e.domain,
+    e.tier,
+    JSON.stringify(e.xref),
+    e.added,
+    e.lastScanned,
+    e.note,
+    String(e.watchTier || defaultWatchTier(e.tier)),
+  ];
 }
 
 export async function loadIntelEntities(): Promise<IntelEntity[]> {
@@ -392,6 +421,7 @@ export async function seedIntelEntities(): Promise<{ added: number; total: numbe
       added: today(),
       lastScanned: "",
       note: "",
+      watchTier: defaultWatchTier(c.tier),
       rowNumber: 0,
     });
   }
@@ -551,6 +581,9 @@ export async function runIntelSweep(opts: IntelSweepOptions = {}): Promise<Intel
     // Schema v2 adds columns to v1 tabs — extend headers in place, rows stay valid.
     await ensureHeaderRow(INTEL_TABS.metricLog, INTEL_METRIC_LOG_HEADERS);
     await ensureHeaderRow(INTEL_TABS.series, INTEL_SERIES_HEADERS);
+    // WS6: widen pre-tier registries so Watch Tier gets a header cell.
+    await ensureHeaderWidth(INTEL_TABS.entities, INTEL_ENTITY_HEADERS);
+    const cfg = await loadSignalConfig();
 
     let entities = await loadIntelEntities();
     // Additive refresh every sweep so new Targets / watchlist rows enter the
@@ -568,7 +601,12 @@ export async function runIntelSweep(opts: IntelSweepOptions = {}): Promise<Intel
     let batch = entities
       .filter((e) => (opts.tier ? e.tier === opts.tier : true))
       .filter((e) => (wanted ? e.name.toLowerCase() === wanted : true));
-    batch.sort((a, b) => (a.lastScanned || "").localeCompare(b.lastScanned || ""));
+    // Tier 1 outranks 2 outranks 3 for scan slots; stalest first within a tier.
+    batch.sort(
+      (a, b) =>
+        a.watchTier - b.watchTier ||
+        (a.lastScanned || "").localeCompare(b.lastScanned || ""),
+    );
     batch = batch.slice(0, limit);
 
     // Series index: "urid|metric" → row.
@@ -610,6 +648,7 @@ export async function runIntelSweep(opts: IntelSweepOptions = {}): Promise<Intel
     const newEvents: EventRow[] = [];
     const changedEvents = new Set<EventRow>();
     const collectorErrors: string[] = [];
+    const promotions: string[] = [];
     const health: Record<string, HealthCounter> = {};
     const bump = (collector: string, status: CollectorResult["status"], note?: string) => {
       const h = (health[collector] ||= { attempts: 0, ok: 0, noSource: 0, ambiguous: 0, errors: 0, notes: [] });
@@ -665,20 +704,41 @@ export async function runIntelSweep(opts: IntelSweepOptions = {}): Promise<Intel
       const atsKnown = entity.xref["ats"];
       const ghKnown = entity.xref["github"];
       const feedKnown = entity.xref["feed"];
+      // WS6 — Tier 3 runs ONLY the cheap high-precision collectors (config:
+      // ATS + EDGAR Form D). Near-zero cost, near-zero false positives, so
+      // the broad sourcing universe scales to hundreds of companies.
+      const gatedOut = (collector: CollectorResult["collector"]): boolean =>
+        entity.watchTier >= 3 && !cfg.watchTiers.tier3Collectors.includes(collector);
       const [ats, gh, ct, edgar, site, changelog, uspto] = await Promise.all([
-        atsKnown || stale(entity.xref["ats_checked"])
-          ? collectAtsJobs(entity.name, atsKnown)
-          : Promise.resolve(noSource("ats", "discovery cached (none found)")),
-        ghKnown || stale(entity.xref["gh_checked"])
-          ? collectGithub(entity.name, entity.domain, ghKnown)
-          : Promise.resolve(noSource("github", "discovery cached (none found)")),
-        entity.domain ? collectCtSubdomains(entity.domain) : Promise.resolve(noSource("ct")),
-        collectEdgarFormD(entity.name, entity.xref["edgar"]),
-        entity.domain ? collectSiteSignals(entity.domain) : Promise.resolve(noSource("site")),
-        entity.domain && (feedKnown || stale(entity.xref["feed_checked"]))
-          ? collectChangelogFeed(entity.domain, feedKnown)
-          : Promise.resolve(noSource("changelog", feedKnown ? "no domain" : "discovery cached (none found)")),
-        collectUsptoTrademarks(entity.name, entity.xref["uspto"]),
+        gatedOut("ats")
+          ? Promise.resolve(noSource("ats", "tier 3 — collector gated"))
+          : atsKnown || stale(entity.xref["ats_checked"])
+            ? collectAtsJobs(entity.name, atsKnown)
+            : Promise.resolve(noSource("ats", "discovery cached (none found)")),
+        gatedOut("github")
+          ? Promise.resolve(noSource("github", "tier 3 — collector gated"))
+          : ghKnown || stale(entity.xref["gh_checked"])
+            ? collectGithub(entity.name, entity.domain, ghKnown)
+            : Promise.resolve(noSource("github", "discovery cached (none found)")),
+        gatedOut("ct") || !entity.domain
+          ? Promise.resolve(noSource("ct", gatedOut("ct") ? "tier 3 — collector gated" : "no domain"))
+          : collectCtSubdomains(entity.domain),
+        gatedOut("edgar")
+          ? Promise.resolve(noSource("edgar", "tier 3 — collector gated"))
+          : collectEdgarFormD(entity.name, entity.xref["edgar"]),
+        gatedOut("site") || !entity.domain
+          ? Promise.resolve(noSource("site", gatedOut("site") ? "tier 3 — collector gated" : "no domain"))
+          : collectSiteSignals(entity.domain),
+        gatedOut("changelog") || !entity.domain
+          ? Promise.resolve(
+              noSource("changelog", gatedOut("changelog") ? "tier 3 — collector gated" : "no domain"),
+            )
+          : feedKnown || stale(entity.xref["feed_checked"])
+            ? collectChangelogFeed(entity.domain, feedKnown)
+            : Promise.resolve(noSource("changelog", "discovery cached (none found)")),
+        gatedOut("uspto")
+          ? Promise.resolve(noSource("uspto", "tier 3 — collector gated"))
+          : collectUsptoTrademarks(entity.name, entity.xref["uspto"]),
       ]);
       if (!atsKnown) {
         if (ats.resolvedRef) delete entity.xref["ats_checked"];
@@ -884,6 +944,54 @@ export async function runIntelSweep(opts: IntelSweepOptions = {}): Promise<Intel
         }
       }
 
+      // ── WS6 — signal-driven promotion (Tier 3 → 2) ──
+      // Every fired anomaly stamps its evidence family on the entity; a Tier-3
+      // company with ≥ promotionMinFamilies DISTINCT families inside the
+      // window auto-promotes. Logged, reversible (Watch Universe editor —
+      // manual demotion clears the family stamps so it doesn't re-fire).
+      if (entityAnomalies.length > 0) {
+        const fired = parseJson<Record<string, string>>(entity.xref["fired_families"] || "", {});
+        for (const ea of entityAnomalies) fired[ea.anomaly.family] = today();
+        entity.xref["fired_families"] = JSON.stringify(fired);
+        if (entity.watchTier === 3) {
+          const check = promotionCheck(fired, today(), cfg);
+          if (check.promote) {
+            const recent = check.evidence;
+            entity.watchTier = 2;
+            const evidence = recent.map(([f, d]) => `${f} (${d})`).join(", ");
+            const isPortco = portcoNames.has(entity.name.trim().toLowerCase());
+            const promo: StoredSignal = {
+              id: "",
+              dateFound: today(),
+              type: "awareness",
+              status: "New",
+              person: "",
+              company: entity.name,
+              email: "",
+              category: "Watchlist Promotion",
+              signal: `Promoted to watchlist (Tier 3 → 2): ${recent.length} independent detector families fired within ${cfg.watchTiers.promotionWindowDays}d — ${evidence}.`,
+              sourceUrl: "",
+              subject: `Promoted to watchlist: ${entity.name}`,
+              body: `Signal-driven promotion. Evidence families: ${evidence}.\n\nRule: ≥${cfg.watchTiers.promotionMinFamilies} distinct evidence families within ${cfg.watchTiers.promotionWindowDays} days. Reversible from the Watch Universe editor on /signals (manual demotion resets the evidence stamps).`,
+              relevance: 0,
+              justification: `Auto-promotion: ${evidence}.`,
+              urgency: "Medium",
+              timing: "",
+              sourceType: newsSourceType(undefined, isPortco),
+              docUrl: "",
+              hasBody: true,
+              badges: BADGE.promoted,
+            };
+            promo.id = keyForStored(promo);
+            if (!seenSignalKeys.has(promo.id)) {
+              seenSignalKeys.add(promo.id);
+              newSignals.push(promo);
+            }
+            promotions.push(`${entity.name}: ${evidence}`);
+          }
+        }
+      }
+
       entity.lastScanned = nowIso();
       dirtyEntities.push(entity);
     }
@@ -968,6 +1076,7 @@ export async function runIntelSweep(opts: IntelSweepOptions = {}): Promise<Intel
         ...logRows.slice(0, 30).map((r) => `${r[2]} · ${r[3]}: ${r[4] || "∅"} → ${r[5]} (${r[11]})`),
         ...newEvents.map((ev) => `EVENT: ${ev.entity} — ${ev.state} (${Math.round(ev.confidence * 100)}%)`),
         ...[...changedEvents].map((ev) => `EVENT UPDATE: ${ev.entity} — ${ev.state} → ${ev.status}`),
+        ...promotions.map((p) => `PROMOTED T3→T2: ${p}`),
       ],
     });
 
@@ -1042,6 +1151,43 @@ export async function recordSignalVerdict(input: {
   } catch (e) {
     console.error("[intel] recordSignalVerdict failed:", e);
     return { ok: false };
+  }
+}
+
+// ── WS6 — manual watch-tier edits (logged, reversible) ───────────
+
+export async function setEntityWatchTier(input: {
+  urid: string;
+  watchTier: number;
+  user?: string;
+}): Promise<{ ok: boolean; error?: string }> {
+  const wt = Math.round(input.watchTier);
+  if (wt < 1 || wt > 3) return { ok: false, error: "watchTier must be 1, 2, or 3" };
+  try {
+    const entities = await loadIntelEntities();
+    const entity = entities.find((e) => e.urid === input.urid);
+    if (!entity || !entity.rowNumber) return { ok: false, error: "entity not found" };
+    const prev = entity.watchTier;
+    entity.watchTier = wt;
+    // Manual demotion to Tier 3 resets promotion evidence so the auto-rule
+    // doesn't instantly re-promote — the human's call stands until NEW
+    // evidence accumulates.
+    if (wt === 3) delete entity.xref["fired_families"];
+    await serialized(() =>
+      writeSheetRow(INTEL_TABS.entities, entity.rowNumber, rowFromEntity(entity)),
+    );
+    await logOpsEvent({
+      action: "sync",
+      source: "intel_watch_tier",
+      status: "ok",
+      summary: `Watch tier: ${entity.name} ${prev} → ${wt}${input.user ? ` (by ${input.user})` : ""}`,
+      records: 1,
+      details: { urid: entity.urid, name: entity.name, from: prev, to: wt, user: input.user || "" },
+    });
+    return { ok: true };
+  } catch (e) {
+    console.error("[intel] setEntityWatchTier failed:", e);
+    return { ok: false, error: e instanceof Error ? e.message : "update failed" };
   }
 }
 

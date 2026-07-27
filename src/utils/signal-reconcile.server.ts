@@ -17,7 +17,12 @@ import {
   loadSignalEvents,
   persistSignalEvents,
   loadSignalConfig,
+  loadSignalFeedback,
+  appendSignalFeedback,
+  appendSignalMetric,
+  loadSignalMetrics,
   type SignalEventRow,
+  type FeedbackRow,
 } from "./event-store.server";
 import {
   loadIntelEventsLite,
@@ -54,6 +59,8 @@ export interface ReconcileResult {
   lateMerges: number;
   detectedBeforePress: number;
   rowsResynced: number;
+  ignoredComputed: number;
+  precisionAt10: number | null;
 }
 
 const today = () => new Date().toISOString().split("T")[0];
@@ -242,6 +249,54 @@ export async function runSignalsReconcile(): Promise<ReconcileResult> {
       resync++;
     }
 
+    // ── Pass E (WS5): terminal feedback rows + precision@10 ───────
+    // "Ignored" = rendered in top-N today, session over, no interaction —
+    // computed HERE nightly, never client-side. Idempotent: existing ignored
+    // rows and an existing metric row for today short-circuit re-runs.
+    const todayIso = today();
+    const feedback = await loadSignalFeedback({ sinceDays: 2 });
+    const todays = feedback.filter((f) => f.dateIso.startsWith(todayIso));
+    const renderedByKey = new Map<string, FeedbackRow>();
+    const interacted = new Set<string>();
+    const dismissedSet = new Set<string>();
+    const alreadyIgnored = new Set<string>();
+    for (const f of todays) {
+      const key = f.eventId || f.signalId;
+      if (!key) continue;
+      if (f.action === "rendered") {
+        if (!renderedByKey.has(key)) renderedByKey.set(key, f);
+      } else if (f.action === "expanded" || f.action === "clicked_source" || f.action === "actioned") {
+        interacted.add(key);
+      } else if (f.action === "dismissed") {
+        dismissedSet.add(key);
+      } else if (f.action === "ignored") {
+        alreadyIgnored.add(key);
+      }
+    }
+    const ignoredRows: FeedbackRow[] = [];
+    for (const [key, r] of renderedByKey) {
+      if (interacted.has(key) || dismissedSet.has(key) || alreadyIgnored.has(key)) continue;
+      ignoredRows.push({ ...r, dateIso: new Date().toISOString(), action: "ignored" });
+    }
+    if (ignoredRows.length > 0) await appendSignalFeedback(ignoredRows);
+
+    let precisionAt10: number | null = null;
+    const top10 = [...renderedByKey.values()].filter(
+      (r) => r.rankPosition != null && r.rankPosition <= 10,
+    );
+    if (top10.length > 0) {
+      const existing = await loadSignalMetrics("precision_at_10", { sinceDays: 1 });
+      if (!existing.some((m) => m.date === todayIso)) {
+        const hit = top10.filter((r) => interacted.has(r.eventId || r.signalId)).length;
+        precisionAt10 = Math.round((hit / top10.length) * 100) / 100;
+        await appendSignalMetric("precision_at_10", precisionAt10, {
+          date: todayIso,
+          interacted: hit,
+          rendered: top10.length,
+        });
+      }
+    }
+
     await persistSignalEvents({ created: [], updated: [...updatedEvents] });
     const stamped = await stampSignalRowsById(stamps);
 
@@ -249,7 +304,7 @@ export async function runSignalsReconcile(): Promise<ReconcileResult> {
       action: "sync",
       source: "signals_reconcile",
       status: "ok",
-      summary: `Signals reconcile · ${lateMerges} late merge${lateMerges === 1 ? "" : "s"} · ${dbp} detected-before-press · ${lateClustered} late-clustered · ${stamped} rows restamped`,
+      summary: `Signals reconcile · ${lateMerges} late merge${lateMerges === 1 ? "" : "s"} · ${dbp} detected-before-press · ${lateClustered} late-clustered · ${ignoredRows.length} ignored · ${stamped} rows restamped${precisionAt10 != null ? ` · p@10 ${precisionAt10}` : ""}`,
       records: stamped,
       details: {
         lateMerges,
@@ -257,10 +312,19 @@ export async function runSignalsReconcile(): Promise<ReconcileResult> {
         lateClustered,
         rowsResynced: resync,
         stamped,
+        ignoredComputed: ignoredRows.length,
+        precisionAt10,
       },
     });
 
-    return { ok: true, lateMerges, detectedBeforePress: dbp, rowsResynced: resync };
+    return {
+      ok: true,
+      lateMerges,
+      detectedBeforePress: dbp,
+      rowsResynced: resync,
+      ignoredComputed: ignoredRows.length,
+      precisionAt10,
+    };
   } catch (err) {
     const message = err instanceof Error ? err.message : "Signals reconcile failed";
     console.error("[signals-reconcile] failed:", err);
@@ -271,6 +335,14 @@ export async function runSignalsReconcile(): Promise<ReconcileResult> {
       summary: message,
       records: 0,
     });
-    return { ok: false, error: message, lateMerges: 0, detectedBeforePress: 0, rowsResynced: 0 };
+    return {
+      ok: false,
+      error: message,
+      lateMerges: 0,
+      detectedBeforePress: 0,
+      rowsResynced: 0,
+      ignoredComputed: 0,
+      precisionAt10: null,
+    };
   }
 }

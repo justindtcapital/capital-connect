@@ -1,6 +1,10 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { scanSignals, fetchSignals, fetchSignalBody } from "@/utils/gemini.functions";
+import {
+  logSignalFeedback,
+  fetchSignalQualityMetrics,
+} from "@/utils/signal-feedback.functions";
 import { fetchLinkedInFeed } from "@/utils/linkedin.functions";
 import { fetchDriveDocs } from "@/utils/drive.functions";
 import { fetchGmailFeed } from "@/utils/gmail.functions";
@@ -103,6 +107,12 @@ const DATE_RANGES: Record<string, number> = {
   "60": 60,
   "90": 90,
 };
+
+// WS5 feed budget — presentation-layer only (downstream consumers read all
+// rows). Mirrors DEFAULT_SIGNAL_CONFIG.feed; the sheet-config override applies
+// server-side scores, these only shape the morning view.
+const FEED_BUDGET_N = 8;
+const FEED_MIN_RANK = 20;
 
 // ── Grounded score chips ─────────────────────────────────────────
 function oppClass(score: number): string {
@@ -324,7 +334,15 @@ function SignalsPage() {
   const { signals: stored, linkedin, drive, gmail, portfolio, contacts } = Route.useLoaderData();
   const { q: focusQuery } = Route.useSearch();
   const [windowDays, setWindowDays] = useState("14");
-  const [sortBy, setSortBy] = useState<"fresh" | "opportunity">("opportunity");
+  const [sortBy, setSortBy] = useState<"fresh" | "opportunity" | "rank">("rank");
+  const [lowerOpen, setLowerOpen] = useState(false);
+  // p@10 trend for the header readout (lazy — never blocks the feed).
+  const [precision, setPrecision] = useState<Array<{ date: string; value: number }>>([]);
+  useEffect(() => {
+    fetchSignalQualityMetrics()
+      .then((r) => setPrecision(r.precisionAt10.slice(-14)))
+      .catch(() => {});
+  }, []);
   const [scanning, setScanning] = useState(false);
   const [result, setResult] = useState(
     stored && (stored.recommendations.length > 0 || stored.otherSignals.length > 0) ? stored : null,
@@ -355,6 +373,9 @@ function SignalsPage() {
   ) => {
     if (!card.storedId) return;
     setVerdicts((prev) => ({ ...prev, [card.id]: verdict }));
+    // "Not useful" is the feed's dismissal — it also lands in the WS5
+    // interaction log so the nightly job never counts the card as ignored.
+    if (verdict === "not_useful") logFeedback(card, "dismissed");
     try {
       await recordVerdict({
         data: {
@@ -444,10 +465,19 @@ function SignalsPage() {
         (a, b) => (b.insight?.scores.opportunity ?? 0) - (a.insight?.scores.opportunity ?? 0),
       );
     }
+    if (sortBy === "rank") {
+      // Materiality rank first; unscored cards fall back to opportunity below
+      // every scored card.
+      return [...out].sort(
+        (a, b) =>
+          (b.rankScore ?? -1) - (a.rankScore ?? -1) ||
+          (b.insight?.scores.opportunity ?? 0) - (a.insight?.scores.opportunity ?? 0),
+      );
+    }
     return out;
   }, [feed, search, dateRange, sourceSel, segSel, coSel, invSel, indSel, keyCompaniesOnly, sortBy]);
 
-  const activeFilters =
+  const activeFilterCount =
     sourceSel.length +
     segSel.length +
     coSel.length +
@@ -456,6 +486,83 @@ function SignalsPage() {
     (search ? 1 : 0) +
     (dateRange !== "120" ? 1 : 0) +
     (keyCompaniesOnly ? 1 : 0);
+
+  // ── WS5 feed budget & abstention (presentation-layer only) ──────
+  // In rank mode with no filters active, the morning view shows at most
+  // FEED_BUDGET_N cards clearing FEED_MIN_RANK; the rest collapse into
+  // "Lower priority (K)" — fully retrievable, never padded.
+  const budgetActive = sortBy === "rank" && activeFilterCount === 0;
+  const { topCards, lowerCards } = useMemo(() => {
+    if (!budgetActive) return { topCards: filtered, lowerCards: [] as FeedCard[] };
+    const top: FeedCard[] = [];
+    const lower: FeedCard[] = [];
+    for (const c of filtered) {
+      if (top.length < FEED_BUDGET_N && (c.rankScore ?? -1) >= FEED_MIN_RANK) top.push(c);
+      else lower.push(c);
+    }
+    return { topCards: top, lowerCards: lower };
+  }, [filtered, budgetActive]);
+
+  // Rank position (1-based) of each top card — frozen into feedback rows.
+  const rankPositionOf = (card: FeedCard): number | null => {
+    const i = topCards.indexOf(card);
+    return i >= 0 ? i + 1 : null;
+  };
+
+  // What actually renders: the budgeted top-N, plus the lower tier only when
+  // the user expands it. Without the budget, everything (as before).
+  const displayCards = budgetActive ? (lowerOpen ? [...topCards, ...lowerCards] : topCards) : filtered;
+
+  // ── WS5 instrumentation ─────────────────────────────────────────
+  const logFeedback = (
+    card: FeedCard,
+    action: "rendered" | "expanded" | "clicked_source" | "actioned" | "dismissed",
+  ) => {
+    logSignalFeedback({
+      data: {
+        user: authEmail || undefined,
+        events: [
+          {
+            eventId: card.eventId,
+            signalId: card.storedId,
+            action,
+            rankPosition: rankPositionOf(card),
+            features: {
+              opportunity: card.insight?.scores.opportunity,
+              clientRank: card.rankScore,
+              badges: card.badges?.join(";") || undefined,
+            },
+          },
+        ],
+      },
+    }).catch(() => {});
+  };
+  // One "rendered" batch per page load for the budgeted top-N.
+  const renderedLogged = useRef(false);
+  useEffect(() => {
+    if (renderedLogged.current || !budgetActive || topCards.length === 0) return;
+    renderedLogged.current = true;
+    logSignalFeedback({
+      data: {
+        user: authEmail || undefined,
+        events: topCards
+          .filter((c) => c.eventId || c.storedId)
+          .map((c, i) => ({
+            eventId: c.eventId,
+            signalId: c.storedId,
+            action: "rendered" as const,
+            rankPosition: i + 1,
+            features: {
+              opportunity: c.insight?.scores.opportunity,
+              clientRank: c.rankScore,
+            },
+          })),
+      },
+    }).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [budgetActive, topCards]);
+
+  const activeFilters = activeFilterCount;
   const clearFilters = () => {
     setSearch("");
     setDateRange("120");
@@ -537,6 +644,7 @@ function SignalsPage() {
       toast.error("No email on file for this contact.");
       return;
     }
+    logFeedback(card, "actioned");
     setDraftContact({
       id: `signal-${conn.email}`,
       name: conn.name || "",
@@ -803,8 +911,23 @@ function SignalsPage() {
           {!scanning && !nothingAtAll && (
             <>
               <div className="flex items-center justify-between mb-3 gap-3">
-                <div className="text-xs text-muted-foreground">
-                  {filtered.length} of {feed.length} signals
+                <div className="text-xs text-muted-foreground flex items-center gap-3">
+                  <span>
+                    {budgetActive
+                      ? `Top ${topCards.length} of ${filtered.length} events`
+                      : `${filtered.length} of ${feed.length} signals`}
+                  </span>
+                  {precision.length > 0 && (
+                    <span
+                      title={`precision@10 by day: ${precision.map((p) => `${p.date.slice(5)} ${(p.value * 100).toFixed(0)}%`).join(" · ")}`}
+                      className="rounded border border-border px-1.5 py-0.5 text-[10px] tabular-nums"
+                    >
+                      p@10 {(precision[precision.length - 1].value * 100).toFixed(0)}%
+                      {precision.length > 1
+                        ? ` · 14d avg ${((precision.reduce((s, p) => s + p.value, 0) / precision.length) * 100).toFixed(0)}%`
+                        : ""}
+                    </span>
+                  )}
                 </div>
                 <div className="flex items-center gap-1.5">
                   <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
@@ -812,12 +935,13 @@ function SignalsPage() {
                   </span>
                   <Select
                     value={sortBy}
-                    onValueChange={(v) => setSortBy(v as "fresh" | "opportunity")}
+                    onValueChange={(v) => setSortBy(v as "fresh" | "opportunity" | "rank")}
                   >
-                    <SelectTrigger className="h-7 w-36 text-xs">
+                    <SelectTrigger className="h-7 w-40 text-xs">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
+                      <SelectItem value="rank">Materiality rank</SelectItem>
                       <SelectItem value="opportunity">Top opportunity</SelectItem>
                       <SelectItem value="fresh">Newest</SelectItem>
                     </SelectContent>
@@ -830,7 +954,7 @@ function SignalsPage() {
                 </p>
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3 items-start">
-                  {filtered.map((card) => {
+                  {displayCards.map((card) => {
                     const isOpen = expanded === card.id;
                     return (
                       <article
@@ -845,6 +969,7 @@ function SignalsPage() {
                             const opening = !isOpen;
                             setExpanded(opening ? card.id : null);
                             if (opening && card.bodyElided) loadBody(card);
+                            if (opening) logFeedback(card, "expanded");
                           }}
                           className="w-full text-left p-4 hover:bg-accent/30 transition-colors flex-1"
                         >
@@ -932,6 +1057,7 @@ function SignalsPage() {
                                     href={card.sourceUrl}
                                     target="_blank"
                                     rel="noopener noreferrer"
+                                    onClick={() => logFeedback(card, "clicked_source")}
                                     className="inline-flex items-center gap-1.5 text-xs font-medium text-primary hover:underline"
                                   >
                                     {card.sourceIsSearch ? "Find the original source" : "Read more"}
@@ -953,7 +1079,10 @@ function SignalsPage() {
                                 <Button
                                   size="sm"
                                   className="h-8 ml-auto text-xs"
-                                  onClick={() => setBroadcastCard(card)}
+                                  onClick={() => {
+                                    setBroadcastCard(card);
+                                    logFeedback(card, "actioned");
+                                  }}
                                 >
                                   <Share2 className="h-3.5 w-3.5" /> Share
                                 </Button>
@@ -1052,6 +1181,30 @@ function SignalsPage() {
                       </article>
                     );
                   })}
+                </div>
+              )}
+
+              {/* WS5 — abstention + the collapsed lower-priority tier. */}
+              {budgetActive && topCards.length < FEED_BUDGET_N && (
+                <p className="text-xs text-muted-foreground text-center mt-4">
+                  Nothing else material today — {topCards.length} of {FEED_BUDGET_N} budget
+                  used. Quiet days stay quiet; the feed does not pad.
+                </p>
+              )}
+              {budgetActive && lowerCards.length > 0 && (
+                <div className="mt-4 text-center">
+                  <button
+                    type="button"
+                    onClick={() => setLowerOpen((v) => !v)}
+                    className="inline-flex items-center gap-1.5 rounded-md border border-border bg-muted/40 px-3 py-1.5 text-xs text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+                  >
+                    {lowerOpen ? (
+                      <ChevronDown className="h-3.5 w-3.5" />
+                    ) : (
+                      <ChevronRight className="h-3.5 w-3.5" />
+                    )}
+                    Lower priority ({lowerCards.length})
+                  </button>
                 </div>
               )}
             </>

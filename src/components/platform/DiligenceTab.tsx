@@ -3,7 +3,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { ChevronRight, Loader2, SearchCheck } from "lucide-react";
+import { ChevronRight, Loader2, Plus, SearchCheck, X } from "lucide-react";
 import { toast } from "sonner";
 import type { DiligencePayload, PlatformContentRow } from "@/lib/platform-content";
 import { runPlatformDiligence } from "@/utils/platform.functions";
@@ -16,6 +16,21 @@ import {
 
 const labelClass =
   "text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block";
+
+// Common grading dimensions offered as one-tap chips. Free-text entry covers
+// everything else; leaving the rubric empty lets the model pick its own.
+const PRESET_METRICS = [
+  "Team",
+  "Market size",
+  "Technology / moat",
+  "Traction",
+  "Competition",
+  "Go-to-market",
+  "Business model",
+  "Regulatory risk",
+] as const;
+
+const MAX_METRICS = 10;
 
 function diligenceScore(row: PlatformContentRow): number | null {
   const p = row.payload as DiligencePayload | undefined;
@@ -38,6 +53,8 @@ export function DiligenceTab({
 }) {
   const [company, setCompany] = useState(prefillCompany);
   const [website, setWebsite] = useState("");
+  const [metrics, setMetrics] = useState<string[]>([]);
+  const [metricDraft, setMetricDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [detailRow, setDetailRow] = useState<PlatformContentRow | null>(null);
 
@@ -48,6 +65,20 @@ export function DiligenceTab({
 
   const history = content.filter((r) => r.type === "diligence");
 
+  const addMetric = (raw: string) => {
+    const m = raw.trim().slice(0, 60);
+    if (!m) return;
+    setMetrics((prev) =>
+      prev.length >= MAX_METRICS ||
+      prev.some((x) => x.toLowerCase() === m.toLowerCase())
+        ? prev
+        : [...prev, m],
+    );
+    setMetricDraft("");
+  };
+
+  const removeMetric = (m: string) => setMetrics((prev) => prev.filter((x) => x !== m));
+
   const run = async () => {
     if (!company.trim()) return;
     setBusy(true);
@@ -57,6 +88,7 @@ export function DiligenceTab({
           company: company.trim(),
           website: website.trim() || undefined,
           generatedBy: userEmail,
+          criteria: metrics.length > 0 ? metrics : undefined,
         },
       });
       onContent(row);
@@ -101,6 +133,64 @@ export function DiligenceTab({
             {busy ? "Researching…" : "Run diligence"}
           </Button>
         </div>
+
+        {/* Grading rubric — optional user-defined dimensions the scorer must use */}
+        <div className="mt-3">
+          <Label className={labelClass}>Grading metrics (optional)</Label>
+          <div className="flex flex-wrap items-center gap-1.5">
+            {metrics.map((m) => (
+              <Badge key={m} variant="secondary" className="text-[11px] gap-1 pr-1">
+                {m}
+                <button
+                  type="button"
+                  onClick={() => removeMetric(m)}
+                  className="rounded-full hover:bg-muted-foreground/20 p-0.5"
+                  title={`Remove ${m}`}
+                >
+                  <X className="h-2.5 w-2.5" />
+                </button>
+              </Badge>
+            ))}
+            <Input
+              className="h-7 w-56 text-xs"
+              value={metricDraft}
+              onChange={(e) => setMetricDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  addMetric(metricDraft);
+                }
+              }}
+              placeholder={
+                metrics.length >= MAX_METRICS
+                  ? `Max ${MAX_METRICS} metrics`
+                  : "Type a metric and press Enter…"
+              }
+              disabled={metrics.length >= MAX_METRICS}
+            />
+          </div>
+          <div className="flex flex-wrap items-center gap-1 mt-1.5">
+            {PRESET_METRICS.filter(
+              (p) => !metrics.some((m) => m.toLowerCase() === p.toLowerCase()),
+            ).map((p) => (
+              <button
+                key={p}
+                type="button"
+                onClick={() => addMetric(p)}
+                disabled={metrics.length >= MAX_METRICS}
+                className="inline-flex items-center gap-0.5 text-[10px] px-1.5 py-0.5 rounded-full border border-dashed border-border text-muted-foreground hover:text-foreground hover:bg-accent disabled:opacity-40"
+              >
+                <Plus className="h-2.5 w-2.5" /> {p}
+              </button>
+            ))}
+          </div>
+          <p className="text-[10px] text-muted-foreground/70 mt-1">
+            {metrics.length > 0
+              ? "The report will grade the company on exactly these dimensions."
+              : "Leave empty and the AI picks the 4–6 most material dimensions itself."}
+          </p>
+        </div>
+
         <p className="text-[11px] text-muted-foreground mt-2">
           Runs grounded web research, folds in Signal Radar items, scores thesis fit (1–10), and
           drafts management questions — 2 AI calls. If Vertex is rate-limited (429), it backs off

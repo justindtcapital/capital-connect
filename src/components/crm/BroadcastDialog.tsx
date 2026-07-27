@@ -84,7 +84,13 @@ export function BroadcastDialog({ open, onOpenChange, card, onEmailTarget }: Bro
     setTargets(null);
     try {
       const res = await scoreNetworkTargets({
-        data: { company: card.company, headline: card.headline, summary: card.summary, segment: card.segment },
+        data: {
+          company: card.company,
+          companyDomain: card.logoDomain,
+          headline: card.headline,
+          summary: card.summary,
+          segment: card.segment,
+        },
       });
       if (!res.ok) {
         toast.error(res.error || "Could not score contacts.");
@@ -161,7 +167,7 @@ export function BroadcastDialog({ open, onOpenChange, card, onEmailTarget }: Bro
           <div className="space-y-3 py-1">
             <div className="flex items-center justify-between gap-2">
               <p className="text-xs text-muted-foreground">
-                Score your network for who this signal is most relevant to.
+                Shortlist only strong fits — specific topical overlap, not a long maybe-list.
               </p>
               <Button size="sm" className="h-8 text-xs shrink-0" onClick={findTargets} disabled={targetsBusy}>
                 {targetsBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Users className="h-3.5 w-3.5" />}

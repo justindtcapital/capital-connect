@@ -187,10 +187,17 @@ export const generateMgmtQuestions = createServerFn({ method: "POST" })
   });
 
 export const runPlatformDiligence = createServerFn({ method: "POST" })
-  .inputValidator((data: { company: string; website?: string; generatedBy: string }) => data)
+  .inputValidator(
+    (data: { company: string; website?: string; generatedBy: string; criteria?: string[] }) => data,
+  )
   .handler(async ({ data }) => {
     if (!data.company?.trim()) throw new Error("Company is required");
-    return await runDiligenceServer(data.company.trim(), data.website?.trim(), data.generatedBy);
+    return await runDiligenceServer(
+      data.company.trim(),
+      data.website?.trim(),
+      data.generatedBy,
+      data.criteria,
+    );
   });
 
 // ── Investment theses + screening (Sourcing tab) ─────────────────

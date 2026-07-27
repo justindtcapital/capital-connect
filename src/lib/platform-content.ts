@@ -237,6 +237,8 @@ export interface DiligencePayload {
   sources: string[];
   /** Stored Signal Radar headlines that were fed into the run (absent on older rows). */
   signalsUsed?: string[];
+  /** User-chosen grading metrics for this run; absent = model picked its own dimensions. */
+  criteria?: string[];
 }
 
 export type PlatformContentPayload =

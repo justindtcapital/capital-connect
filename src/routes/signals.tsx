@@ -5,6 +5,8 @@ import { fetchLinkedInFeed } from "@/utils/linkedin.functions";
 import { fetchDriveDocs } from "@/utils/drive.functions";
 import { fetchGmailFeed } from "@/utils/gmail.functions";
 import { fetchPortfolioCompanies, fetchContacts } from "@/utils/sheets.functions";
+import { recordVerdict } from "@/utils/intel.functions";
+import { useAuth } from "@/lib/auth-context";
 import type { Contact, PortfolioCompany } from "@/lib/types";
 import {
   buildFeed,
@@ -288,6 +290,28 @@ function SignalsPage() {
   // keyed by card id, plus in-flight tracking.
   const [bodies, setBodies] = useState<Record<string, string>>({});
   const [bodyBusy, setBodyBusy] = useState<Record<string, boolean>>({});
+  // Partner feedback per card — labels for the intel learning loop.
+  const [verdicts, setVerdicts] = useState<Record<string, string>>({});
+  const { email: authEmail } = useAuth();
+  const submitVerdict = async (
+    card: FeedCard,
+    verdict: "useful" | "not_useful" | "already_knew",
+  ) => {
+    if (!card.storedId) return;
+    setVerdicts((prev) => ({ ...prev, [card.id]: verdict }));
+    try {
+      await recordVerdict({
+        data: {
+          signalId: card.storedId,
+          company: card.company,
+          verdict,
+          user: authEmail || undefined,
+        },
+      });
+    } catch (e) {
+      console.error("recordVerdict failed", e);
+    }
+  };
 
   const loadBody = async (card: FeedCard) => {
     if (!card.storedId || bodies[card.id] != null || bodyBusy[card.id]) return;
@@ -877,6 +901,36 @@ function SignalsPage() {
                                   <Share2 className="h-3.5 w-3.5" /> Share
                                 </Button>
                               </div>
+                              {card.storedId && (
+                                <div className="flex items-center gap-1.5 pt-1">
+                                  {verdicts[card.id] ? (
+                                    <span className="text-[10px] text-muted-foreground">
+                                      Feedback recorded — thanks.
+                                    </span>
+                                  ) : (
+                                    <>
+                                      <span className="text-[10px] text-muted-foreground mr-1">
+                                        Was this useful?
+                                      </span>
+                                      {(
+                                        [
+                                          ["useful", "Useful"],
+                                          ["not_useful", "Not useful"],
+                                          ["already_knew", "Already knew"],
+                                        ] as const
+                                      ).map(([v, label]) => (
+                                        <button
+                                          key={v}
+                                          onClick={() => submitVerdict(card, v)}
+                                          className="text-[10px] px-1.5 py-0.5 rounded border border-border hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"
+                                        >
+                                          {label}
+                                        </button>
+                                      ))}
+                                    </>
+                                  )}
+                                </div>
+                              )}
                             </div>
 
                             {/* Why it matters + scoring + who might care — pushed to the bottom

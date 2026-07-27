@@ -16,6 +16,9 @@ import { isDriveConfigured, listDriveDocs, downloadDriveFile } from "./drive.ser
 import { isNewsConfigured, fetchNewsForCompanies } from "./news.server";
 import { isPerplexityConfigured, fetchPerplexityNews } from "./perplexity.server";
 import { gatherNetworkEmails, type GmailSignal } from "./gmail.functions";
+import { buildRadarWatchlist } from "./platform.server";
+import { scoreAttribution } from "@/lib/attribution-score";
+import type { Contact } from "@/lib/types";
 // Signal persistence (Signals tab row contract) lives in signal-store.server —
 // shared with the Gmail digest pipeline, which archives per-link signals too.
 import {
@@ -442,9 +445,69 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
       return fresh;
     }
 
+    // ── Grounded attribution relevance ──────────────────────────
+    // The model's 1–10 relevance is only a prior. Recompute relevance from CRM
+    // evidence (warmth, engagement, role fit, stated interests, portfolio
+    // overlap, actionability), validate the attribution (email must resolve to
+    // a real contact; CRM must agree on employer), and append the component
+    // breakdown to the justification so every score is inspectable.
+    let watchNames = new Set<string>();
+    try {
+      watchNames = new Set(
+        (await buildRadarWatchlist()).map((w) => w.company.trim().toLowerCase()),
+      );
+    } catch {
+      /* watchlist unavailable — portfolio fit falls back to sector overlap */
+    }
+    const portfolioSectors = [
+      ...new Set(portfolio.map((p) => (p.sector || "").trim().toLowerCase()).filter(Boolean)),
+    ];
+    const contactByEmail = new Map<string, Contact>();
+    const contactsByName = new Map<string, Contact[]>();
+    for (const c of contacts) {
+      for (const em of (c.email || "").split(";")) {
+        const key = em.trim().toLowerCase();
+        if (key && !contactByEmail.has(key)) contactByEmail.set(key, c);
+      }
+      const nameKey = c.name.trim().toLowerCase();
+      if (nameKey) contactsByName.set(nameKey, [...(contactsByName.get(nameKey) || []), c]);
+    }
+    const resolveContact = (email: string, person: string): Contact | undefined => {
+      const byEmail = contactByEmail.get((email || "").trim().toLowerCase());
+      if (byEmail) return byEmail;
+      // Name fallback only when unambiguous — never guess between namesakes.
+      const byName = contactsByName.get((person || "").trim().toLowerCase());
+      return byName && byName.length === 1 ? byName[0] : undefined;
+    };
+    const rescoredRecs = fresh.recommendations.map((r) => {
+      const contact = resolveContact(r.email, r.person);
+      const att = scoreAttribution(
+        {
+          person: r.person,
+          email: r.email,
+          company: r.company,
+          category: r.category,
+          signal: r.signal,
+          llmRelevance: r.relevance,
+        },
+        {
+          contact,
+          isPortcoCompany: portcoNames.has((r.company || "").trim().toLowerCase()),
+          isWatchlistCompany: watchNames.has((r.company || "").trim().toLowerCase()),
+          portfolioSectors,
+        },
+      );
+      return {
+        ...r,
+        relevance: att.relevance,
+        // Grounded breakdown FIRST so it survives the justification length clamp.
+        justification: [att.summary, r.justification].filter(Boolean).join(" — "),
+      };
+    });
+
     const dateFound = new Date().toISOString().split("T")[0];
     const candidates = [
-      ...fresh.recommendations.map((r) => storedFromRec(r, dateFound, portcoNames)),
+      ...rescoredRecs.map((r) => storedFromRec(r, dateFound, portcoNames)),
       ...fresh.otherSignals.map((a) => storedFromAwareness(a, dateFound, portcoNames)),
     ];
 

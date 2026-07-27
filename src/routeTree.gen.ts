@@ -22,6 +22,7 @@ import { Route as ActivityRouteImport } from './routes/activity'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as ApiInngestRouteImport } from './routes/api/inngest'
 import { Route as ApiCronScanSignalsRouteImport } from './routes/api/cron/scan-signals'
+import { Route as ApiCronIntelScanRouteImport } from './routes/api/cron/intel-scan'
 
 const TargetingRoute = TargetingRouteImport.update({
   id: '/targeting',
@@ -88,6 +89,11 @@ const ApiCronScanSignalsRoute = ApiCronScanSignalsRouteImport.update({
   path: '/api/cron/scan-signals',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiCronIntelScanRoute = ApiCronIntelScanRouteImport.update({
+  id: '/api/cron/intel-scan',
+  path: '/api/cron/intel-scan',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -102,6 +108,7 @@ export interface FileRoutesByFullPath {
   '/signals': typeof SignalsRoute
   '/targeting': typeof TargetingRoute
   '/api/inngest': typeof ApiInngestRoute
+  '/api/cron/intel-scan': typeof ApiCronIntelScanRoute
   '/api/cron/scan-signals': typeof ApiCronScanSignalsRoute
 }
 export interface FileRoutesByTo {
@@ -117,6 +124,7 @@ export interface FileRoutesByTo {
   '/signals': typeof SignalsRoute
   '/targeting': typeof TargetingRoute
   '/api/inngest': typeof ApiInngestRoute
+  '/api/cron/intel-scan': typeof ApiCronIntelScanRoute
   '/api/cron/scan-signals': typeof ApiCronScanSignalsRoute
 }
 export interface FileRoutesById {
@@ -133,6 +141,7 @@ export interface FileRoutesById {
   '/signals': typeof SignalsRoute
   '/targeting': typeof TargetingRoute
   '/api/inngest': typeof ApiInngestRoute
+  '/api/cron/intel-scan': typeof ApiCronIntelScanRoute
   '/api/cron/scan-signals': typeof ApiCronScanSignalsRoute
 }
 export interface FileRouteTypes {
@@ -150,6 +159,7 @@ export interface FileRouteTypes {
     | '/signals'
     | '/targeting'
     | '/api/inngest'
+    | '/api/cron/intel-scan'
     | '/api/cron/scan-signals'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -165,6 +175,7 @@ export interface FileRouteTypes {
     | '/signals'
     | '/targeting'
     | '/api/inngest'
+    | '/api/cron/intel-scan'
     | '/api/cron/scan-signals'
   id:
     | '__root__'
@@ -180,6 +191,7 @@ export interface FileRouteTypes {
     | '/signals'
     | '/targeting'
     | '/api/inngest'
+    | '/api/cron/intel-scan'
     | '/api/cron/scan-signals'
   fileRoutesById: FileRoutesById
 }
@@ -196,6 +208,7 @@ export interface RootRouteChildren {
   SignalsRoute: typeof SignalsRoute
   TargetingRoute: typeof TargetingRoute
   ApiInngestRoute: typeof ApiInngestRoute
+  ApiCronIntelScanRoute: typeof ApiCronIntelScanRoute
   ApiCronScanSignalsRoute: typeof ApiCronScanSignalsRoute
 }
 
@@ -292,6 +305,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiCronScanSignalsRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/cron/intel-scan': {
+      id: '/api/cron/intel-scan'
+      path: '/api/cron/intel-scan'
+      fullPath: '/api/cron/intel-scan'
+      preLoaderRoute: typeof ApiCronIntelScanRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
@@ -308,6 +328,7 @@ const rootRouteChildren: RootRouteChildren = {
   SignalsRoute: SignalsRoute,
   TargetingRoute: TargetingRoute,
   ApiInngestRoute: ApiInngestRoute,
+  ApiCronIntelScanRoute: ApiCronIntelScanRoute,
   ApiCronScanSignalsRoute: ApiCronScanSignalsRoute,
 }
 export const routeTree = rootRouteImport

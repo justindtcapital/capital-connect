@@ -1605,9 +1605,16 @@ export async function runDiligence(
   company: string,
   website: string | undefined,
   generatedBy: string,
+  criteria?: string[],
 ): Promise<PlatformContentRow> {
   return audited("platform-diligence", `Diligence run — ${company}`, async () => {
     const site = website ? ` (website: ${website})` : "";
+    // User-defined grading rubric: when present, the model must grade on exactly
+    // these dimensions instead of choosing its own. Sanitized here so a stray
+    // long paste can't blow up the prompt.
+    const rubric = [
+      ...new Set((criteria ?? []).map((c) => c.trim().slice(0, 60)).filter(Boolean)),
+    ].slice(0, 10);
     // Stored Signal Radar rows for this company are part of the findings too —
     // exact company match first, then a name-mention fallback across all rows.
     const signalsPromise = readSignalHeadlines({ company }, 10).then(async (exact) => {
@@ -1618,6 +1625,9 @@ export async function runDiligence(
       groundedSearch(
         `Research the company "${company}"${site}: what the product/technology is, funding history and investors, ` +
           `target market and business model, main competitors, traction or notable customers, and founding team. ` +
+          (rubric.length > 0
+            ? `Pay particular attention to anything relevant to: ${rubric.join("; ")}. `
+            : "") +
           `Be factual; say clearly when something could not be found.`,
         1500,
       ),
@@ -1638,6 +1648,9 @@ export async function runDiligence(
       [
         "You are diligence support for a deep-tech VC (security, AI, data, cloud, infrastructure, silicon, supply chain).",
         "Score ONLY from the provided findings; do not invent facts.",
+        rubric.length > 0
+          ? `Grade the company on EXACTLY these dimensions, one entry per dimension using these names verbatim: ${rubric.map((r) => `"${r}"`).join(", ")}. If the findings say nothing about a dimension, score it low and say so in the note rather than guessing.`
+          : "Choose the 4-6 dimensions most material to this company.",
         "Also draft management questions grounded in findings / weak dimensions — no generic questionnaires.",
         'Group questions by area ("Product", "Market", "Traction", "Team", or "Risks").',
         'Output ONLY JSON: {"score":<1-10>,"dimensions":[{"name":"","score":<1-10>,"note":""}],"rationale":"","questions":[{"area":"","question":"","why":""}]}',
@@ -1666,6 +1679,7 @@ export async function runDiligence(
       signalsUsed: signalHeadlines.map(
         (s) => `${s.date ? `[${s.date}] ` : ""}${s.category ? `(${s.category}) ` : ""}${s.signal}`,
       ),
+      ...(rubric.length > 0 ? { criteria: rubric } : {}),
     };
     return savePlatformContent({
       type: "diligence",

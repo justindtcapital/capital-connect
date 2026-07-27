@@ -540,8 +540,9 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
       await ensureHeaderWidth(TAB_NAMES.signals, SIGNAL_HEADERS);
       // Event clustering (WS1): one real-world event per card — candidates get
       // an eventId FK; new sources for known events join the existing event.
-      const { enriched } = await processCandidatesIntoEvents(toAppend);
-      await appendSheetRows(TAB_NAMES.signals, enriched.map(rowFromStored));
+      // extraRows = synthetic burst meta-event cards (WS4).
+      const { enriched, extraRows } = await processCandidatesIntoEvents(toAppend);
+      await appendSheetRows(TAB_NAMES.signals, [...enriched, ...extraRows].map(rowFromStored));
     }
 
     await logOpsEvent({

@@ -28,8 +28,8 @@ import {
   processCandidatesIntoEvents,
   type SignalRowStamp,
 } from "./event-pipeline.server";
-import { fetchStoredSignals } from "./signal-store.server";
-import { logOpsEvent } from "./sheets.server";
+import { fetchStoredSignals, rowFromStored } from "./signal-store.server";
+import { logOpsEvent, appendSheetRows, TAB_NAMES } from "./sheets.server";
 import {
   matchIntelCorroboration,
   newsTypesForIntelState,
@@ -204,7 +204,11 @@ export async function runSignalsReconcile(): Promise<ReconcileResult> {
     );
     let lateClustered = 0;
     if (unclustered.length > 0) {
-      const { enriched } = await processCandidatesIntoEvents(unclustered);
+      const { enriched, extraRows } = await processCandidatesIntoEvents(unclustered);
+      if (extraRows.length > 0) {
+        // Burst meta-event cards created during reconcile are NEW rows.
+        await appendSheetRows(TAB_NAMES.signals, extraRows.map(rowFromStored));
+      }
       for (const s of enriched) {
         if (!s.eventId) continue;
         stamps.set(s.id, {

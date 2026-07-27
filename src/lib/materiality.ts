@@ -15,6 +15,10 @@
 // verbatim in grounded source text is discarded (the event survives).
 
 import type { SignalConfig, SignalEventType } from "@/lib/signal-config";
+// WS4 reuses the intel engine's robust-statistics machinery (MAD z with sigma
+// floor) rather than reimplementing it — intel-detect is pure with zero app
+// imports, so this stays client-safe and fixture-testable.
+import { computeStats } from "@/utils/intel-detect.server";
 
 export interface ScorePart {
   name: string;
@@ -195,6 +199,102 @@ export function applySurprise(
       value: Math.round(mult * 100) / 100,
       why: `cadence surprise ${s.toFixed(2)} → ×(${cfg.surprise.base} + ${cfg.surprise.span}·s)`,
     },
+  };
+}
+
+// ── WS4: surprise vs. the company's own event cadence ────────────
+// Materiality says "product launches matter"; surprise says "this company
+// launches weekly, so this one doesn't." Computed from the Signal Events
+// table's own history — no new collection.
+
+const dayMs = 86_400_000;
+const daysDiff = (aIso: string, bIso: string): number =>
+  Math.abs(Date.parse(aIso) - Date.parse(bIso)) / dayMs;
+
+export interface SurpriseInput {
+  /** first_seen dates of PRIOR same-type events for this company. */
+  sameTypePriorDates: string[];
+  /** first_seen dates of ALL prior events for this company (any type). */
+  anyTypePriorDates: string[];
+  /** The current event's date. */
+  currentDate: string;
+}
+
+/**
+ * surpriseNorm ∈ [0,1]. ≥3 prior same-type gaps → robust z of the current
+ * inter-arrival gap vs. the company's own gap history (computeStats — the
+ * intel engine's MAD machinery, reused per the brief). Sparse history falls
+ * back to explicit, documented defaults: a company quiet ≥ quietDays scores
+ * high (an event breaking silence IS surprising); an active company with no
+ * same-type history gets the cold-start default.
+ */
+export function eventSurprise(
+  input: SurpriseInput,
+  cfg: SignalConfig,
+): { surpriseNorm: number; why: string } {
+  const s = cfg.surprise;
+  const prior = [...input.sameTypePriorDates]
+    .filter((d) => d && d <= input.currentDate)
+    .sort();
+  if (prior.length < 2) {
+    const anyRecent = input.anyTypePriorDates.some(
+      (d) => d && d <= input.currentDate && daysDiff(input.currentDate, d) <= s.quietDays,
+    );
+    return anyRecent
+      ? {
+          surpriseNorm: s.coldStartDefault,
+          why: `no ${prior.length ? "second" : ""} same-type precedent; company otherwise active — cold-start default ${s.coldStartDefault}`,
+        }
+      : {
+          surpriseNorm: s.quietDefault,
+          why: `company quiet ≥ ${s.quietDays}d before this — quiet default ${s.quietDefault}`,
+        };
+  }
+  const gaps: Array<[string, number]> = [];
+  for (let i = 1; i < prior.length; i++) {
+    gaps.push([prior[i], daysDiff(prior[i], prior[i - 1])]);
+  }
+  const currentGap = daysDiff(input.currentDate, prior[prior.length - 1]);
+  if (gaps.length < 3) {
+    // Too few gaps for a meaningful z — ratio vs. the median gap instead.
+    const median = [...gaps.map(([, g]) => g)].sort((a, b) => a - b)[Math.floor(gaps.length / 2)];
+    const norm = Math.min(1, Math.max(0, currentGap / (2 * Math.max(median, 1))));
+    return {
+      surpriseNorm: Math.round(norm * 100) / 100,
+      why: `gap ${currentGap.toFixed(0)}d vs. median ${median.toFixed(0)}d (${gaps.length} prior gaps — ratio fallback)`,
+    };
+  }
+  const stats = computeStats([...gaps, [input.currentDate, currentGap]], currentGap);
+  const norm = Math.min(1, Math.max(0, 0.5 + stats.z / 4));
+  return {
+    surpriseNorm: Math.round(norm * 100) / 100,
+    why: `gap ${currentGap.toFixed(0)}d vs. baseline ${stats.baseline.toFixed(0)}d (robust z ${stats.z.toFixed(1)}, ${gaps.length} prior gaps)`,
+  };
+}
+
+/** Burst detector: ≥ burstMinEvents within burstWindowDays after a quiet
+ *  priorQuietDays ⇒ a synthetic "unusual_activity" meta-event. */
+export function detectBurst(
+  allEventDates: string[],
+  todayIso: string,
+  cfg: SignalConfig,
+): { burst: boolean; recentCount: number; why: string } {
+  const s = cfg.surprise;
+  const recent = allEventDates.filter(
+    (d) => d && d <= todayIso && daysDiff(todayIso, d) <= s.burstWindowDays,
+  );
+  const priorWindow = allEventDates.filter((d) => {
+    if (!d || d > todayIso) return false;
+    const age = daysDiff(todayIso, d);
+    return age > s.burstWindowDays && age <= s.burstWindowDays + s.priorQuietDays;
+  });
+  const burst = recent.length >= s.burstMinEvents && priorWindow.length === 0;
+  return {
+    burst,
+    recentCount: recent.length,
+    why: burst
+      ? `${recent.length} events in ${s.burstWindowDays}d after ${s.priorQuietDays}d of silence`
+      : `${recent.length} recent / ${priorWindow.length} in prior window`,
   };
 }
 

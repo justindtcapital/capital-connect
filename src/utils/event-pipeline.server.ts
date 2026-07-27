@@ -13,8 +13,10 @@
 import {
   fetchStoredSignals,
   rowFromStored,
+  keyForStored,
   type StoredSignal,
 } from "./signal-store.server";
+import { newsSourceType } from "@/lib/signal-feed";
 import { loadIntelEntities, INTEL_TABS } from "./intel.server";
 import {
   buildPortfolioCompanies,
@@ -61,6 +63,8 @@ import {
   eventRelevance,
   eventActionability,
   rankScore,
+  eventSurprise,
+  detectBurst,
   type MagnitudeProposal,
   type ValidatedMagnitude,
 } from "@/lib/materiality";
@@ -74,11 +78,15 @@ import {
 export interface PipelineResult {
   /** Candidates with eventId + scores stamped — append THESE. */
   enriched: StoredSignal[];
+  /** NEW synthetic rows (burst meta-events) the caller must ALSO append. */
+  extraRows: StoredSignal[];
   eventsCreated: number;
   eventsUpdated: number;
 }
 
 const today = () => new Date().toISOString().split("T")[0];
+const daysBetweenIso = (a: string, b: string) =>
+  Math.abs(Date.parse(a) - Date.parse(b)) / 86_400_000;
 
 // ── Context loading ──────────────────────────────────────────────
 
@@ -434,20 +442,25 @@ export async function processCandidatesIntoEvents(
   candidates: StoredSignal[],
 ): Promise<PipelineResult> {
   if (candidates.length === 0) {
-    return { enriched: candidates, eventsCreated: 0, eventsUpdated: 0 };
+    return { enriched: candidates, extraRows: [], eventsCreated: 0, eventsUpdated: 0 };
   }
   try {
     await ensureSignalV2Tabs();
     const ctx = await buildContext();
     const cfg = ctx.cfg;
     const classifications = await classifyCandidates(candidates);
-    // Trailing window ×2 so a candidate near the window edge still sees the event.
-    const stored = await loadSignalEvents({ sinceDays: cfg.clustering.windowDays * 2 });
+    // ~400d of events: the clustering pool only needs the trailing window, but
+    // the WS4 surprise term needs the company's own cadence history.
+    const allEvents = await loadSignalEvents({ sinceDays: 400 });
+    const poolCutoff = new Date(Date.now() - cfg.clustering.windowDays * 2 * 86_400_000)
+      .toISOString()
+      .split("T")[0];
+    const stored = allEvents.filter((e) => (e.lastUpdated || e.firstSeen) >= poolCutoff);
 
     const created: SignalEventRow[] = [];
     const updated = new Set<SignalEventRow>();
     const byId = new Map<string, SignalEventRow>();
-    for (const e of stored) byId.set(e.eventId, e);
+    for (const e of allEvents) byId.set(e.eventId, e);
     const openPool: OpenEventLite[] = stored.map((e) => toOpenLite(e));
     // Rec relevances per event accumulated this run (event row keeps only scores).
     const recRelByEvent = new Map<string, number[]>();
@@ -595,10 +608,126 @@ export async function processCandidatesIntoEvents(
         }
       }
       ev.confidence = eventConfidence(ev.sourceCount, ev.topTier, Boolean(ev.intelEventId), cfg);
+      // WS4 — surprise vs. the company's own cadence, from the events table.
+      const companyKey = normCompanyKey(ev.company);
+      const priorOf = (sameTypeOnly: boolean) =>
+        [...byId.values()]
+          .filter(
+            (p) =>
+              p.eventId !== ev.eventId &&
+              normCompanyKey(p.company) === companyKey &&
+              (!sameTypeOnly || p.eventType === ev.eventType) &&
+              p.firstSeen <= ev.firstSeen,
+          )
+          .map((p) => p.firstSeen);
+      const sur = eventSurprise(
+        {
+          sameTypePriorDates: priorOf(true),
+          anyTypePriorDates: priorOf(false),
+          currentDate: ev.firstSeen,
+        },
+        cfg,
+      );
+      ev.scoreBreakdown.surpriseWhy = sur.why;
       // Previously-scored relevance stays a candidate so joins never lower it.
       const rels = [...(recRelByEvent.get(ev.eventId) || [])];
       if (ev.relevance > 0) rels.push(ev.relevance);
-      scoreEvent(ev, facts, rels, cfg, { corroborationMultiplier });
+      scoreEvent(ev, facts, rels, cfg, { corroborationMultiplier, surpriseNorm: sur.surpriseNorm });
+    }
+
+    // ── WS4 — burst detector: quiet company suddenly generating events ──
+    const extraRows: StoredSignal[] = [];
+    const touchedCompanies = new Set([...touched].map((e) => normCompanyKey(e.company)));
+    for (const companyKey of touchedCompanies) {
+      const companyEvents = [...byId.values()].filter(
+        (e) => normCompanyKey(e.company) === companyKey && e.eventType !== "unusual_activity",
+      );
+      if (companyEvents.length === 0) continue;
+      const burst = detectBurst(companyEvents.map((e) => e.firstSeen), today(), cfg);
+      if (!burst.burst) continue;
+      // One live meta-event per company — refresh, never duplicate.
+      const existingMeta = [...byId.values()].find(
+        (e) =>
+          e.eventType === "unusual_activity" &&
+          normCompanyKey(e.company) === companyKey &&
+          e.status !== "closed" &&
+          (e.lastUpdated || e.firstSeen) >= poolCutoff,
+      );
+      const constituents = companyEvents
+        .filter((e) => daysBetweenIso(today(), e.firstSeen) <= cfg.surprise.burstWindowDays)
+        .sort((a, b) => b.rankScore - a.rankScore);
+      const companyName = constituents[0]?.company || companyEvents[0].company;
+      const facts = factsFor(ctx, companyName);
+      if (existingMeta) {
+        existingMeta.constituentIds = [...new Set(constituents.map((e) => e.eventId))];
+        existingMeta.lastUpdated = today();
+        scoreEvent(existingMeta, facts, [], cfg, { surpriseNorm: 1 });
+        updated.add(existingMeta);
+        continue;
+      }
+      const meta: SignalEventRow = {
+        eventId: newEventId(),
+        company: companyName,
+        entityUrid: facts.urid || "",
+        eventType: "unusual_activity",
+        firstSeen: today(),
+        lastUpdated: today(),
+        status: "open",
+        sourceCount: constituents.length,
+        topSourceUrl: constituents[0]?.topSourceUrl || "",
+        topTier: constituents[0]?.topTier || "C",
+        sources: [],
+        confidence: eventConfidence(constituents.length, constituents[0]?.topTier || "C", false, cfg),
+        materiality: 0,
+        materialityAdj: 0,
+        relevance: 0,
+        actionability: 0,
+        surprise: 1,
+        rankScore: 0,
+        magnitude: null,
+        intelEventId: "",
+        badges: "",
+        scoreBreakdown: { burst: burst.why },
+        tokens: [],
+        constituentIds: constituents.map((e) => e.eventId),
+        rowNumber: 0,
+      };
+      scoreEvent(meta, facts, [], cfg, { surpriseNorm: 1 });
+      created.push(meta);
+      byId.set(meta.eventId, meta);
+      // The meta-event's feed card — links its constituents in the body.
+      const lines = constituents
+        .slice(0, 6)
+        .map((e) => `• ${e.firstSeen} ${cfg.eventTaxonomy[e.eventType]?.label || e.eventType}${e.topSourceUrl ? ` — ${e.topSourceUrl}` : ""}`);
+      const sig: StoredSignal = {
+        id: "",
+        dateFound: today(),
+        type: "awareness",
+        status: "New",
+        person: "",
+        company: companyName,
+        email: "",
+        category: "Unusual Activity",
+        signal: `Unusual activity: ${burst.recentCount} distinct events in ${cfg.surprise.burstWindowDays} days after ≥${cfg.surprise.priorQuietDays}d of quiet.`,
+        sourceUrl: meta.topSourceUrl,
+        subject: `Unusual activity: ${companyName}`,
+        body: `CONSTITUENT EVENTS\n${lines.join("\n")}\n\n${burst.why}. Burst meta-event ${meta.eventId}; constituents remain listed above.`,
+        relevance: 0,
+        justification: burst.why,
+        urgency: "High",
+        timing: `Burst window: last ${cfg.surprise.burstWindowDays} days`,
+        sourceType: newsSourceType(undefined, facts.isPortco),
+        docUrl: "",
+        hasBody: true,
+        eventId: meta.eventId,
+        materiality: meta.materialityAdj,
+        rankScore: meta.rankScore,
+        badges: meta.badges,
+        scoreBreakdown: JSON.stringify({ burst: burst.why, rank: meta.rankScore }).slice(0, 3000),
+      };
+      sig.id = keyForStored(sig);
+      meta.scoreBreakdown.signalId = sig.id;
+      extraRows.push(sig);
     }
 
     // ── Stamp candidates from their (now scored) events ──
@@ -649,10 +778,15 @@ export async function processCandidatesIntoEvents(
       });
     }
 
-    return { enriched: candidates, eventsCreated: created.length, eventsUpdated: updated.size };
+    return {
+      enriched: candidates,
+      extraRows,
+      eventsCreated: created.length,
+      eventsUpdated: updated.size,
+    };
   } catch (err) {
     console.error("[signal-events] pipeline failed (signals stored unenriched):", err);
-    return { enriched: candidates, eventsCreated: 0, eventsUpdated: 0 };
+    return { enriched: candidates, extraRows: [], eventsCreated: 0, eventsUpdated: 0 };
   }
 }
 

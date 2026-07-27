@@ -87,6 +87,37 @@ export interface SignalConfig {
     materialityFloor: number;
     /** The cap applied when below the floor (0–100 display scale). */
     floorRankCap: number;
+    /** Relevance (0–10) proxy for events with no attributed recommendation —
+     *  derived from CRM facts (portco / watchlist / network presence). */
+    relevanceProxy: { portco: number; watch: number; networked: number; base: number };
+    /** Actionability (0–1) component weights — mirrors attribution-score's
+     *  actionability semantics so both scores read the same evidence. */
+    actionability: {
+      email: number;
+      prime: number;
+      reengagement: number;
+      recentTouch: number;
+      reengagementGapDays: number;
+    };
+  };
+
+  /** WS2 — magnitude normalization relative to the company's own size.
+   *  Size proxy = current ATS open-role count (the intel engine's series);
+   *  brackets are [minValue, factor][] scanned top-down (value ≥ min ⇒ factor). */
+  magnitudeNorm: {
+    /** Crude headcount ≈ open roles × this ratio (stated in every breakdown). */
+    postingToHeadcountRatio: number;
+    /** ≤ this many open roles (or unknown) ⇒ "small" company bracket. */
+    smallCompanyMaxRoles: number;
+    /** ≥ this many open roles ⇒ "large" bracket ("mid" in between). */
+    largeCompanyMinRoles: number;
+    funding: {
+      small: Array<[number, number]>;
+      mid: Array<[number, number]>;
+      large: Array<[number, number]>;
+    };
+    /** Layoff count as a fraction of proxy headcount → factor brackets. */
+    layoffPct: Array<[number, number]>;
   };
 
   /** WS4 — surprise modulation: materialityAdj = m × (base + span × surpriseNorm). */
@@ -213,6 +244,44 @@ export const DEFAULT_SIGNAL_CONFIG: SignalConfig = {
     gamma: 0.5,
     materialityFloor: 3,
     floorRankCap: 25,
+    relevanceProxy: { portco: 9, watch: 7, networked: 5, base: 3 },
+    actionability: {
+      email: 0.35,
+      prime: 0.25,
+      reengagement: 0.4,
+      recentTouch: 0.15,
+      reengagementGapDays: 45,
+    },
+  },
+
+  magnitudeNorm: {
+    postingToHeadcountRatio: 10,
+    smallCompanyMaxRoles: 15,
+    largeCompanyMinRoles: 75,
+    funding: {
+      small: [
+        [10_000_000, 1.4],
+        [3_000_000, 1.2],
+        [0, 1.0],
+      ],
+      mid: [
+        [50_000_000, 1.3],
+        [20_000_000, 1.1],
+        [5_000_000, 0.9],
+        [0, 0.8],
+      ],
+      large: [
+        [200_000_000, 1.2],
+        [50_000_000, 1.0],
+        [0, 0.7],
+      ],
+    },
+    layoffPct: [
+      [0.3, 1.5],
+      [0.1, 1.2],
+      [0.03, 1.0],
+      [0, 0.8],
+    ],
   },
 
   surprise: {

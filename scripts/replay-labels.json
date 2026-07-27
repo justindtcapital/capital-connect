@@ -1,0 +1,168 @@
+{
+  "_instructions": "Mark genuinely important events by moving their id into `important`, then re-run with --labels",
+  "important": [],
+  "candidates": [
+    {
+      "id": "s9630fcf9",
+      "company": "Entro",
+      "headline": "Insights on Agentic IAM Market Dynamics",
+      "eventType": "product_launch"
+    },
+    {
+      "id": "s2754d62d",
+      "company": "Singulr.ai",
+      "headline": "AI governance as a key market battleground",
+      "eventType": "other"
+    },
+    {
+      "id": "sb65748c8",
+      "company": "Cequence",
+      "headline": "Congratulations on Rupal Shah Hollenbeck's Board Appointment!",
+      "eventType": "exec_change"
+    },
+    {
+      "id": "s9a5347ca",
+      "company": "MinIo",
+      "headline": "Interesting read on S3's 'read path' evolution",
+      "eventType": "other"
+    },
+    {
+      "id": "s1791f91a",
+      "company": "Cequence",
+      "headline": "Congrats on Cequence's Agentic AI Governance focus!",
+      "eventType": "other"
+    },
+    {
+      "id": "s4b4ce8a4",
+      "company": "Singulr.ai",
+      "headline": "Agentic AI Governance: Your leadership stands out",
+      "eventType": "other"
+    },
+    {
+      "id": "s3ee18be5",
+      "company": "Twine Security",
+      "headline": "Twine Security & the agentic AI governance layer",
+      "eventType": "other"
+    },
+    {
+      "id": "s0cc3f191",
+      "company": "Entro",
+      "headline": "Entro's role in the agentic AI governance landscape",
+      "eventType": "other"
+    },
+    {
+      "id": "sc273be32",
+      "company": "Dell",
+      "headline": "Salesforce navigating AI-driven M&A landscape",
+      "eventType": "other"
+    },
+    {
+      "id": "s58108679",
+      "company": "Morgan Stanley",
+      "headline": "Thoughts on Salesforce's Recent AI-Driven M&A?",
+      "eventType": "other"
+    },
+    {
+      "id": "s7bb06aaa",
+      "company": "Morgan Stanley",
+      "headline": "Databricks Acquiring Panther Labs – Your View?",
+      "eventType": "other"
+    },
+    {
+      "id": "s17b24f2d",
+      "company": "Citi",
+      "headline": "Congrats on Jane Fraser's Carnegie Honor!",
+      "eventType": "other"
+    },
+    {
+      "id": "sbdb9fa49",
+      "company": "Citi",
+      "headline": "Heath Terry's AI Investment Outlook",
+      "eventType": "other"
+    },
+    {
+      "id": "s4ec277e5",
+      "company": "Entro",
+      "headline": "Fragmented AI Agent Governance Landscape",
+      "eventType": "other"
+    },
+    {
+      "id": "s69f724d2",
+      "company": "Twine Security",
+      "headline": "Fragmented AI Agent Governance Landscape",
+      "eventType": "other"
+    },
+    {
+      "id": "s6a68f6b5",
+      "company": "Halcyon",
+      "headline": "Another major ransomware attack – underscores Halcyon's value",
+      "eventType": "regulatory_legal"
+    },
+    {
+      "id": "s4b718d3c",
+      "company": "Entro",
+      "headline": "Keycard's Agentic IAM Launch & Entro",
+      "eventType": "product_launch"
+    },
+    {
+      "id": "s92ec9669",
+      "company": "Morgan Stanley",
+      "headline": "Interesting LayerX Finding on AI Browser Security",
+      "eventType": "product_launch"
+    },
+    {
+      "id": "s35ca59e4",
+      "company": "Salesforce",
+      "headline": "Salesforce announced two billion-dollar acquisitions (Contentful and Fin) in ear",
+      "eventType": "funding_round"
+    },
+    {
+      "id": "s3702ba54",
+      "company": "Databricks",
+      "headline": "Databricks acquired Panther Labs at its Data & AI Summit 2026 to strengthen its ",
+      "eventType": "funding_round"
+    },
+    {
+      "id": "sde52b024",
+      "company": "Halcyon",
+      "headline": "Databricks acquired Panther Labs to bolster its AI-driven cybersecurity offering",
+      "eventType": "funding_round"
+    },
+    {
+      "id": "s3b373de5",
+      "company": "Databricks",
+      "headline": "Databricks acquired Panther Labs to enhance its SIEM offerings and aims to help ",
+      "eventType": "funding_round"
+    },
+    {
+      "id": "s1b8fbf07",
+      "company": "Keycard",
+      "headline": "Keycard raised a total of $38 million in funding, including an $8 million seed r",
+      "eventType": "funding_round"
+    },
+    {
+      "id": "s5d6403e0",
+      "company": "Salesforce Inc.",
+      "headline": "Salesforce Inc. made two significant acquisitions in the first two weeks of June",
+      "eventType": "funding_round"
+    },
+    {
+      "id": "s339e8577",
+      "company": "Reo.Dev",
+      "headline": "Reo.Dev, a San Francisco startup, raised a $4M seed round led by Heavybit for it",
+      "eventType": "funding_round"
+    },
+    {
+      "id": "s3f4ac588",
+      "company": "Databricks (network company context)",
+      "headline": "Databricks acquired Panther Labs, a San Francisco-based security information and",
+      "eventType": "funding_round"
+    },
+    {
+      "id": "s0ad5d1a0",
+      "company": "Architect Labs",
+      "headline": "Architect Labs raised $24M in seed funding for AI chip design, led by Kindred Ve",
+      "eventType": "funding_round"
+    }
+  ]
+}

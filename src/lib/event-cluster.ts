@@ -46,15 +46,22 @@ export function tokensOf(title: string, text: string, cap = 40): string[] {
   return out;
 }
 
-/** max(Jaccard, containment) — containment handles a short headline vs a long body. */
+/** Minimum token-set size before containment is trusted — a 5-token headline
+ *  fully contained in a 40-token body is weak evidence, not a duplicate. */
+const CONTAINMENT_MIN_TOKENS = 8;
+
+/** max(Jaccard, containment) — containment handles a short headline vs a long
+ *  body, but only when both sides carry enough tokens to be distinctive. */
 export function tokenSim(a: string[], b: string[]): number {
   if (a.length === 0 || b.length === 0) return 0;
   const sa = new Set(a);
   let inter = 0;
   for (const t of b) if (sa.has(t)) inter++;
-  const union = sa.size + new Set(b).size - inter;
+  const sb = new Set(b).size;
+  const union = sa.size + sb - inter;
   const jaccard = union > 0 ? inter / union : 0;
-  const containment = inter / Math.min(sa.size, new Set(b).size);
+  const minSize = Math.min(sa.size, sb);
+  const containment = minSize >= CONTAINMENT_MIN_TOKENS ? inter / minSize : 0;
   return Math.max(jaccard, containment);
 }
 

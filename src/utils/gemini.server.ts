@@ -572,6 +572,10 @@ export interface SignalScanInput {
   /** Links from the network's recent emails, pre-attributed to a company by domain.
    *  Gemini reads each via the URL-context tool and emits a per-company signal. */
   emailLinks?: Array<{ url: string; company?: string }>;
+  /** Subject/keyword searches ("agentic security", "warehouse robotics") — the
+   *  scan grabs recent stories ABOUT these topics; each story is attributed to
+   *  the actual company it concerns, never to the topic phrase itself. */
+  topics?: string[];
 }
 
 export interface SignalRecommendation {
@@ -683,6 +687,13 @@ function buildSignalPrompt(input: SignalScanInput): string {
     lines.push("");
     lines.push("OTHER NETWORK COMPANIES (also scan):");
     lines.push(input.companies.join(", "));
+  }
+  if (input.topics && input.topics.length > 0) {
+    lines.push("");
+    lines.push(
+      "WATCH TOPICS (subject searches): search for recent, concrete stories ABOUT each topic below — funding rounds, launches, exec moves, partnerships, incidents in that space. For every story, set `company` to the ACTUAL company the story concerns (extract it from the story), NEVER to the topic phrase. Articles in the list below labeled with a [topic] in brackets are topic-search results: attribute them to the company in the story the same way. Skip listicles and vague trend pieces with no named company.",
+    );
+    for (const t of input.topics) lines.push(`- ${t}`);
   }
   lines.push("");
   lines.push("NETWORK PEOPLE (attribution pool — Name | Company | sector | email):");

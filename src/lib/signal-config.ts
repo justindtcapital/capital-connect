@@ -160,6 +160,11 @@ export interface SignalConfig {
     minRankScore: number;
   };
 
+  /** Pinned watch topics — subject searches every SCHEDULED news scan includes
+   *  ("agentic security", "warehouse robotics"). Managed from the /signals
+   *  topic bar; stored as `topics` rows in the Signal Config tab. */
+  topics: string[];
+
   /** WS6 — tiered watch universe. */
   watchTiers: {
     /** Intel collector families allowed for Tier 3 (cheap, high-precision only). */
@@ -355,6 +360,8 @@ export const DEFAULT_SIGNAL_CONFIG: SignalConfig = {
     budgetN: 8,
     minRankScore: 20,
   },
+
+  topics: [],
 
   watchTiers: {
     tier3Collectors: ["ats", "edgar"],

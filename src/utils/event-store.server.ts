@@ -15,6 +15,7 @@ import {
   fetchSheetTab,
   appendSheetRows,
   writeSheetRow,
+  deleteSheetRows,
 } from "./sheets.server";
 import {
   DEFAULT_SIGNAL_CONFIG,
@@ -500,7 +501,10 @@ export async function loadSignalConfig(): Promise<SignalConfig> {
     const value = parseValue(valRaw || "");
     if (!section || !key || value === undefined) continue;
     try {
-      if (section === "taxonomy") {
+      if (section === "topics") {
+        const phrase = String(value).trim();
+        if (phrase && !cfg.topics.includes(phrase)) cfg.topics.push(phrase);
+      } else if (section === "taxonomy") {
         const t = key as SignalEventType;
         if (cfg.eventTaxonomy[t] && typeof value === "number") {
           cfg.eventTaxonomy[t].prior = value;
@@ -541,4 +545,46 @@ export async function loadSignalConfig(): Promise<SignalConfig> {
   }
   cfg.fusion.corroborationMap = [...corroboration.values()];
   return cfg;
+}
+
+// ── Pinned watch topics (the /signals keyword bar's persistence) ─
+// One `topics` row per pinned phrase in the Signal Config tab; every
+// SCHEDULED news scan includes them as subject searches.
+
+const topicKey = (phrase: string): string =>
+  phrase
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60);
+
+export async function setSignalTopicPinned(
+  phrase: string,
+  pinned: boolean,
+): Promise<{ ok: boolean; topics: string[]; error?: string }> {
+  const clean = (phrase || "").trim().replace(/\s+/g, " ").slice(0, 80);
+  if (!clean) return { ok: false, topics: [], error: "empty topic" };
+  const key = topicKey(clean);
+  if (!key) return { ok: false, topics: [], error: "unusable topic" };
+  try {
+    await ensureTab(SIGNAL_V2_TABS.config, SIGNAL_CONFIG_HEADERS);
+    const rows = await fetchSheetTab(SIGNAL_V2_TABS.config);
+    const matching: number[] = [];
+    for (let i = 1; i < rows.length; i++) {
+      const [sec, k] = rows[i] || [];
+      if ((sec || "").trim() === "topics" && (k || "").trim() === key) matching.push(i + 1);
+    }
+    if (pinned && matching.length === 0) {
+      await serialized(() =>
+        appendSheetRows(SIGNAL_V2_TABS.config, [["topics", key, clean, "pinned watch topic"]]),
+      );
+    } else if (!pinned && matching.length > 0) {
+      await serialized(() => deleteSheetRows(SIGNAL_V2_TABS.config, matching));
+    }
+    const cfg = await loadSignalConfig();
+    return { ok: true, topics: cfg.topics };
+  } catch (e) {
+    console.error("[signal-config] setSignalTopicPinned failed:", e);
+    return { ok: false, topics: [], error: e instanceof Error ? e.message : "update failed" };
+  }
 }

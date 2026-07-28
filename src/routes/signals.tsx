@@ -15,6 +15,7 @@ import {
   setWatchTier,
   type WatchEntity,
 } from "@/utils/intel.functions";
+import { fetchSignalTopics, pinSignalTopic } from "@/utils/signal-topics.functions";
 import {
   Dialog,
   DialogContent,
@@ -65,6 +66,8 @@ import {
   Zap,
   BadgeCheck,
   Layers,
+  Pin,
+  Globe,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -545,6 +548,72 @@ function SignalsPage() {
     }
   };
 
+  // ── Topic search bar (tuneable keyword collection) ──────────────
+  // Type keywords → instant filter of stored signals; "Scan web" grabs fresh
+  // stories about the subject (grounded, attributed, clustered, ranked like
+  // any other signal); pinning makes the topic ride every scheduled scan.
+  const [topicInput, setTopicInput] = useState("");
+  const [topicScanning, setTopicScanning] = useState(false);
+  const [pinnedTopics, setPinnedTopics] = useState<string[]>([]);
+  const [pinBusy, setPinBusy] = useState(false);
+  useEffect(() => {
+    fetchSignalTopics()
+      .then((r) => setPinnedTopics(r.topics))
+      .catch(() => {});
+  }, []);
+
+  const applyTopicFilter = (phrase: string) => {
+    setTopicInput(phrase);
+    setSearch(phrase);
+  };
+
+  const runTopicScan = async () => {
+    const topic = topicInput.trim();
+    if (!topic || topicScanning) return;
+    setTopicScanning(true);
+    try {
+      const res = await scanSignals({ data: { windowDays: Number(windowDays), topic } });
+      if (!res.found && res.error) {
+        toast.error(res.error);
+      } else {
+        setResult(res);
+        setSearch(topic);
+        const n = res.newCount ?? 0;
+        toast[n > 0 ? "success" : "info"](
+          n > 0
+            ? `${n} new stor${n === 1 ? "y" : "ies"} about “${topic}” added to the feed.`
+            : `No new stories found for “${topic}” — showing what's already stored.`,
+        );
+      }
+    } catch (e) {
+      console.error("topic scan failed", e);
+      toast.error("Topic scan failed — see console.");
+    } finally {
+      setTopicScanning(false);
+    }
+  };
+
+  const togglePin = async (phrase: string, pinned: boolean) => {
+    const topic = phrase.trim();
+    if (!topic || pinBusy) return;
+    setPinBusy(true);
+    try {
+      const r = await pinSignalTopic({ data: { topic, pinned } });
+      if (r.ok) {
+        setPinnedTopics(r.topics);
+        toast.success(
+          pinned
+            ? `Pinned “${topic}” — every scheduled morning scan now covers it.`
+            : `Unpinned “${topic}”.`,
+        );
+      } else {
+        toast.error(r.error || "Could not update pinned topics.");
+      }
+    } finally {
+      setPinBusy(false);
+    }
+  };
+
   // Broadcast + email dialogs
   const [watchOpen, setWatchOpen] = useState(false);
   const [broadcastCard, setBroadcastCard] = useState<FeedCard | null>(null);
@@ -589,10 +658,15 @@ function SignalsPage() {
   }, [portfolio]);
 
   const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
+    // Keyword search is token-AND: every term must appear somewhere in the
+    // card text, so "agentic security" matches "agentic identity security".
+    const terms = search.trim().toLowerCase().split(/\s+/).filter(Boolean);
     const minTs = dateRange in DATE_RANGES ? Date.now() - DATE_RANGES[dateRange] * 86_400_000 : 0;
     const out = feed.filter((c) => {
-      if (q && !`${c.headline} ${c.summary} ${c.company}`.toLowerCase().includes(q)) return false;
+      if (terms.length > 0) {
+        const hay = `${c.headline} ${c.summary} ${c.company} ${c.category || ""}`.toLowerCase();
+        if (!terms.every((t) => hay.includes(t))) return false;
+      }
       if (minTs && (!c.sortTs || c.sortTs < minTs)) return false;
       if (sourceSel.length && !sourceSel.includes(c.sourceType)) return false;
       if (segSel.length && !segSel.includes(c.segmentBucket)) return false;
@@ -869,6 +943,107 @@ function SignalsPage() {
             )}
           </Button>
         </div>
+      </div>
+
+      {/* Topic bar — tuneable keyword collection. Enter filters what's stored;
+          "Scan web" fetches fresh stories about the subject; pinning makes the
+          topic part of every scheduled morning scan. */}
+      <div className="border-b border-border bg-muted/20 px-6 py-2.5">
+        <div className="flex items-center gap-2">
+          <div className="relative flex-1 max-w-xl">
+            <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+            <Input
+              value={topicInput}
+              onChange={(e) => setTopicInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") setSearch(topicInput.trim());
+              }}
+              placeholder="Search stories by keyword — e.g. agentic security, warehouse robotics…"
+              className="h-9 pl-8 text-sm bg-card"
+            />
+            {topicInput && (
+              <button
+                type="button"
+                onClick={() => {
+                  setTopicInput("");
+                  setSearch("");
+                }}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                title="Clear"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
+          <Button
+            variant="secondary"
+            className="h-9"
+            onClick={() => setSearch(topicInput.trim())}
+            disabled={!topicInput.trim()}
+            title="Filter the stored feed to these keywords (all terms must match)"
+          >
+            <Search className="h-4 w-4" /> Filter
+          </Button>
+          <Button
+            className="h-9"
+            onClick={runTopicScan}
+            disabled={topicScanning || !topicInput.trim()}
+            title="Search the web for recent stories about this subject and add them to the feed"
+          >
+            {topicScanning ? (
+              <>
+                <Loader2 className="h-4 w-4 animate-spin" /> Scanning…
+              </>
+            ) : (
+              <>
+                <Globe className="h-4 w-4" /> Scan web
+              </>
+            )}
+          </Button>
+          <Button
+            variant="outline"
+            className="h-9"
+            onClick={() => togglePin(topicInput, true)}
+            disabled={
+              pinBusy ||
+              !topicInput.trim() ||
+              pinnedTopics.some((t) => t.toLowerCase() === topicInput.trim().toLowerCase())
+            }
+            title="Pin this topic — every scheduled morning scan will cover it"
+          >
+            <Pin className="h-4 w-4" /> Pin
+          </Button>
+        </div>
+        {pinnedTopics.length > 0 && (
+          <div className="flex items-center gap-1.5 flex-wrap mt-2">
+            <span className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground">
+              Pinned topics (scanned daily)
+            </span>
+            {pinnedTopics.map((t) => (
+              <span
+                key={t}
+                className="inline-flex items-center gap-1 rounded-md border border-primary/25 bg-primary/5 pl-1.5 pr-1 py-0.5 text-[11px] text-primary"
+              >
+                <button
+                  type="button"
+                  onClick={() => applyTopicFilter(t)}
+                  className="hover:underline"
+                  title="Filter the feed to this topic"
+                >
+                  {t}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => togglePin(t, false)}
+                  className="rounded hover:bg-primary/10 p-0.5"
+                  title="Unpin — stop scanning this topic daily"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className="flex flex-1 overflow-hidden">

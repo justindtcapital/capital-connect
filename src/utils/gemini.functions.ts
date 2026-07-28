@@ -286,6 +286,11 @@ type SignalScanInput = {
   companyName?: string;
   /** True for cron-driven scans — enables WS6 tier cadence (Tier 2 weekly). */
   scheduled?: boolean;
+  /** Ad-hoc subject search ("agentic security") — the scan grabs recent
+   *  stories about this topic instead of fanning out over the company
+   *  universe. Stories are attributed to their actual companies and flow
+   *  through clustering/scoring like any other signal. */
+  topic?: string;
 };
 
 /**
@@ -300,6 +305,8 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
   // profile's Signals panel): only that company is scanned, only people
   // connected to it are in the attribution pool, and the result is filtered to it.
   const scoped = (data.companyName || "").trim().toLowerCase();
+  // Ad-hoc topic scan: search the SUBJECT, not the universe.
+  const topic = (data.topic || "").trim().replace(/\s+/g, " ").slice(0, 80);
 
   try {
     const [contacts, portfolio] = await Promise.all([buildContacts(), buildPortfolioCompanies()]);
@@ -310,9 +317,11 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
       themes: p.description,
     }));
     const portcoNames = new Set(allPortcos.map((p) => p.name.trim().toLowerCase()));
-    const portcos = scoped
-      ? allPortcos.filter((p) => p.name.trim().toLowerCase() === scoped)
-      : allPortcos;
+    const portcos = topic
+      ? []
+      : scoped
+        ? allPortcos.filter((p) => p.name.trim().toLowerCase() === scoped)
+        : allPortcos;
 
     // Attribution pool: everyone, or — when scoped — only contacts who work at
     // the company or have an intro to it.
@@ -339,19 +348,23 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
         lastContact: c.lastContact,
       }));
 
-    // Broad network companies only matter for an unscoped scan.
+    // Broad network companies only matter for an unscoped, non-topic scan.
     // WS6 tier cadence (scheduled scans only): most-connected + watchlist
     // companies are the Tier-2 band — news-scanned weekly on the configured
     // ISO weekday, not daily. Portcos (Tier 1) stay daily. Tier 3 never.
+    // Topics: an ad-hoc scan searches just its subject; scheduled scans also
+    // carry the PINNED watch topics from Signal Config (the tuneable keywords).
     let companies: string[] = [];
+    let topics: string[] = topic ? [topic] : [];
     let tier2Skipped = false;
-    if (!scoped) {
+    if (!scoped && !topic) {
       let tier2Day = true;
       if (data.scheduled) {
         try {
           const cfg = await loadSignalConfig();
           const isoDay = ((new Date().getUTCDay() + 6) % 7) + 1; // 1=Mon…7=Sun
           tier2Day = isoDay === cfg.watchTiers.tier2NewsScanIsoDay;
+          topics = cfg.topics.slice(0, 8);
         } catch {
           tier2Day = true; // config unavailable — fail open, never dark
         }
@@ -370,13 +383,14 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
       } else {
         tier2Skipped = true;
       }
-    } else if (portcos.length === 0 && data.companyName) {
+    } else if (!topic && portcos.length === 0 && data.companyName) {
       // Scoped to a name that isn't a portfolio company — scan it as a company.
       companies = [data.companyName.trim()];
     }
 
     // Internal PDFs from the shared drive (best-effort — empty if unconfigured).
-    const documents = await loadSignalDocuments();
+    // Topic scans skip them: they're universe context, not subject context.
+    const documents = topic ? [] : await loadSignalDocuments();
 
     // Already-stored signals — used both to dedupe new signals AND to skip
     // articles we've already turned into signals on a prior scan.
@@ -391,7 +405,10 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
     // empty if unconfigured; then Gemini uses Google Search). Two providers feed
     // the same pool: NewsAPI (Event Registry) + Perplexity (Sonar). Both are
     // opt-in via their own key and merged/deduped by URL below.
-    const newsTargets = [...portcos.map((p) => p.name), ...companies];
+    // Topics ride the same provider pool — NewsAPI/Perplexity treat each as a
+    // keyword query; articles come back labeled with the topic phrase and the
+    // model re-attributes each story to its actual company.
+    const newsTargets = [...portcos.map((p) => p.name), ...companies, ...topics];
     let articles: Awaited<ReturnType<typeof fetchNewsForCompanies>> = [];
     try {
       if (isNewsConfigured()) {
@@ -429,11 +446,14 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
         status: "ok",
         summary: scoped
           ? `Signals scan for ${data.companyName} · no new articles`
-          : "Signals scan · no new articles to process",
+          : topic
+            ? `Topic scan "${topic}" · no new articles`
+            : "Signals scan · no new articles to process",
         records: 0,
         details: {
           windowDays,
           scoped: scoped || "",
+          topic: topic || "",
           existing: existing.length,
           reason: "all_articles_seen",
         },
@@ -442,18 +462,21 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
     }
 
     // Links from the network's recent emails — pre-attributed to a company by
-    // domain, then read by Gemini via the URL-context tool.
+    // domain, then read by Gemini via the URL-context tool. Skipped for topic
+    // scans (subject searches, not inbox digestion).
     let emailLinks: Array<{ url: string; company?: string }> = [];
-    try {
-      const g = await gatherNetworkEmails({ contacts, portfolio });
-      if (g.ok) {
-        const d2c = buildDomainToCompany(contacts, portfolio);
-        emailLinks = extractEmailLinks(g.emails)
-          .filter((u) => !seenUrls.has(u.toLowerCase()))
-          .map((u) => ({ url: u, company: companyForLink(u, d2c) || undefined }));
+    if (!topic) {
+      try {
+        const g = await gatherNetworkEmails({ contacts, portfolio });
+        if (g.ok) {
+          const d2c = buildDomainToCompany(contacts, portfolio);
+          emailLinks = extractEmailLinks(g.emails)
+            .filter((u) => !seenUrls.has(u.toLowerCase()))
+            .map((u) => ({ url: u, company: companyForLink(u, d2c) || undefined }));
+        }
+      } catch (e) {
+        console.error("[gemini] gatherNetworkEmails for scan failed (continuing):", e);
       }
-    } catch (e) {
-      console.error("[gemini] gatherNetworkEmails for scan failed (continuing):", e);
     }
 
     const fresh = await runScanSignals({
@@ -464,6 +487,7 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
       documents,
       articles,
       emailLinks,
+      topics,
     });
     if (!fresh.found) {
       await logOpsEvent({
@@ -572,11 +596,15 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
       status: "ok",
       summary: scoped
         ? `Signals scan for ${data.companyName} · +${toAppend.length} new`
-        : `Signals scan · +${toAppend.length} new · ${existing.length + toAppend.length} total`,
+        : topic
+          ? `Topic scan "${topic}" · +${toAppend.length} new`
+          : `Signals scan · +${toAppend.length} new · ${existing.length + toAppend.length} total`,
       records: toAppend.length,
       details: {
         windowDays,
         scoped: scoped || "",
+        topic: topic || "",
+        topics: topics.length,
         people: people.length,
         portcos: portcos.length,
         companies: companies.length,

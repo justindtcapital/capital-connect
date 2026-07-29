@@ -216,7 +216,24 @@ export async function gatherNetworkEmails(pre?: {
   if (pre?.persistDigest && digestLinks.size > 0) {
     try {
       const portcoNames = new Set(portfolio.map((p) => p.name.trim().toLowerCase()));
-      const added = await appendDigestLinkSignals(emails, portcoNames);
+      const networkCompanyNames = new Set(
+        contacts.map((c) => (c.company || "").trim().toLowerCase()).filter(Boolean),
+      );
+      let watchNames = new Set<string>();
+      try {
+        // Dynamic import avoids a top-level gmail ↔ platform cycle (platform
+        // pulls gemini.server, which gmail also reaches via the scan path).
+        const { buildRadarWatchlist } = await import("./platform.server");
+        watchNames = new Set(
+          (await buildRadarWatchlist()).map((w) => w.company.trim().toLowerCase()),
+        );
+      } catch {
+        /* watchlist unavailable — proxy falls back to portco/network only */
+      }
+      const added = await appendDigestLinkSignals(emails, portcoNames, {
+        watchNames,
+        networkCompanyNames,
+      });
       if (added > 0) console.log(`[gmail] archived ${added} digest link signal(s) to Signals tab`);
     } catch (e) {
       console.error("[gmail] digest signal archiving failed (feed unaffected):", e);

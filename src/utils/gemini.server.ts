@@ -15,6 +15,7 @@
 
 import { GoogleAuth } from "google-auth-library";
 import { getVertexProject, getVertexLocation, getServiceAccountJson } from "./google.server";
+import { articleUrlKey } from "./news.server";
 
 export const GEMINI_MODEL = "gemini-2.5-flash";
 
@@ -653,9 +654,17 @@ const SIGNAL_SYSTEM_PROMPT = `You are a relationship-intelligence analyst for a 
 Method:
 1. SEARCH the web (Google Search) for recent developments (within the configured window) about the listed portfolio companies, their sectors/themes, and the listed network companies. Search liberally; prefer reputable sources (company blogs, news outlets, regulatory filings). Do NOT fabricate news — every signal must be grounded in a real search result with a URL. You may ALSO be given attached internal PDF documents from the firm's shared drive: treat them as trusted first-party context to corroborate, enrich, or originate signals, and cite such a signal via the document link provided in the prompt.
 2. CATEGORIZE each real signal into exactly one of: "Funding/M&A", "Product/Milestone", "Executive Movement", "Thought Leadership", "Partnership/Customer Win", "Crisis/Regulatory", "Industry Trend", "Personal Milestone".
-3. ATTRIBUTE each signal to one or more people from the provided network list, with a relevance score 1-10. Direct (they work at / are named in the company) scores highest; strong-indirect (same sector + thesis overlap) and warm-connection (investor/advisor/portfolio overlap) can also qualify. ONLY produce an outreach recommendation when relevance >= 7.
+3. ATTRIBUTE each signal to one or more people from the provided network list, with a relevance score 1-10. Set "company" to the company the STORY is about (the news subject), not necessarily the person's employer.
+   - CRITICAL for PORTFOLIO COMPANIES: never recommend outreach to someone who works AT that portfolio company about its own news — they already know. Attribute instead to OTHER network people (investors, peers at other companies, customers, advisors, operators in the same sector).
+   - Prefer strong-indirect (same sector + thesis overlap) and warm-connection (investor/advisor/portfolio overlap). Direct employment at the news-subject company must NOT be used for portfolio-company stories.
+   - ONLY produce an outreach recommendation when relevance >= 7.
 4. DRAFT outreach for each qualifying attribution: a warm personalized subject (<8 words) and a 2-3 sentence body that references the specific signal, adds genuine value, and suggests a concrete next step (congrats, call, intro, share insight). Never spammy or purely self-serving. Use the person's real email from the list.
 5. FLAG any compliance/confidentiality concerns (e.g. material non-public info, regulated communications) in the compliance array.
+
+CARD COPY — keep the feed scannable:
+- recommendations[].signal: the card headline. At most 1-2 short sentences (≤ ~40 words). Lead with the concrete news fact; do NOT write essays, multi-clause industry analysis, or "aligns with / indicates / suggests" padding.
+- otherSignals[].summary: same rule — 1-2 short sentences max.
+- Put longer reasoning only in justification (recommendations) if needed.
 
 Output ONLY a single JSON object, no prose, no markdown fences, in exactly this shape:
 {
@@ -667,7 +676,7 @@ Output ONLY a single JSON object, no prose, no markdown fences, in exactly this 
   ],
   "compliance": []
 }
-Sort recommendations by relevance then urgency (highest first) and include at most 10. Put real-but-lower-relevance or unattributed signals in otherSignals. If you find no real signals, return empty arrays. Body text uses real \\n newlines.`;
+Sort recommendations by relevance then urgency (highest first) and include at most 8. Put real-but-lower-relevance or unattributed signals in otherSignals (at most 12). Keep every string field short — do not pad. If you find no real signals, return empty arrays. Body text uses real \\n newlines.`;
 
 function buildSignalPrompt(input: SignalScanInput): string {
   const lines: string[] = [];
@@ -691,7 +700,7 @@ function buildSignalPrompt(input: SignalScanInput): string {
   if (input.topics && input.topics.length > 0) {
     lines.push("");
     lines.push(
-      "WATCH TOPICS (subject searches): search for recent, concrete stories ABOUT each topic below — funding rounds, launches, exec moves, partnerships, incidents in that space. For every story, set `company` to the ACTUAL company the story concerns (extract it from the story), NEVER to the topic phrase. Articles in the list below labeled with a [topic] in brackets are topic-search results: attribute them to the company in the story the same way. Skip listicles and vague trend pieces with no named company.",
+      "WATCH TOPICS (subject searches): search for recent, concrete stories ABOUT each topic below — funding rounds, launches, exec moves, partnerships, incidents in that space. For every story, set `company` to the ACTUAL company the story concerns (extract it from the story), NEVER to the topic phrase. Articles in the list below labeled with a [topic] in brackets are topic-search results: attribute them to the company in the story the same way. Skip listicles and vague trend pieces with no named company. IMPORTANT: still EMIT these as otherSignals (or recommendations when a network person clearly fits) — do not drop topic-grounded stories just because they are outside the portfolio list.",
     );
     for (const t of input.topics) lines.push(`- ${t}`);
   }
@@ -728,7 +737,7 @@ function buildSignalPrompt(input: SignalScanInput): string {
   if (input.emailLinks && input.emailLinks.length > 0) {
     lines.push("");
     lines.push(
-      "EMAIL LINKS TO ANALYZE — each URL is a blog post/article shared in your network's email, pre-attributed to the company in [brackets] (matched by the link's domain). For EACH link: OPEN and READ the page, then emit a signal for that company — set company to the bracketed name, sourceUrl to the EXACT url, category appropriately, and summary to what the post says + why it matters to that company. Put these in otherSignals, unless a post clearly maps to a listed network person (then a recommendation). Cover every link.",
+      "EMAIL LINKS TO ANALYZE — each URL is a blog post/article shared in your network's email, pre-attributed to the company in [brackets] (matched by the link's domain). For EACH link: OPEN and READ the page, then emit a signal for that company — set company to the bracketed name, sourceUrl to the EXACT url, category appropriately, and summary to 1-2 short sentences on what the post says (no essays). Put these in otherSignals, unless a post clearly maps to a listed network person (then a recommendation with a 1-2 sentence signal). Cover every link.",
     );
     for (const l of input.emailLinks) lines.push(`- ${l.company ? `[${l.company}] ` : ""}${l.url}`);
   }
@@ -840,9 +849,9 @@ export async function scanSignals(input: SignalScanInput): Promise<SignalScanRes
   const requestBody: Record<string, unknown> = {
     systemInstruction: { parts: [{ text: SIGNAL_SYSTEM_PROMPT }] },
     contents: [{ role: "user", parts }],
-    // Generous output budget: thinking + a multi-signal JSON array can be large,
-    // and truncation here is the main cause of "broken JSON" from a scan.
-    generationConfig: genConfig(12000, 6000),
+    // More answer tokens, less thinking — large article sets used to hit MAX_TOKENS
+    // mid-JSON and return empty scans.
+    generationConfig: genConfig(20000, 4000),
   };
   const tools: Array<Record<string, unknown>> = [];
   if (!hasArticles) tools.push({ googleSearch: {} });
@@ -909,15 +918,31 @@ export async function scanSignals(input: SignalScanInput): Promise<SignalScanRes
       ...(input.emailLinks || []).map((l) => l.url),
     ]);
     const fixUrl = (u?: string) => (u && allowed.has(u) ? u : "");
-    const recommendations = (parsed.recommendations || [])
-      .filter((rec) => (rec.relevance ?? 0) >= 7)
-      .sort((a, b) => (b.relevance ?? 0) - (a.relevance ?? 0))
-      .slice(0, 10)
-      .map((rec) => ({ ...rec, sourceUrl: fixUrl(rec.sourceUrl) }));
-    const otherSignals = (parsed.otherSignals || []).map((s) => ({
-      ...s,
-      sourceUrl: fixUrl(s.sourceUrl),
-    }));
+    const usedUrls = new Set<string>();
+    const claimUrl = (u?: string): { ok: true; url: string } | { ok: false } => {
+      const fixed = fixUrl(u);
+      if (!fixed) return { ok: true, url: "" };
+      const k = articleUrlKey(fixed);
+      if (k && usedUrls.has(k)) return { ok: false };
+      if (k) usedUrls.add(k);
+      return { ok: true, url: fixed };
+    };
+    const recommendations: SignalRecommendation[] = [];
+    for (const rec of (parsed.recommendations || [])
+      .filter((r) => (r.relevance ?? 0) >= 7)
+      .sort((a, b) => (b.relevance ?? 0) - (a.relevance ?? 0))) {
+      const claimed = claimUrl(rec.sourceUrl);
+      if (!claimed.ok) continue;
+      recommendations.push({ ...rec, sourceUrl: claimed.url });
+      if (recommendations.length >= 8) break;
+    }
+    const otherSignals: SignalAwarenessItem[] = [];
+    for (const s of parsed.otherSignals || []) {
+      const claimed = claimUrl(s.sourceUrl);
+      if (!claimed.ok) continue;
+      otherSignals.push({ ...s, sourceUrl: claimed.url });
+      if (otherSignals.length >= 12) break;
+    }
     return {
       found: true,
       recommendations,

@@ -176,6 +176,17 @@ export interface SignalConfig {
     /** … within this trailing window (days). */
     promotionWindowDays: number;
   };
+
+  /**
+   * Soft gate for awareness persistence. Recommendations always keep.
+   * Awareness keeps when relevance ≥ minRelevance OR materiality ≥ minMateriality.
+   */
+  qualityGate: {
+    /** 0–10; networked proxy is 5 — cold base(3) alone is insufficient. */
+    minRelevance: number;
+    /** 0–10; cold companies need a meaningful event (above ranking floor). */
+    minMateriality: number;
+  };
 }
 
 export const DEFAULT_SIGNAL_CONFIG: SignalConfig = {
@@ -368,6 +379,11 @@ export const DEFAULT_SIGNAL_CONFIG: SignalConfig = {
     tier2NewsScanIsoDay: 1,
     promotionMinFamilies: 2,
     promotionWindowDays: 30,
+  },
+
+  qualityGate: {
+    minRelevance: 5,
+    minMateriality: 6,
   },
 };
 

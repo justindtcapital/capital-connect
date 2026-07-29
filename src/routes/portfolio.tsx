@@ -7,6 +7,7 @@ import {
 } from "@/utils/sheets.functions";
 import { fetchAsanaPortcoData, type AsanaPortcoData } from "@/utils/asana.functions";
 import type { PortfolioCompany, Contact, PortfolioDomain, EmailActivityRecord } from "@/lib/types";
+import { matchSheetToAsanaKeys } from "@/lib/portco-names";
 import { PortfolioCard } from "@/components/portfolio/PortfolioCard";
 import { PortfolioDetail } from "@/components/portfolio/PortfolioDetail";
 import { AddPortfolioCompanyDialog } from "@/components/portfolio/AddPortfolioCompanyDialog";
@@ -44,11 +45,20 @@ export const Route = createFileRoute("/portfolio")({
     ]);
 
     const sheetCompanies = companies as PortfolioCompany[];
+    const asanaKeys = Object.keys(asana.fieldsByCompanyName);
+    // Fuzzy Sheet↔Asana name map so "VAST" merges into "VAST Data", etc.
+    const sheetToAsana = matchSheetToAsanaKeys(
+      sheetCompanies.map((c) => c.name),
+      asanaKeys,
+      (key) => asana.namesByCompanyName[key] || key,
+    );
+    const claimedAsana = new Set(sheetToAsana.values());
+
     // Sheet companies, enriched with matching Asana fields + events (by name).
     const merged = sheetCompanies.map((c) => {
-      const key = c.name.trim().toLowerCase();
-      const asanaFields = asana.fieldsByCompanyName[key];
-      const asanaEvents = asana.eventsByCompanyName[key] || [];
+      const asanaKey = sheetToAsana.get(c.name);
+      const asanaFields = asanaKey ? asana.fieldsByCompanyName[asanaKey] : undefined;
+      const asanaEvents = asanaKey ? asana.eventsByCompanyName[asanaKey] || [] : [];
       return {
         ...c,
         asanaFields: asanaFields && Object.keys(asanaFields).length > 0 ? asanaFields : undefined,
@@ -56,11 +66,10 @@ export const Route = createFileRoute("/portfolio")({
       };
     });
 
-    // Companies that exist in the Asana portco project but have no Sheet row —
-    // surface them so the Asana project itself populates the tab.
-    const sheetKeys = new Set(sheetCompanies.map((c) => c.name.trim().toLowerCase()));
-    const asanaOnly = Object.keys(asana.fieldsByCompanyName)
-      .filter((key) => !sheetKeys.has(key))
+    // Companies that exist in the Asana portco project but still have no Sheet
+    // row after fuzzy matching — surface them so the Asana project populates the tab.
+    const asanaOnly = asanaKeys
+      .filter((key) => !claimedAsana.has(key))
       .map((key, i) => buildCompanyFromAsana(key, asana, i));
 
     return { companies: [...merged, ...asanaOnly], contacts: contacts as Contact[], emailActivity };

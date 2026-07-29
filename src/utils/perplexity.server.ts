@@ -13,7 +13,7 @@
 //   PERPLEXITY_API_KEY — Sonar API key (https://www.perplexity.ai/settings/api)
 //   PERPLEXITY_MODEL   — optional model override (default "sonar"; e.g. "sonar-pro")
 
-import type { NewsArticle } from "./news.server";
+import { articleUrlKey, uniqueSearchNames, type NewsArticle } from "./news.server";
 
 const PERPLEXITY_URL = "https://api.perplexity.ai/chat/completions";
 
@@ -30,14 +30,7 @@ function recencyFilter(windowDays: number): "day" | "week" | "month" | "year" {
   return "year";
 }
 
-function normUrl(u: string): string {
-  try {
-    const x = new URL(u);
-    return `${x.hostname.replace(/^www\./, "")}${x.pathname.replace(/\/$/, "")}`.toLowerCase();
-  } catch {
-    return u.trim().toLowerCase().replace(/\/$/, "");
-  }
-}
+const normUrl = articleUrlKey;
 
 function hostOf(u: string): string {
   try {
@@ -66,6 +59,7 @@ interface PerplexityResponse {
 
 interface ModelItem {
   company?: string;
+  topic?: string;
   title?: string;
   url?: string;
   summary?: string;
@@ -79,29 +73,42 @@ interface ModelItem {
 export async function fetchPerplexityNews(
   companies: string[],
   windowDays: number,
-  opts?: { batchSize?: number; maxBatches?: number; max?: number },
+  opts?: {
+    batchSize?: number;
+    maxBatches?: number;
+    max?: number;
+    /** "topics" = subject/keyword search; "companies" = named-company news (default). */
+    mode?: "companies" | "topics";
+  },
 ): Promise<NewsArticle[]> {
   const key = process.env.PERPLEXITY_API_KEY;
   if (!key) return [];
 
-  const uniq = [...new Set(companies.map((c) => c.trim()).filter(Boolean))];
+  const uniq = uniqueSearchNames(companies);
   if (uniq.length === 0) return [];
 
   const model = process.env.PERPLEXITY_MODEL?.trim() || "sonar";
   const recency = recencyFilter(windowDays);
   const batchSize = Math.max(1, opts?.batchSize ?? 8);
   const maxBatches = opts?.maxBatches ?? 3; // cost-conscious: each call is billed
+  const asTopics = opts?.mode === "topics";
 
   const out: NewsArticle[] = [];
 
   for (let i = 0, b = 0; i < uniq.length && b < maxBatches; i += batchSize, b++) {
     const batch = uniq.slice(i, i + batchSize);
-    const userPrompt =
-      `Find notable, recent news (last ${windowDays} days) about these companies: ${batch.join(", ")}.\n` +
-      `Return ONLY a JSON object of the form ` +
-      `{"items":[{"company":"<exactly one of the listed names>","title":"...","url":"<the source article URL>","summary":"1-2 sentence factual summary","date":"YYYY-MM-DD"}]}.\n` +
-      `Include an item only when there is a genuine, recent source article and set url to that article's real URL. ` +
-      `Omit companies with no recent news. No prose, JSON only.`;
+    const userPrompt = asTopics
+      ? `Find notable, recent news (last ${windowDays} days) ABOUT these subjects/topics: ${batch.join(", ")}.\n` +
+        `Return ONLY a JSON object of the form ` +
+        `{"items":[{"topic":"<exactly one of the listed topics>","company":"<the real company the story is about>","title":"...","url":"<the source article URL>","summary":"1-2 sentence factual summary","date":"YYYY-MM-DD"}]}.\n` +
+        `Prefer concrete company news in that space (funding, launches, partnerships, robotics/hardware/quantum breakthroughs). ` +
+        `Set company to the actual organization named in the story — never to the topic phrase. ` +
+        `Include an item only when there is a genuine, recent source article. No prose, JSON only.`
+      : `Find notable, recent news (last ${windowDays} days) about these companies: ${batch.join(", ")}.\n` +
+        `Return ONLY a JSON object of the form ` +
+        `{"items":[{"company":"<exactly one of the listed names>","title":"...","url":"<the source article URL>","summary":"1-2 sentence factual summary","date":"YYYY-MM-DD"}]}.\n` +
+        `Include an item only when there is a genuine, recent source article and set url to that article's real URL. ` +
+        `Omit companies with no recent news. No prose, JSON only.`;
 
     let res: Response;
     try {
@@ -168,9 +175,21 @@ export async function fetchPerplexityNews(
     }
 
     const matchCompany = (title: string, item?: ModelItem): string => {
+      const hay = `${title} ${item?.summary || ""}`.toLowerCase();
+      if (asTopics) {
+        // Topic mode: prefer the real company the model named; fall back to the
+        // matched topic label so Gemini can re-attribute from [Topic] brackets.
+        const claimed = (item?.company || "").trim();
+        if (claimed && !batch.some((t) => t.toLowerCase() === claimed.toLowerCase())) {
+          return claimed;
+        }
+        const topicHit =
+          batch.find((t) => t.toLowerCase() === (item?.topic || "").trim().toLowerCase()) ||
+          batch.find((t) => hay.includes(t.toLowerCase()));
+        return claimed || topicHit || "";
+      }
       const claimed = (item?.company || "").trim();
       if (claimed && batch.some((c) => c.toLowerCase() === claimed.toLowerCase())) return claimed;
-      const hay = `${title} ${item?.summary || ""}`.toLowerCase();
       return batch.find((c) => hay.includes(c.toLowerCase())) || "";
     };
 

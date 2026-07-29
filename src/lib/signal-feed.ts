@@ -46,10 +46,67 @@ export function bucketOf(segment: string): string {
   return "Other";
 }
 
-// Map a signal to a source type. News/thought-leadership about a portco becomes
-// PortCo Blogs/News; the same about anyone else becomes Industry Reports/News.
-// Exported so the server can persist the SAME value onto stored signals.
-export function newsSourceType(cat: string | undefined, isPortco: boolean): SignalSourceType {
+/** URL path/host hint that overrides category when classifying Source Type. */
+export type SourceUrlLane = "blog" | "news";
+
+const NEWS_HOST_SUFFIXES = [
+  "techcrunch.com",
+  "bloomberg.com",
+  "reuters.com",
+  "wsj.com",
+  "ft.com",
+  "theinformation.com",
+  "axios.com",
+  "cnbc.com",
+  "forbes.com",
+  "fortune.com",
+  "businessinsider.com",
+  "theverge.com",
+  "wired.com",
+  "arstechnica.com",
+  "venturebeat.com",
+  "nytimes.com",
+  "washingtonpost.com",
+  "economist.com",
+  "darkreading.com",
+  "siliconangle.com",
+  "theregister.com",
+];
+
+/** Infer blog vs news lane from URL path/host; null when unknown. */
+export function sourceUrlLane(sourceUrl?: string): SourceUrlLane | null {
+  const raw = (sourceUrl || "").trim();
+  if (!raw || !/^https?:\/\//i.test(raw)) return null;
+  try {
+    const u = new URL(raw);
+    const host = u.hostname.toLowerCase().replace(/^www\./, "");
+    const path = u.pathname.toLowerCase();
+    if (
+      host.startsWith("blog.") ||
+      /(^|\.)medium\.com$/.test(host) ||
+      /\/(blog|blogs|insights|learn)(\/|$)/i.test(path)
+    ) {
+      return "blog";
+    }
+    if (/\/(press|news|newsroom|pr|press-releases?)(\/|$)/i.test(path)) return "news";
+    if (NEWS_HOST_SUFFIXES.some((h) => host === h || host.endsWith(`.${h}`))) return "news";
+  } catch {
+    /* ignore malformed */
+  }
+  return null;
+}
+
+// Map a signal to a source type. Prefer URL lane when known; else category +
+// portco membership. Exported so the server can persist the SAME value onto
+// stored signals.
+export function newsSourceType(
+  cat: string | undefined,
+  isPortco: boolean,
+  sourceUrl?: string,
+): SignalSourceType {
+  const lane = sourceUrlLane(sourceUrl);
+  if (lane === "blog") return isPortco ? "PortCo Blogs" : "Industry Reports";
+  if (lane === "news") return isPortco ? "PortCo News" : "Industry News";
   if (isPortco) return cat === "Thought Leadership" ? "PortCo Blogs" : "PortCo News";
   return cat === "Thought Leadership" || cat === "Industry Trend"
     ? "Industry Reports"
@@ -371,7 +428,7 @@ export function buildFeed(input: BuildFeedInput): FeedCard[] {
       // Prefer the persisted source type; derive it only for un-stored/fresh items.
       sourceType:
         (r.sourceType as SignalSourceType) ||
-        newsSourceType(r.category, isPortcoName(r.company || "")),
+        newsSourceType(r.category, isPortcoName(r.company || ""), r.sourceUrl),
       company: r.company || r.person || "Network",
       segment: seg,
       segmentBucket: bucketOf(seg),
@@ -414,7 +471,7 @@ export function buildFeed(input: BuildFeedInput): FeedCard[] {
       id: `news-${i}-${s.company}`,
       sourceType:
         (s.sourceType as SignalSourceType) ||
-        newsSourceType(s.category, isPortcoName(s.company || "")),
+        newsSourceType(s.category, isPortcoName(s.company || ""), s.sourceUrl),
       company: s.company || "Industry",
       segment: seg,
       segmentBucket: bucketOf(seg),
@@ -502,7 +559,7 @@ export function buildFeed(input: BuildFeedInput): FeedCard[] {
           : "");
       cards.push({
         id: `gmail-${i}-${e.id}`,
-        sourceType: newsSourceType("Thought Leadership", isPortcoName(company)),
+        sourceType: newsSourceType("Thought Leadership", isPortcoName(company), e.linkUrl),
         company,
         segment: seg,
         segmentBucket: bucketOf(seg),

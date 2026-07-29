@@ -13,11 +13,11 @@ import {
   type SignalDocument,
 } from "./gemini.server";
 import { isDriveConfigured, listDriveDocs, downloadDriveFile } from "./drive.server";
-import { isNewsConfigured, fetchNewsForCompanies } from "./news.server";
+import { isNewsConfigured, fetchNewsForCompanies, articleUrlKey, uniqueSearchNames } from "./news.server";
 import { isPerplexityConfigured, fetchPerplexityNews } from "./perplexity.server";
 import { gatherNetworkEmails, type GmailSignal } from "./gmail.functions";
 import { buildRadarWatchlist } from "./platform.server";
-import { scoreAttribution } from "@/lib/attribution-score";
+import { scoreAttribution, isSelfCompanyAttribution } from "@/lib/attribution-score";
 import type { Contact } from "@/lib/types";
 // Signal persistence (Signals tab row contract) lives in signal-store.server —
 // shared with the Gmail digest pipeline, which archives per-link signals too.
@@ -396,37 +396,66 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
     // articles we've already turned into signals on a prior scan.
     const existing = await fetchStoredSignals();
     const seenUrls = new Set(
-      existing
-        .map((s) => (s.sourceUrl || "").trim().toLowerCase())
-        .filter((u) => /^https?:\/\//.test(u)),
+      existing.map((s) => articleUrlKey(s.sourceUrl)).filter(Boolean),
     );
 
     // Real articles to ground the scan with durable source URLs (best-effort —
     // empty if unconfigured; then Gemini uses Google Search). Two providers feed
-    // the same pool: NewsAPI (Event Registry) + Perplexity (Sonar). Both are
-    // opt-in via their own key and merged/deduped by URL below.
-    // Topics ride the same provider pool — NewsAPI/Perplexity treat each as a
-    // keyword query; articles come back labeled with the topic phrase and the
-    // model re-attributes each story to its actual company.
-    const newsTargets = [...portcos.map((p) => p.name), ...companies, ...topics];
+    // the same pool: NewsAPI (Event Registry) + Perplexity (Sonar).
+    //
+    // IMPORTANT: pinned/ad-hoc topics are fetched in their OWN pass first.
+    // Mixing them at the end of a long portco+company list used to drop them
+    // under NewsAPI/Perplexity batch caps (topics never queried → no Robotics /
+    // Quantum / Physical AI stories).
+    const topicList = uniqueSearchNames(topics);
+    topics = topicList;
+    const topicLower = new Set(topicList.map((t) => t.toLowerCase()));
+    // Don't re-query the same name as both a company and a pinned topic.
+    const companyTargets = uniqueSearchNames([
+      ...portcos.map((p) => p.name),
+      ...companies,
+    ]).filter((n) => !topicLower.has(n.toLowerCase()));
     let articles: Awaited<ReturnType<typeof fetchNewsForCompanies>> = [];
+    const pushUnique = (incoming: typeof articles) => {
+      const have = new Set(articles.map((a) => articleUrlKey(a.url)).filter(Boolean));
+      for (const a of incoming) {
+        const u = articleUrlKey(a.url);
+        if (u && !have.has(u)) {
+          have.add(u);
+          articles.push(a);
+        }
+      }
+    };
     try {
       if (isNewsConfigured()) {
-        articles = await fetchNewsForCompanies(newsTargets, windowDays);
+        if (topicList.length > 0) {
+          pushUnique(
+            await fetchNewsForCompanies(topicList, windowDays, {
+              maxBatches: Math.max(1, Math.ceil(topicList.length / 10)),
+              max: 40,
+            }),
+          );
+        }
+        if (companyTargets.length > 0) {
+          pushUnique(await fetchNewsForCompanies(companyTargets, windowDays));
+        }
       }
     } catch (e) {
       console.error("[gemini] fetchNewsForCompanies failed (continuing without):", e);
     }
     try {
       if (isPerplexityConfigured()) {
-        const px = await fetchPerplexityNews(newsTargets, windowDays);
-        const have = new Set(articles.map((a) => a.url.trim().toLowerCase()));
-        for (const a of px) {
-          const u = a.url.trim().toLowerCase();
-          if (u && !have.has(u)) {
-            have.add(u);
-            articles.push(a);
-          }
+        if (topicList.length > 0) {
+          pushUnique(
+            await fetchPerplexityNews(topicList, windowDays, {
+              mode: "topics",
+              maxBatches: Math.max(1, Math.ceil(topicList.length / 8)),
+              max: 30,
+            }),
+          );
+        }
+        if (companyTargets.length > 0) {
+          pushUnique(await fetchPerplexityNews(companyTargets, windowDays, { mode: "companies" }));
         }
       }
     } catch (e) {
@@ -436,7 +465,7 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
     // Drop articles already processed in a previous scan so we don't re-source
     // the same stories (saves tokens and stops repeats).
     const hadArticles = articles.length > 0;
-    articles = articles.filter((a) => !seenUrls.has(a.url.trim().toLowerCase()));
+    articles = articles.filter((a) => !seenUrls.has(articleUrlKey(a.url)));
     if (hadArticles && articles.length === 0) {
       // Every article NewsAPI surfaced has already been turned into a signal —
       // nothing new. Return the stored set without spending a Gemini call.
@@ -471,22 +500,46 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
         if (g.ok) {
           const d2c = buildDomainToCompany(contacts, portfolio);
           emailLinks = extractEmailLinks(g.emails)
-            .filter((u) => !seenUrls.has(u.toLowerCase()))
+            .filter((u) => {
+              const k = articleUrlKey(u);
+              return k && !seenUrls.has(k);
+            })
             .map((u) => ({ url: u, company: companyForLink(u, d2c) || undefined }));
+          // Dedupe email links against each other (tracking-param variants).
+          const linkSeen = new Set<string>();
+          emailLinks = emailLinks.filter((l) => {
+            const k = articleUrlKey(l.url);
+            if (!k || linkSeen.has(k)) return false;
+            linkSeen.add(k);
+            return true;
+          });
         }
       } catch (e) {
         console.error("[gemini] gatherNetworkEmails for scan failed (continuing):", e);
       }
     }
 
+    // Cap Gemini input so the JSON reply fits under the output-token budget.
+    // Topic articles first (pinned themes), then company news, email links, docs.
+    const topicArts = articles.filter((a) => topicLower.has(a.company.toLowerCase()));
+    const companyArts = articles.filter((a) => !topicLower.has(a.company.toLowerCase()));
+    const ARTICLE_CAP = 36;
+    const TOPIC_ART_CAP = 16;
+    const cappedArticles = [
+      ...topicArts.slice(0, TOPIC_ART_CAP),
+      ...companyArts.slice(0, Math.max(0, ARTICLE_CAP - Math.min(topicArts.length, TOPIC_ART_CAP))),
+    ];
+    const cappedEmailLinks = emailLinks.slice(0, 20);
+    const cappedDocuments = documents.slice(0, 8);
+
     const fresh = await runScanSignals({
       windowDays,
       portcos,
       companies,
       people,
-      documents,
-      articles,
-      emailLinks,
+      documents: cappedDocuments,
+      articles: cappedArticles,
+      emailLinks: cappedEmailLinks,
       topics,
     });
     if (!fresh.found) {
@@ -496,7 +549,14 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
         status: "error",
         summary: fresh.error || "Signal scan returned no results",
         records: 0,
-        details: { windowDays, scoped: scoped || "" },
+        details: {
+          windowDays,
+          scoped: scoped || "",
+          articleCount: articles.length,
+          cappedArticleCount: cappedArticles.length,
+          topicArticleCount: topicArts.length,
+          geminiError: fresh.error || "",
+        },
       });
       return fresh;
     }
@@ -535,8 +595,22 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
       const byName = contactsByName.get((person || "").trim().toLowerCase());
       return byName && byName.length === 1 ? byName[0] : undefined;
     };
-    const rescoredRecs = fresh.recommendations.map((r) => {
+    const demotedToAwareness: typeof fresh.otherSignals = [];
+    const rescoredRecs = [];
+    for (const r of fresh.recommendations) {
       const contact = resolveContact(r.email, r.person);
+      const isPortcoCompany = portcoNames.has((r.company || "").trim().toLowerCase());
+      // Portco stories must not suggest people who work at that portco.
+      if (isPortcoCompany && isSelfCompanyAttribution(contact, r.company)) {
+        demotedToAwareness.push({
+          company: r.company,
+          person: "",
+          category: r.category,
+          summary: r.signal,
+          sourceUrl: r.sourceUrl,
+        });
+        continue;
+      }
       const att = scoreAttribution(
         {
           person: r.person,
@@ -548,33 +622,55 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
         },
         {
           contact,
-          isPortcoCompany: portcoNames.has((r.company || "").trim().toLowerCase()),
+          isPortcoCompany,
           isWatchlistCompany: watchNames.has((r.company || "").trim().toLowerCase()),
+          isContactAtPortco: Boolean(
+            contact?.company && portcoNames.has(contact.company.trim().toLowerCase()),
+          ),
           portfolioSectors,
         },
       );
-      return {
+      // Belt-and-suspenders: scoreAttribution zeroes these, but never store them as recs.
+      if (isPortcoCompany && att.selfCompanyAttribution) {
+        demotedToAwareness.push({
+          company: r.company,
+          person: "",
+          category: r.category,
+          summary: r.signal,
+          sourceUrl: r.sourceUrl,
+        });
+        continue;
+      }
+      rescoredRecs.push({
         ...r,
         relevance: att.relevance,
         // Grounded breakdown FIRST so it survives the justification length clamp.
         justification: [att.summary, r.justification].filter(Boolean).join(" — "),
-      };
-    });
+      });
+    }
 
     const dateFound = new Date().toISOString().split("T")[0];
     const candidates = [
       ...rescoredRecs.map((r) => storedFromRec(r, dateFound, portcoNames)),
-      ...fresh.otherSignals.map((a) => storedFromAwareness(a, dateFound, portcoNames)),
+      ...[...fresh.otherSignals, ...demotedToAwareness].map((a) =>
+        storedFromAwareness(a, dateFound, portcoNames),
+      ),
     ];
 
-    // Dedup on the recomputed content key (not the stored ID column), so
-    // re-scans don't double-store the same signal even if older rows carry a
-    // legacy/mangled ID.
+    // Dedup on content key AND source URL so re-scans / Gemini duplicates
+    // don't double-store the same story (even with UTM / trailing-slash variants).
     const seen = new Set(existing.map(keyForStored));
+    const seenSourceUrls = new Set(
+      existing.map((s) => articleUrlKey(s.sourceUrl)).filter(Boolean),
+    );
     const toAppend: StoredSignal[] = [];
     for (const c of candidates) {
-      if (seen.has(c.id)) continue;
-      seen.add(c.id);
+      const k = keyForStored(c);
+      if (seen.has(k)) continue;
+      const u = articleUrlKey(c.sourceUrl);
+      if (u && seenSourceUrls.has(u)) continue;
+      seen.add(k);
+      if (u) seenSourceUrls.add(u);
       toAppend.push(c);
     }
 
@@ -605,6 +701,7 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
         scoped: scoped || "",
         topic: topic || "",
         topics: topics.length,
+        topicList: topics.join(", "),
         people: people.length,
         portcos: portcos.length,
         companies: companies.length,

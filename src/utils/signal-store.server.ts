@@ -11,7 +11,14 @@
 import type { SignalRecommendation, SignalAwarenessItem } from "./gemini.server";
 import type { GmailSignal } from "./gmail.functions";
 import { newsSourceType } from "@/lib/signal-feed";
+import { DEFAULT_SIGNAL_CONFIG } from "@/lib/signal-config";
+import {
+  awarenessRelevanceProxy,
+  digestHeadline,
+  passesAwarenessQualityGate,
+} from "@/lib/signal-quality";
 import { fetchSheetTab, appendSheetRows, TAB_NAMES } from "./sheets.server";
+import { articleUrlKey } from "./news.server";
 
 export interface StoredSignal {
   id: string;
@@ -54,10 +61,25 @@ export interface StoredSignal {
 // (via fetchStoredSignals lite mode) lazy-loaded on expand rather than pulled on
 // every feed load. Both env-overridable.
 const SIGNAL_SUMMARY_MAX = Number(process.env.SIGNALS_SUMMARY_MAX) || 500;
+/** Card headline (`signal`) — keep scannable: ~2 short sentences. */
+const SIGNAL_HEADLINE_MAX = Number(process.env.SIGNALS_HEADLINE_MAX) || 220;
 const SIGNAL_BODY_MAX = Number(process.env.SIGNALS_BODY_MAX) || 4000;
 function clampText(s: string, max: number): string {
   const t = s || "";
   return t.length > max ? t.slice(0, max).trimEnd() + "…" : t;
+}
+
+/** Keep card headlines to at most 1–2 sentences (and a hard char cap). */
+function clampHeadline(s: string, maxSentences = 2, maxChars = SIGNAL_HEADLINE_MAX): string {
+  const t = (s || "").trim().replace(/\s+/g, " ");
+  if (!t) return "";
+  const sentences = t.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [t];
+  const kept = sentences
+    .slice(0, maxSentences)
+    .map((x) => x.trim())
+    .filter(Boolean)
+    .join(" ");
+  return clampText(kept, maxChars);
 }
 
 // A Google Drive / Docs link is a durable "saved copy" we can preserve alongside
@@ -106,7 +128,7 @@ export function storedFromRec(
     company: r.company || "",
     email: r.email || "",
     category: r.category || "",
-    signal: r.signal || "",
+    signal: clampHeadline(r.signal || ""),
     sourceUrl: r.sourceUrl || "",
     subject: r.subject || "",
     body: clampText(r.body || "", SIGNAL_BODY_MAX),
@@ -114,7 +136,7 @@ export function storedFromRec(
     justification: clampText(r.justification || "", SIGNAL_SUMMARY_MAX),
     urgency: String(r.urgency || ""),
     timing: r.timing || "",
-    sourceType: newsSourceType(r.category, isPortco),
+    sourceType: newsSourceType(r.category, isPortco, r.sourceUrl),
     docUrl: driveDocUrl(r.sourceUrl),
     hasBody: Boolean((r.body || "").trim()),
   };
@@ -136,7 +158,7 @@ export function storedFromAwareness(
     company: a.company || "",
     email: "",
     category: a.category || "",
-    signal: clampText(a.summary || "", SIGNAL_SUMMARY_MAX),
+    signal: clampHeadline(a.summary || ""),
     sourceUrl: a.sourceUrl || "",
     subject: a.title || "",
     body: "",
@@ -144,7 +166,7 @@ export function storedFromAwareness(
     justification: "",
     urgency: "",
     timing: "",
-    sourceType: newsSourceType(a.category, isPortco),
+    sourceType: newsSourceType(a.category, isPortco, a.sourceUrl),
     docUrl: driveDocUrl(a.sourceUrl),
     hasBody: false,
   };
@@ -240,16 +262,27 @@ export async function fetchStoredSignals(
 
 // ── Digest-link archiving ────────────────────────────────────────
 
-// Normalized URL identity for dedup: lowercased, no trailing slash.
 function urlKey(u: string): string {
-  return (u || "").trim().toLowerCase().replace(/\/+$/, "");
+  return articleUrlKey(u);
 }
 
 // One exploded digest link → an awareness row. The article title rides in the
 // (otherwise rec-only) Subject column so the feed can show it as the headline;
-// Timing records which digest email surfaced it.
-function storedFromDigestLink(s: GmailSignal, portcoNames: Set<string>): StoredSignal {
-  const isPortco = portcoNames.has((s.company || "").trim().toLowerCase());
+// Justification records which digest email surfaced it (Timing stays for urgency).
+function storedFromDigestLink(
+  s: GmailSignal,
+  portcoNames: Set<string>,
+  watchNames: Set<string>,
+  networkCompanyNames: Set<string>,
+): StoredSignal {
+  const companyKey = (s.company || "").trim().toLowerCase();
+  const isPortco = portcoNames.has(companyKey);
+  const isWatch = watchNames.has(companyKey);
+  const networkContactCount = networkCompanyNames.has(companyKey) ? 1 : 0;
+  const cfg = DEFAULT_SIGNAL_CONFIG;
+  const title = (s.subject || "").trim();
+  const headline = digestHeadline(s.snippet || "", title || `${s.company} published an update`);
+  const fallback = `${s.company} published “${title || "an update"}”.`;
   return {
     id: signalId("awareness", s.company || "", s.linkUrl || s.subject || ""),
     dateFound: s.dateLabel || new Date().toISOString().split("T")[0],
@@ -259,32 +292,44 @@ function storedFromDigestLink(s: GmailSignal, portcoNames: Set<string>): StoredS
     company: s.company || "",
     email: "",
     category: "Thought Leadership",
-    signal: clampText(s.snippet || `${s.company} published “${s.subject}”.`, SIGNAL_SUMMARY_MAX),
+    signal: clampHeadline(headline || fallback),
     sourceUrl: s.linkUrl || "",
-    subject: clampText(s.subject || "", 200),
+    subject: clampText(title, 200),
     body: "",
-    relevance: 0,
-    justification: "",
+    relevance: awarenessRelevanceProxy({ isPortco, isWatch, networkContactCount }, cfg),
+    justification: s.digestSubject ? `Shared in “${s.digestSubject}”` : "",
     urgency: "",
-    timing: s.digestSubject ? `Shared in “${s.digestSubject}”` : "",
-    sourceType: newsSourceType("Thought Leadership", isPortco),
+    timing: "",
+    sourceType: newsSourceType("Thought Leadership", isPortco, s.linkUrl),
     docUrl: "",
     hasBody: false,
   };
+}
+
+export interface DigestArchiveOpts {
+  watchNames?: Set<string>;
+  /** Lowercased company names that appear on ≥1 CRM contact. */
+  networkCompanyNames?: Set<string>;
 }
 
 /**
  * Archive exploded digest-link signals to the Signals tab so they outlive the
  * Gmail search window. Deduped by source URL against EVERYTHING already stored
  * (scan signals included) and by content key within the batch — repeat feed
- * loads and re-forwarded digests append nothing. Returns rows appended.
+ * loads and re-forwarded digests append nothing. Soft-gated by CRM relevance
+ * proxy (no materiality at write time). Returns rows appended.
  */
 export async function appendDigestLinkSignals(
   signals: GmailSignal[],
   portcoNames: Set<string>,
+  opts: DigestArchiveOpts = {},
 ): Promise<number> {
   const links = signals.filter((s) => s.linkUrl);
   if (links.length === 0) return 0;
+
+  const watchNames = opts.watchNames || new Set<string>();
+  const networkCompanyNames = opts.networkCompanyNames || new Set<string>();
+  const cfg = DEFAULT_SIGNAL_CONFIG;
 
   const existing = await fetchStoredSignals();
   const seenUrls = new Set(existing.map((s) => urlKey(s.sourceUrl)).filter(Boolean));
@@ -294,7 +339,8 @@ export async function appendDigestLinkSignals(
   for (const s of links) {
     const u = urlKey(s.linkUrl || "");
     if (!u || seenUrls.has(u)) continue;
-    const stored = storedFromDigestLink(s, portcoNames);
+    const stored = storedFromDigestLink(s, portcoNames, watchNames, networkCompanyNames);
+    if (!passesAwarenessQualityGate(stored, cfg)) continue;
     const k = keyForStored(stored);
     if (seenKeys.has(k)) continue;
     seenUrls.add(u);

@@ -404,7 +404,8 @@ type ScalarSection =
   | "feed"
   | "watchTiers"
   | "magnitudeNorm"
-  | "fusionScalars";
+  | "fusionScalars"
+  | "qualityGate";
 
 function configRows(cfg: SignalConfig): string[][] {
   const rows: string[][] = [];
@@ -429,6 +430,7 @@ function configRows(cfg: SignalConfig): string[][] {
     ["feed", cfg.feed as unknown as Record<string, unknown>],
     ["watchTiers", cfg.watchTiers as unknown as Record<string, unknown>],
     ["magnitudeNorm", cfg.magnitudeNorm as unknown as Record<string, unknown>],
+    ["qualityGate", cfg.qualityGate as unknown as Record<string, unknown>],
     [
       "fusionScalars",
       {
@@ -532,7 +534,8 @@ export async function loadSignalConfig(): Promise<SignalConfig> {
         section === "surprise" ||
         section === "feed" ||
         section === "watchTiers" ||
-        section === "magnitudeNorm"
+        section === "magnitudeNorm" ||
+        section === "qualityGate"
       ) {
         const target = cfg[section] as unknown as Record<string, unknown>;
         if (key in target && typeof value === typeof target[key]) target[key] = value;

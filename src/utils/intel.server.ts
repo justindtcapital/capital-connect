@@ -540,7 +540,11 @@ function eventSignal(
     justification: `${candidate.anomalies.map((a) => a.reason).join(" ")} Same-source metrics counted once; ${event.families} independent famil${event.families === 1 ? "y" : "ies"}.`,
     urgency: event.confidence >= 0.75 || candidate.state === "Fundraising evidence" ? "High" : "Medium",
     timing: `Event status: ${event.status} · first detected ${event.firstDetected}`,
-    sourceType: newsSourceType(undefined, isPortco),
+    sourceType: newsSourceType(
+      undefined,
+      isPortco,
+      candidate.anomalies[0] ? eventEvidenceUrl(event) : "",
+    ),
     docUrl: "",
     hasBody: true,
   };

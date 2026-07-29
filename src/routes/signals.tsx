@@ -1338,11 +1338,11 @@ function SignalsPage() {
                                 )}
                               </div>
                               <EventBadges card={card} />
-                              <h3 className="text-sm font-bold tracking-tight mt-2 leading-snug line-clamp-3">
+                              <h3 className="text-sm font-bold tracking-tight mt-2 leading-snug line-clamp-2">
                                 {card.headline}
                               </h3>
                               {card.summary && !isOpen && (
-                                <p className="text-xs text-muted-foreground mt-1.5 line-clamp-3">
+                                <p className="text-xs text-muted-foreground mt-1.5 line-clamp-2">
                                   {card.summary}
                                 </p>
                               )}

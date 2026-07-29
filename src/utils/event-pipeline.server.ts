@@ -74,6 +74,7 @@ import {
   BADGE,
   type IntelEventLite,
 } from "@/lib/fusion";
+import { passesAwarenessQualityGate } from "@/lib/signal-quality";
 
 export interface PipelineResult {
   /** Candidates with eventId + scores stamped — append THESE. */
@@ -712,11 +713,11 @@ export async function processCandidatesIntoEvents(
         sourceUrl: meta.topSourceUrl,
         subject: `Unusual activity: ${companyName}`,
         body: `CONSTITUENT EVENTS\n${lines.join("\n")}\n\n${burst.why}. Burst meta-event ${meta.eventId}; constituents remain listed above.`,
-        relevance: 0,
+        relevance: meta.relevance,
         justification: burst.why,
         urgency: "High",
         timing: `Burst window: last ${cfg.surprise.burstWindowDays} days`,
-        sourceType: newsSourceType(undefined, facts.isPortco),
+        sourceType: newsSourceType(undefined, facts.isPortco, meta.topSourceUrl),
         docUrl: "",
         hasBody: true,
         eventId: meta.eventId,
@@ -739,6 +740,11 @@ export async function processCandidatesIntoEvents(
       cand.rankScore = ev.rankScore;
       cand.badges = ev.badges;
       cand.scoreBreakdown = rowBreakdown(ev, cls);
+      // Awareness rows previously stayed at relevance 0; stamp the event's
+      // CRM-proxy / attribution relevance so the sheet and soft gate agree.
+      if (cand.type === "awareness") {
+        cand.relevance = ev.relevance;
+      }
       // Corroborating observations belong on the card, in prose.
       const corr = ev.scoreBreakdown.corroboration as
         | { state?: string; observations?: string[] }
@@ -751,26 +757,61 @@ export async function processCandidatesIntoEvents(
       }
     }
 
-    await persistSignalEvents({ created, updated: [...updated] });
+    // Soft gate: keep all recommendations; awareness only when relevance or
+    // materiality clears the configured floor. Drop orphaned newly-created
+    // events so the Events tab does not accumulate gated-out noise.
+    const enriched = candidates.filter((c) => passesAwarenessQualityGate(c, cfg));
+    const keptExtra = extraRows.filter((c) => passesAwarenessQualityGate(c, cfg));
+    const keptSignalIds = new Set([...enriched, ...keptExtra].map((s) => s.id));
+    const keptEventIds = new Set(
+      [...enriched, ...keptExtra].map((s) => s.eventId).filter(Boolean) as string[],
+    );
+    const candidateIds = new Set(candidates.map((c) => c.id));
+
+    for (const ev of created) {
+      ev.constituentIds = ev.constituentIds.filter((id) => keptSignalIds.has(id));
+    }
+    for (const ev of updated) {
+      ev.constituentIds = ev.constituentIds.filter(
+        (id) => !candidateIds.has(id) || keptSignalIds.has(id),
+      );
+    }
+    const createdToPersist = created.filter(
+      (ev) => keptEventIds.has(ev.eventId) && ev.constituentIds.length > 0,
+    );
+    // Drop updates that were only touched by gated-out candidates and gained
+    // nothing durable — still persist if sources/scores changed and the event
+    // remains referenced by prior or surviving rows.
+    const updatedToPersist = [...updated].filter(
+      (ev) => keptEventIds.has(ev.eventId) || ev.constituentIds.some((id) => !candidateIds.has(id)),
+    );
+
+    await persistSignalEvents({ created: createdToPersist, updated: updatedToPersist });
 
     // The intel engine's own feed card for a press-confirmed event joins the
     // news event's card group (one card per real-world event, WS3.2).
     if (intelSignalStamps.size > 0) await stampIntelSignalRows(intelSignalStamps);
 
-    if (created.length > 0 || updated.size > 0) {
+    if (createdToPersist.length > 0 || updatedToPersist.length > 0) {
       await logOpsEvent({
         action: "sync",
         source: "signal_events",
         status: "ok",
-        summary: `Event pipeline · ${created.length} new event${created.length === 1 ? "" : "s"} · ${updated.size} gained sources`,
-        records: created.length + updated.size,
-        details: { candidates: candidates.length, created: created.length, updated: updated.size },
+        summary: `Event pipeline · ${createdToPersist.length} new event${createdToPersist.length === 1 ? "" : "s"} · ${updatedToPersist.length} gained sources`,
+        records: createdToPersist.length + updatedToPersist.length,
+        details: {
+          candidates: candidates.length,
+          kept: enriched.length + keptExtra.length,
+          gated: candidates.length - enriched.length,
+          created: createdToPersist.length,
+          updated: updatedToPersist.length,
+        },
         items: [
-          ...created.map(
+          ...createdToPersist.map(
             (e) =>
               `NEW ${e.eventId}: ${e.company} — ${e.eventType} [${e.topTier}] mat ${e.materialityAdj} rank ${e.rankScore}`,
           ),
-          ...[...updated].map(
+          ...updatedToPersist.map(
             (e) =>
               `+SRC ${e.eventId}: ${e.company} — ${e.eventType} (${e.sourceCount} sources) rank ${e.rankScore}`,
           ),
@@ -779,10 +820,10 @@ export async function processCandidatesIntoEvents(
     }
 
     return {
-      enriched: candidates,
-      extraRows,
-      eventsCreated: created.length,
-      eventsUpdated: updated.size,
+      enriched,
+      extraRows: keptExtra,
+      eventsCreated: createdToPersist.length,
+      eventsUpdated: updatedToPersist.length,
     };
   } catch (err) {
     console.error("[signal-events] pipeline failed (signals stored unenriched):", err);

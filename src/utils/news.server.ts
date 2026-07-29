@@ -24,6 +24,48 @@ export function isNewsConfigured(): boolean {
   return Boolean(process.env.NEWSAPI_KEY);
 }
 
+/**
+ * Stable URL identity for search/store dedup: host (no www) + path (no trailing
+ * slash) + non-tracking query, lowercased. Same story with UTM params or a
+ * trailing slash collapses to one key.
+ */
+export function articleUrlKey(raw: string): string {
+  const s = (raw || "").trim();
+  if (!s) return "";
+  try {
+    const x = new URL(s);
+    const drop: string[] = [];
+    x.searchParams.forEach((_, k) => {
+      if (/^(utm_|mc_|mkt_|hsa_|vero_|oly_|_hs|gclid$|fbclid$|igshid$|mkt_tok$|cmpid$|s_cid$|source$|ref$)/i.test(k)) {
+        drop.push(k);
+      }
+    });
+    for (const k of drop) x.searchParams.delete(k);
+    x.hash = "";
+    const host = x.hostname.replace(/^www\./, "").toLowerCase();
+    const path = x.pathname.replace(/\/+$/, "") || "";
+    const q = x.searchParams.toString();
+    return `${host}${path}${q ? `?${q}` : ""}`.toLowerCase();
+  } catch {
+    return s.toLowerCase().replace(/\/+$/, "");
+  }
+}
+
+/** Case-insensitive unique names, preserving first spelling. */
+export function uniqueSearchNames(names: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const n of names) {
+    const t = (n || "").trim();
+    if (!t) continue;
+    const k = t.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(t);
+  }
+  return out;
+}
+
 // Fetch recent articles for the given company names within `windowDays`. Companies
 // are batched into OR keyword-queries to conserve Event Registry tokens; each
 // article is tagged to the company whose name appears in its title/body.
@@ -35,7 +77,7 @@ export async function fetchNewsForCompanies(
   const key = process.env.NEWSAPI_KEY;
   if (!key) return [];
 
-  const uniq = [...new Set(companies.map((c) => c.trim()).filter(Boolean))];
+  const uniq = uniqueSearchNames(companies);
   if (uniq.length === 0) return [];
 
   const dateStart = new Date(Date.now() - Math.max(1, windowDays) * 86_400_000).toISOString().split("T")[0];
@@ -110,12 +152,13 @@ export async function fetchNewsForCompanies(
     }
   }
 
-  // Dedupe by URL, newest first, capped.
+  // Dedupe by normalized URL, newest first, capped.
   const seen = new Set<string>();
   const deduped: NewsArticle[] = [];
   for (const a of out.sort((x, y) => (y.publishedAt > x.publishedAt ? 1 : -1))) {
-    if (seen.has(a.url)) continue;
-    seen.add(a.url);
+    const n = articleUrlKey(a.url);
+    if (!n || seen.has(n)) continue;
+    seen.add(n);
     deduped.push(a);
   }
   return deduped.slice(0, opts?.max ?? 60);

@@ -4,6 +4,7 @@
 import {
   scoreAttribution,
   companiesMatch,
+  isSelfCompanyAttribution,
   type AttributionContact,
 } from "../src/lib/attribution-score";
 
@@ -109,6 +110,89 @@ console.log("— validation caps —");
   );
   check("company mismatch capped at 5", moved.relevance <= 5, String(moved.relevance));
   check("mismatch explained", moved.companyMismatch && moved.summary.includes("possible job change"));
+
+  const portcoExternal = scoreAttribution(
+    {
+      person: "Jane Doe",
+      email: "jane@acme.com",
+      company: "Redis",
+      category: "Product/Milestone",
+      signal: "Redis launched a real-time context layer for AI agents",
+      llmRelevance: 9,
+    },
+    {
+      contact: { ...hotCiso, company: "Acme Security" },
+      isPortcoCompany: true,
+      isWatchlistCompany: false,
+      portfolioSectors: ["ai"],
+      todayIso: TODAY,
+    },
+  );
+  check(
+    "portco story + external contact not mismatch-capped",
+    portcoExternal.relevance > 5 && !portcoExternal.selfCompanyAttribution,
+    String(portcoExternal.relevance),
+  );
+
+  const portcoEmployee = scoreAttribution(
+    {
+      person: "Rowan",
+      email: "rowan@redis.com",
+      company: "Redis",
+      category: "Product/Milestone",
+      signal: "Redis launched a real-time context layer for AI agents",
+      llmRelevance: 9,
+    },
+    {
+      contact: { ...hotCiso, name: "Rowan", email: "rowan@redis.com", company: "Redis" },
+      isPortcoCompany: true,
+      isWatchlistCompany: false,
+      portfolioSectors: ["ai"],
+      todayIso: TODAY,
+    },
+  );
+  check(
+    "portco story + employee rejected",
+    portcoEmployee.relevance === 0 && portcoEmployee.selfCompanyAttribution,
+    String(portcoEmployee.relevance),
+  );
+  check(
+    "isSelfCompanyAttribution helper",
+    isSelfCompanyAttribution({ company: "Redis Inc" }, "Redis") &&
+      !isSelfCompanyAttribution({ company: "Twine Security" }, "Keycard"),
+  );
+
+  const competitorToPortco = scoreAttribution(
+    {
+      person: "Omri Green",
+      email: "omri@twinesecurity.com",
+      company: "Keycard",
+      category: "Product/Milestone",
+      signal: "Keycard launched an agentic IAM control plane",
+      llmRelevance: 9,
+    },
+    {
+      contact: {
+        name: "Omri Green",
+        email: "omri@twinesecurity.com",
+        company: "Twine Security",
+        title: "CEO",
+        temperature: "Hot",
+        activityScore: 60,
+        areasOfInterest: "security",
+      },
+      isPortcoCompany: false,
+      isWatchlistCompany: false,
+      isContactAtPortco: true,
+      portfolioSectors: ["security"],
+      todayIso: TODAY,
+    },
+  );
+  check(
+    "competitor news to portco contact not mismatch-capped",
+    competitorToPortco.relevance > 5,
+    String(competitorToPortco.relevance),
+  );
 }
 
 console.log("— evidence ordering —");

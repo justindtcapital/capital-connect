@@ -44,6 +44,8 @@ export interface AttributionContext {
   contact?: AttributionContact;
   isPortcoCompany: boolean;
   isWatchlistCompany: boolean;
+  /** Contact's CRM employer is a portfolio company (competitor/market intel target). */
+  isContactAtPortco?: boolean;
   /** Lowercased portfolio sectors, for thesis-space overlap. */
   portfolioSectors: string[];
   /** Today's date (ISO) — injected for deterministic tests. */
@@ -64,6 +66,8 @@ export interface AttributionScore {
   verified: boolean;
   /** CRM lists the contact at a different company than the story claims. */
   companyMismatch: boolean;
+  /** Contact works at the news-subject company (self-company attribution). */
+  selfCompanyAttribution: boolean;
   components: AttributionComponent[];
   /** Compact, human-readable breakdown appended to the signal justification. */
   summary: string;
@@ -92,6 +96,16 @@ export function companiesMatch(a: string, b: string): boolean {
   const nb = normCompany(b);
   if (!na || !nb) return false;
   return na === nb || na.includes(nb) || nb.includes(na);
+}
+
+/** True when the CRM contact works at the news-subject company. */
+export function isSelfCompanyAttribution(
+  contact: AttributionContact | undefined,
+  subjectCompany: string,
+): boolean {
+  return Boolean(
+    contact?.company && subjectCompany && companiesMatch(contact.company, subjectCompany),
+  );
 }
 
 function escapeRegex(s: string): string {
@@ -225,14 +239,26 @@ export function scoreAttribution(rec: AttributionRec, ctx: AttributionContext): 
 
   // Validation caps — an attribution we can't verify must not outrank ones we can.
   const verified = Boolean(c);
+  const selfCompanyAttribution = isSelfCompanyAttribution(c, rec.company);
+  // "Mismatch" = CRM employer ≠ story company. For portfolio stories that is the
+  // DESIRED pattern (external network, not employees). Only penalize mismatch
+  // off-portfolio, where it more often means a job-change / bad attribution.
   const companyMismatch = Boolean(
-    c && c.company && rec.company && !companiesMatch(c.company, rec.company),
+    c && c.company && rec.company && !selfCompanyAttribution,
   );
   const notes: string[] = [];
-  if (!verified) {
+  if (ctx.isPortcoCompany && selfCompanyAttribution) {
+    // Hard reject: never suggest portco employees about their own company's news.
+    relevance = 0;
+    notes.push("REJECTED — contact works at this portfolio company; attribute to external network instead");
+  } else if (!verified) {
     relevance = Math.min(relevance, 3.5);
     notes.push("UNVERIFIED — email/name not found in CRM (capped)");
-  } else if (companyMismatch) {
+  } else if (
+    companyMismatch &&
+    !ctx.isPortcoCompany &&
+    !ctx.isContactAtPortco
+  ) {
     relevance = Math.min(relevance, 5);
     notes.push(`CRM lists them at ${c?.company} not ${rec.company} — possible job change or misattribution (capped)`);
   }
@@ -244,5 +270,5 @@ export function scoreAttribution(rec: AttributionRec, ctx: AttributionContext): 
     (notes.length > 0 ? `. ${notes.join(". ")}` : "") +
     `. LLM prior ${llm}/10 weighted 25%.`;
 
-  return { relevance, verified, companyMismatch, components, summary };
+  return { relevance, verified, companyMismatch, selfCompanyAttribution, components, summary };
 }

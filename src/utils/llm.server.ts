@@ -1338,6 +1338,19 @@ export async function runAgent(
 
     if (calls.length === 0) {
       const answer = textFromParts(parts);
+      // Thinking models sometimes finish with no visible text (budget spent on
+      // reasoning, or an empty candidate). Don't leave the UI on "(no answer)".
+      if (!answer.trim()) {
+        const finish = cand?.finishReason || "unknown";
+        const fallback = partialAnswerFromState(
+          state,
+          finish === "MAX_TOKENS"
+            ? "model hit its output limit before writing an answer"
+            : "model returned no text",
+        );
+        report({ step: step + 1, phase: "done", message: "Done (recovered empty answer)" });
+        return { status: "complete", answer: fallback, state, partial: true };
+      }
       report({ step: step + 1, phase: "done", message: "Done" });
       return { status: "complete", answer, state };
     }

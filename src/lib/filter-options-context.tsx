@@ -11,8 +11,11 @@ export interface FilterOptions {
   targetOrigins: string[];
   // Portfolio
   portfolioDomains: string[];
+  portfolioSectors: string[];
   portfolioCities: string[];
   portfolioDtcPriorities: string[];
+  portfolioCompanyStages: string[];
+  portfolioLeadInvestors: string[];
   // Dashboard (shared from CRM + targets)
   allCities: string[];
   portfolioCompanies: string[];
@@ -26,8 +29,11 @@ const defaultOptions: FilterOptions = {
   targetCities: [],
   targetOrigins: [],
   portfolioDomains: [],
+  portfolioSectors: [],
   portfolioCities: [],
   portfolioDtcPriorities: [],
+  portfolioCompanyStages: [],
+  portfolioLeadInvestors: [],
   allCities: [],
   portfolioCompanies: [],
 };

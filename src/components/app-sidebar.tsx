@@ -136,8 +136,11 @@ export function AppSidebar({
   const allCities = filterOpts.allCities;
   const portfolioCompanies = filterOpts.portfolioCompanies;
   const portfolioDomains = filterOpts.portfolioDomains;
+  const portfolioSectors = filterOpts.portfolioSectors;
   const portfolioCities = filterOpts.portfolioCities;
   const portfolioDtcPriorities = filterOpts.portfolioDtcPriorities;
+  const portfolioCompanyStages = filterOpts.portfolioCompanyStages;
+  const portfolioLeadInvestors = filterOpts.portfolioLeadInvestors;
   const targetSectors = filterOpts.targetSectors;
   const targetCities = filterOpts.targetCities;
   const targetOrigins = filterOpts.targetOrigins;
@@ -1090,66 +1093,72 @@ export function AppSidebar({
                     <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
                       Domain
                     </label>
-                    <Select
+                    <MultiSelect
+                      options={portfolioDomains}
                       value={portfolioFilters.domain}
-                      onValueChange={(v) => updatePortfolio({ domain: v })}
-                    >
-                      <SelectTrigger className="h-8 text-xs">
-                        <SelectValue placeholder="All Domains" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="all">All Domains</SelectItem>
-                        {portfolioDomains.map((d) => (
-                          <SelectItem key={d} value={d}>
-                            {d}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
+                      onChange={(v) => updatePortfolio({ domain: v })}
+                      placeholder="All Domains"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+                      Focus Area
+                    </label>
+                    <MultiSelect
+                      options={portfolioSectors}
+                      value={portfolioFilters.sector}
+                      onChange={(v) => updatePortfolio({ sector: v })}
+                      placeholder="All Focus Areas"
+                    />
                   </div>
 
                   <div>
                     <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
                       City
                     </label>
-                    <Select
+                    <MultiSelect
+                      options={portfolioCities}
                       value={portfolioFilters.city}
-                      onValueChange={(v) => updatePortfolio({ city: v })}
-                    >
-                      <SelectTrigger className="h-8 text-xs">
-                        <SelectValue placeholder="All Cities" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="all">All Cities</SelectItem>
-                        {portfolioCities.map((c) => (
-                          <SelectItem key={c} value={c}>
-                            {c}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
+                      onChange={(v) => updatePortfolio({ city: v })}
+                      placeholder="All Cities"
+                    />
                   </div>
 
                   <div>
                     <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
                       DTC Priority
                     </label>
-                    <Select
+                    <MultiSelect
+                      options={portfolioDtcPriorities}
                       value={portfolioFilters.dtcPriority}
-                      onValueChange={(v) => updatePortfolio({ dtcPriority: v })}
-                    >
-                      <SelectTrigger className="h-8 text-xs">
-                        <SelectValue placeholder="All Priorities" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="all">All Priorities</SelectItem>
-                        {portfolioDtcPriorities.map((p) => (
-                          <SelectItem key={p} value={p}>
-                            {p}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
+                      onChange={(v) => updatePortfolio({ dtcPriority: v })}
+                      placeholder="All Priorities"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+                      Company Stage
+                    </label>
+                    <MultiSelect
+                      options={portfolioCompanyStages}
+                      value={portfolioFilters.companyStage}
+                      onChange={(v) => updatePortfolio({ companyStage: v })}
+                      placeholder="All Stages"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+                      Lead Investor
+                    </label>
+                    <MultiSelect
+                      options={portfolioLeadInvestors}
+                      value={portfolioFilters.leadInvestor}
+                      onChange={(v) => updatePortfolio({ leadInvestor: v })}
+                      placeholder="All Investors"
+                    />
                   </div>
                 </SidebarGroupContent>
               </SidebarGroup>

@@ -402,10 +402,18 @@ export interface PortfolioCompany {
 
 export interface PortfolioFilters {
   search: string;
-  sector: string;
-  domain: string;
-  city: string;
-  dtcPriority: string;
+  /** Focus Area(s) from the sheet — multi-select (empty = no filter). */
+  sector: string[];
+  /** Mapped PortfolioDomain — multi-select (empty = no filter). */
+  domain: string[];
+  /** Multi-select cities (empty = no city filter). Canonical labels via location-utils. */
+  city: string[];
+  /** Asana DTC Priority — multi-select (empty = no filter). */
+  dtcPriority: string[];
+  /** Asana Company Stage — multi-select (empty = no filter). */
+  companyStage: string[];
+  /** Asana Lead Investor — multi-select (empty = no filter). */
+  leadInvestor: string[];
 }
 
 // Asana-sourced event surfaced across Network/PortCo/Events views.

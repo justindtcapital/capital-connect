@@ -2991,6 +2991,45 @@ export async function deletePortfolioCompany(entry: {
   return { deleted };
 }
 
+// Hard-delete many portfolio companies in one sheet pass (URID preferred, name fallback
+// only when that entry has no URID — same rules as deletePortfolioCompany).
+export async function bulkDeletePortfolioCompanies(
+  entries: { urid?: string; name?: string }[],
+): Promise<{ deleted: number }> {
+  const wantedUrids = new Set(
+    entries.map((e) => (e.urid || "").trim().toLowerCase()).filter(Boolean),
+  );
+  // Name fallback only for entries that did not supply a URID.
+  const wantedNames = new Set(
+    entries
+      .filter((e) => !(e.urid || "").trim())
+      .map((e) => (e.name || "").trim().toLowerCase())
+      .filter(Boolean),
+  );
+  if (wantedUrids.size === 0 && wantedNames.size === 0) return { deleted: 0 };
+
+  const rows = await fetchSheetTab(TAB_NAMES.portfolio);
+  if (rows.length < 2) return { deleted: 0 };
+  const headers = rows[0].map((h) => h.trim().toLowerCase());
+  const uridIdx = headers.indexOf("urid");
+  const nameIdx = headers.indexOf("company name");
+
+  const rowNumbers: number[] = [];
+  for (let i = 1; i < rows.length; i++) {
+    const rowUrid = uridIdx !== -1 ? (rows[i][uridIdx] || "").trim().toLowerCase() : "";
+    if (rowUrid && wantedUrids.has(rowUrid)) {
+      rowNumbers.push(i + 1);
+      continue;
+    }
+    if (wantedNames.size > 0 && nameIdx !== -1) {
+      const rowName = (rows[i][nameIdx] || "").trim().toLowerCase();
+      if (rowName && wantedNames.has(rowName)) rowNumbers.push(i + 1);
+    }
+  }
+  const deleted = await deleteSheetRows(TAB_NAMES.portfolio, rowNumbers);
+  return { deleted };
+}
+
 export async function appendTargetOutreach(
   targetKey: string,
   attempt: { date: string; method: string; summary: string; id: string },

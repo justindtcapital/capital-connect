@@ -110,9 +110,40 @@ export function normalizeLocation(raw?: string): string {
   return state ? `${city}, ${state}` : city;
 }
 
-/** Distinct, sorted canonical locations from a set of raw contact locations. */
+/** Lowercased city token used to collapse "Palo Alto" vs "Palo Alto, CA". */
+export function locationCityKey(normalizedOrRaw?: string): string {
+  const normalized = normalizeLocation(normalizedOrRaw);
+  if (!normalized) return "";
+  return normalized.split(",")[0].trim().toLowerCase();
+}
+
+/**
+ * Distinct, sorted canonical locations from a set of raw strings.
+ * Prefers "City, ST" over bare "City" when both variants exist so the filter
+ * dropdown shows one entry per place (e.g. Palo Alto / Redwood City dupes).
+ */
 export function canonicalLocations(raw: Array<string | undefined>): string[] {
-  return [...new Set(raw.map((r) => normalizeLocation(r)).filter(Boolean))].sort();
+  const byCity = new Map<string, string>();
+  for (const r of raw) {
+    const label = normalizeLocation(r);
+    if (!label) continue;
+    const key = locationCityKey(label);
+    if (!key) continue;
+    const prev = byCity.get(key);
+    // Prefer the richer "City, ST" label when a bare city also appears.
+    if (!prev || (label.includes(",") && !prev.includes(","))) {
+      byCity.set(key, label);
+    }
+  }
+  return [...byCity.values()].sort((a, b) => a.localeCompare(b));
+}
+
+/** True when a raw location belongs to any of the selected canonical cities. */
+export function locationMatches(raw: string | undefined, selected: string[]): boolean {
+  if (!selected.length) return true;
+  const key = locationCityKey(raw);
+  if (!key) return false;
+  return selected.some((s) => locationCityKey(s) === key);
 }
 
 /** Curated common metros, offered as suggestions in the location combobox. Free

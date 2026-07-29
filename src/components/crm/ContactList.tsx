@@ -1,7 +1,7 @@
 import { useState, useMemo, useEffect, useRef } from "react";
 import type { Contact, ContactFilters as Filters } from "@/lib/types";
 import { seniorityOf, departmentOf } from "@/lib/people-classify";
-import { normalizeLocation } from "@/lib/location-utils";
+import { locationMatches } from "@/lib/location-utils";
 import { isMyContact, type TeamProfile } from "@/lib/user-ownership";
 import { ContactCard } from "./ContactCard";
 import { ContactTable } from "./ContactTable";
@@ -71,7 +71,7 @@ export function ContactList({
         return false;
       if (filters.title && !c.title.toLowerCase().includes(filters.title.toLowerCase()))
         return false;
-      if (filters.location.length && !filters.location.includes(normalizeLocation(c.location)))
+      if (filters.location.length && !locationMatches(c.location, filters.location))
         return false;
       if (filters.followUpOnly && !c.followUpPending) return false;
       if (filters.dateFrom || filters.dateTo) {

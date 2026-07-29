@@ -53,7 +53,7 @@ export function CustomerDiscoveryPanel({ company, onImported, initialTechnologie
   const [loadingComps, setLoadingComps] = useState(false);
   // Selected decision-makers, keyed "oppIndex:personIndex".
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [addingIdx, setAddingIdx] = useState<number | null>(null);
+  const [addingIdx, setAddingIdx] = useState<number | "all" | null>(null);
 
   const run = async (force = false, technologies?: string[]) => {
     setLoading(true);
@@ -164,24 +164,112 @@ export function CustomerDiscoveryPanel({ company, onImported, initialTechnologie
     });
   };
 
-  const addForOpportunity = async (opp: OpportunityCompany, oi: number) => {
-    const chosen: SumbleProspect[] = opp.decisionMakers.filter((_, pi) => selected.has(`${oi}:${pi}`));
+  const allPersonKeys = (opps: OpportunityCompany[]) => {
+    const keys: string[] = [];
+    opps.forEach((o, oi) => o.decisionMakers.forEach((_, pi) => keys.push(`${oi}:${pi}`)));
+    return keys;
+  };
+
+  const toggleAllPeople = () => {
+    if (!result) return;
+    const keys = allPersonKeys(result.opportunities);
+    setSelected((prev) => {
+      if (keys.length > 0 && keys.every((k) => prev.has(k))) return new Set();
+      return new Set(keys);
+    });
+  };
+
+  const toggleAllComps = () => {
+    if (!competitors || competitors.length === 0) return;
+    setSelectedComps((prev) => {
+      if (competitors.every((c) => prev.has(c))) return new Set();
+      return new Set(competitors);
+    });
+  };
+
+  const addProspects = async (
+    chosen: SumbleProspect[],
+    reason: string,
+    busyKey: number | "all",
+  ) => {
     if (chosen.length === 0) {
       toast.error("Select at least one person to add.");
       return;
     }
+    const withReason = chosen.map((p) => ({ ...p, reason }));
+    setAddingIdx(busyKey);
+    try {
+      const res = await addProspectsToTargets({
+        data: {
+          prospects: withReason,
+          source: `Customer Discovery — ${company.name}`,
+          sourceKind: "Customer Discovery",
+          focus: company.name,
+        },
+      });
+      const parts = [`Added ${res.added} target${res.added !== 1 ? "s" : ""}`];
+      if (res.enriched) parts.push(`${res.enriched} enriched`);
+      if (res.duplicates) parts.push(`${res.duplicates} dup${res.duplicates !== 1 ? "s" : ""} skipped`);
+      if (res.failed) parts.push(`${res.failed} failed`);
+      (res.failed ? toast.warning : toast.success)(parts.join(" · "));
+      if (res.added > 0) await onImported?.();
+    } catch (e) {
+      console.error("addProspectsToTargets failed", e);
+      toast.error("Adding failed — see console.");
+    } finally {
+      setAddingIdx(null);
+    }
+  };
+
+  const addForOpportunity = async (opp: OpportunityCompany, oi: number) => {
+    const chosen: SumbleProspect[] = opp.decisionMakers.filter((_, pi) => selected.has(`${oi}:${pi}`));
     // Why each was surfaced — the company's evidence — retained on the target row.
     const reasonBits: string[] = [];
     if (opp.evidence?.techMatches?.length) reasonBits.push(`Uses ${opp.evidence.techMatches.slice(0, 3).join(", ")}`);
     if (opp.evidence?.hiringHits?.length) reasonBits.push(`Hiring: ${opp.evidence.hiringHits.slice(0, 2).join(", ")}`);
     if (opp.fitScore) reasonBits.push(`Fit ${opp.fitScore}/100`);
     const reason = reasonBits.join(" · ") || opp.suggestedMatch || `Potential customer for ${company.name}`;
-    const withReason = chosen.map((p) => ({ ...p, reason }));
+    await addProspects(chosen, reason, oi);
+  };
 
-    setAddingIdx(oi);
+  const addAllSelected = async () => {
+    if (!result) return;
+    const chosen: SumbleProspect[] = [];
+    const reasonByPerson = new Map<SumbleProspect, string>();
+    result.opportunities.forEach((opp, oi) => {
+      const reasonBits: string[] = [];
+      if (opp.evidence?.techMatches?.length)
+        reasonBits.push(`Uses ${opp.evidence.techMatches.slice(0, 3).join(", ")}`);
+      if (opp.evidence?.hiringHits?.length)
+        reasonBits.push(`Hiring: ${opp.evidence.hiringHits.slice(0, 2).join(", ")}`);
+      if (opp.fitScore) reasonBits.push(`Fit ${opp.fitScore}/100`);
+      const reason =
+        reasonBits.join(" · ") || opp.suggestedMatch || `Potential customer for ${company.name}`;
+      opp.decisionMakers.forEach((p, pi) => {
+        if (selected.has(`${oi}:${pi}`)) {
+          chosen.push(p);
+          reasonByPerson.set(p, reason);
+        }
+      });
+    });
+    if (chosen.length === 0) {
+      toast.error("Select at least one person to add.");
+      return;
+    }
+    // Batch with per-person reasons preserved via the reason field on each prospect.
+    const withReason = chosen.map((p) => ({
+      ...p,
+      reason: reasonByPerson.get(p) || `Potential customer for ${company.name}`,
+    }));
+    setAddingIdx("all");
     try {
       const res = await addProspectsToTargets({
-        data: { prospects: withReason, source: `Customer Discovery — ${company.name}`, sourceKind: "Customer Discovery", focus: company.name },
+        data: {
+          prospects: withReason,
+          source: `Customer Discovery — ${company.name}`,
+          sourceKind: "Customer Discovery",
+          focus: company.name,
+        },
       });
       const parts = [`Added ${res.added} target${res.added !== 1 ? "s" : ""}`];
       if (res.enriched) parts.push(`${res.enriched} enriched`);
@@ -305,9 +393,19 @@ export function CustomerDiscoveryPanel({ company, onImported, initialTechnologie
                   })}
                 </div>
                 <div className="flex items-center justify-between gap-2 pt-0.5">
-                  <span className="text-[10px] text-muted-foreground">
-                    Find companies already using the selected competitor{selectedComps.size !== 1 ? "s" : ""} (displacement targets).
-                  </span>
+                  <div className="flex items-center gap-2 min-w-0">
+                    <button
+                      type="button"
+                      onClick={toggleAllComps}
+                      className="text-[10px] text-primary hover:underline shrink-0"
+                    >
+                      {competitors.every((c) => selectedComps.has(c)) ? "Deselect all" : "Select all"}
+                    </button>
+                    <span className="text-[10px] text-muted-foreground truncate">
+                      Find companies already using the selected competitor
+                      {selectedComps.size !== 1 ? "s" : ""} (displacement targets).
+                    </span>
+                  </div>
                   <Button
                     size="sm"
                     className="h-7 text-[11px] shrink-0"
@@ -386,6 +484,45 @@ export function CustomerDiscoveryPanel({ company, onImported, initialTechnologie
             </p>
           ) : (
             <div className="space-y-2.5">
+              {(() => {
+                const personKeys = allPersonKeys(result.opportunities);
+                const selectedPeopleCount = personKeys.filter((k) => selected.has(k)).length;
+                const allPeopleSelected =
+                  personKeys.length > 0 && personKeys.every((k) => selected.has(k));
+                return (
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={toggleAllPeople}
+                        className="text-[10px] text-primary hover:underline"
+                      >
+                        {allPeopleSelected ? "Deselect all" : "Select all"} people
+                      </button>
+                      <span className="text-[10px] text-muted-foreground tabular-nums">
+                        {selectedPeopleCount}/{personKeys.length}
+                      </span>
+                    </div>
+                    <Button
+                      size="sm"
+                      className="h-7 text-[11px] shrink-0"
+                      onClick={() => void addAllSelected()}
+                      disabled={addingIdx !== null || selectedPeopleCount === 0}
+                    >
+                      {addingIdx === "all" ? (
+                        <>
+                          <Loader2 className="h-3 w-3 mr-1 animate-spin" /> Adding…
+                        </>
+                      ) : (
+                        <>
+                          <UserPlus className="h-3 w-3 mr-1" /> Add {selectedPeopleCount || ""} as
+                          Cold
+                        </>
+                      )}
+                    </Button>
+                  </div>
+                );
+              })()}
               {result.opportunities.map((opp, oi) => (
                 <OpportunityCard
                   key={`${opp.domain || opp.name}-${oi}`}
@@ -395,7 +532,7 @@ export function CustomerDiscoveryPanel({ company, onImported, initialTechnologie
                   selected={selected}
                   onToggle={togglePerson}
                   onAdd={() => addForOpportunity(opp, oi)}
-                  adding={addingIdx === oi}
+                  adding={addingIdx === oi || addingIdx === "all"}
                 />
               ))}
             </div>

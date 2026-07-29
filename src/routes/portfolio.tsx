@@ -1,11 +1,13 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useCallback } from "react";
 import { createFileRoute, useRouter } from "@tanstack/react-router";
 import {
   fetchPortfolioCompanies,
   fetchContacts,
   fetchEmailActivity,
+  bulkDeletePortfolioCompanies,
 } from "@/utils/sheets.functions";
 import { fetchAsanaPortcoData, type AsanaPortcoData } from "@/utils/asana.functions";
+import { syncPortcoFromAsana, syncPortcoFromWeb } from "@/utils/portco-sync.functions";
 import type { PortfolioCompany, Contact, PortfolioDomain, EmailActivityRecord } from "@/lib/types";
 import { matchSheetToAsanaKeys } from "@/lib/portco-names";
 import { PortfolioCard } from "@/components/portfolio/PortfolioCard";
@@ -14,10 +16,24 @@ import { AddPortfolioCompanyDialog } from "@/components/portfolio/AddPortfolioCo
 import { ContactDetail } from "@/components/crm/ContactDetail";
 import { ContactAvatar } from "@/components/crm/ContactAvatar";
 import { Button } from "@/components/ui/button";
-import { Building2, Users, Plus } from "lucide-react";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { Building2, Users, Plus, Trash2, RefreshCw, Globe, Loader2, X } from "lucide-react";
 import { usePortfolioFilters } from "@/lib/portfolio-filter-context";
 import { useFilterOptions } from "@/lib/filter-options-context";
 import { extractDomain } from "@/lib/domain-utils";
+import { canonicalLocations, locationMatches } from "@/lib/location-utils";
+import { canonicalFocusAreas, focusAreaMatches } from "@/lib/focus-area-utils";
+import { toast } from "sonner";
 
 export const Route = createFileRoute("/portfolio")({
   head: () => ({
@@ -151,6 +167,37 @@ export interface PortfolioCompanyCounts {
   intros: number;
 }
 
+/** Case-insensitive Asana custom-field lookup (first non-empty alias wins). */
+function asanaFieldOf(company: PortfolioCompany, aliases: string[]): string {
+  const fields = company.asanaFields;
+  if (!fields) return "";
+  const lowered = Object.keys(fields).reduce<Record<string, string>>((acc, k) => {
+    acc[k.toLowerCase().trim()] = fields[k];
+    return acc;
+  }, {});
+  for (const a of aliases) {
+    const v = (lowered[a.toLowerCase().trim()] || "").trim();
+    if (v) return v;
+  }
+  return "";
+}
+
+function dtcPriorityOf(company: PortfolioCompany): string {
+  return asanaFieldOf(company, ["DTC Priority"]);
+}
+
+function companyStageOf(company: PortfolioCompany): string {
+  return asanaFieldOf(company, ["Company Stage", "Stage"]);
+}
+
+function leadInvestorOf(company: PortfolioCompany): string {
+  return asanaFieldOf(company, ["Lead Investor"]);
+}
+
+function uniqueSorted(values: Iterable<string>): string[] {
+  return [...new Set([...values].filter(Boolean))].sort((a, b) => a.localeCompare(b));
+}
+
 function computeCounts(
   matched: Contact[],
   crmIntros: Contact[],
@@ -195,6 +242,11 @@ function PortfolioPage() {
   // email domain matches a company in that sector) under each sector.
   const [showContactsBySector, setShowContactsBySector] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [asanaSyncing, setAsanaSyncing] = useState(false);
+  const [webSyncing, setWebSyncing] = useState(false);
   const { filters } = usePortfolioFilters();
   const { updateOptions } = useFilterOptions();
 
@@ -218,21 +270,21 @@ function PortfolioPage() {
   }, [loaderData.companies, loaderData.contacts]);
 
   useEffect(() => {
-    const domains = [...new Set(companies.map((c) => c.domain).filter(Boolean))].sort();
-    const names = [...new Set(companies.map((c) => c.name).filter(Boolean))].sort();
-    const cities = [...new Set(companies.map((c) => c.location).filter(Boolean))].sort();
-    const priorities = [
-      ...new Set(
-        companies
-          .map((c) => c.asanaFields?.["DTC Priority"] || c.asanaFields?.["DTC Priority "])
-          .filter((v): v is string => !!v),
-      ),
-    ].sort();
+    const domains = uniqueSorted(companies.map((c) => c.domain));
+    const names = uniqueSorted(companies.map((c) => c.name));
+    const cities = canonicalLocations(companies.map((c) => c.location));
+    const sectors = canonicalFocusAreas(companies.map((c) => c.sector));
+    const priorities = uniqueSorted(companies.map(dtcPriorityOf));
+    const stages = uniqueSorted(companies.map(companyStageOf));
+    const leadInvestors = uniqueSorted(companies.map(leadInvestorOf));
     updateOptions({
       portfolioDomains: domains,
       portfolioCompanies: names,
       portfolioCities: cities,
+      portfolioSectors: sectors,
       portfolioDtcPriorities: priorities,
+      portfolioCompanyStages: stages,
+      portfolioLeadInvestors: leadInvestors,
     });
   }, [companies, updateOptions]);
 
@@ -266,22 +318,206 @@ function PortfolioPage() {
     [selectedCompany, contacts],
   );
 
-  const filtered = companies.filter((c) => {
-    if (
-      filters.search &&
-      !c.name.toLowerCase().includes(filters.search.toLowerCase()) &&
-      !c.description.toLowerCase().includes(filters.search.toLowerCase())
-    )
-      return false;
-    if (filters.sector !== "all" && c.sector !== filters.sector) return false;
-    if (filters.domain !== "all" && c.domain !== filters.domain) return false;
-    if (filters.city !== "all" && c.location !== filters.city) return false;
-    if (filters.dtcPriority !== "all") {
-      const p = c.asanaFields?.["DTC Priority"] || c.asanaFields?.["DTC Priority "];
-      if (p !== filters.dtcPriority) return false;
+  const filtered = useMemo(
+    () =>
+      companies.filter((c) => {
+        if (
+          filters.search &&
+          !c.name.toLowerCase().includes(filters.search.toLowerCase()) &&
+          !c.description.toLowerCase().includes(filters.search.toLowerCase())
+        )
+          return false;
+        if (filters.sector.length && !focusAreaMatches(c.sector, filters.sector)) return false;
+        if (filters.domain.length && !filters.domain.includes(c.domain)) return false;
+        if (filters.city.length && !locationMatches(c.location, filters.city)) return false;
+        if (filters.dtcPriority.length) {
+          const p = dtcPriorityOf(c);
+          if (!p || !filters.dtcPriority.includes(p)) return false;
+        }
+        if (filters.companyStage.length) {
+          const stage = companyStageOf(c);
+          if (!stage || !filters.companyStage.includes(stage)) return false;
+        }
+        if (filters.leadInvestor.length) {
+          const inv = leadInvestorOf(c);
+          if (!inv || !filters.leadInvestor.includes(inv)) return false;
+        }
+        return true;
+      }),
+    [companies, filters],
+  );
+
+  // Drop selections that are no longer in the filtered set (e.g. after filter/delete).
+  useEffect(() => {
+    const visible = new Set(filtered.map((c) => c.id));
+    setSelectedIds((prev) => {
+      let changed = false;
+      const next = new Set<string>();
+      for (const id of prev) {
+        if (visible.has(id)) next.add(id);
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [filtered]);
+
+  const selectedCompanies = useMemo(
+    () => filtered.filter((c) => selectedIds.has(c.id)),
+    [filtered, selectedIds],
+  );
+  // Asana-only cards (no Sheet row) can't be deleted from the sheet.
+  const sheetSelected = useMemo(
+    () => selectedCompanies.filter((c) => !c.id.startsWith("asana-pc-")),
+    [selectedCompanies],
+  );
+  const allSelected = filtered.length > 0 && filtered.every((c) => selectedIds.has(c.id));
+  const someSelected = selectedIds.size > 0 && !allSelected;
+  const busy = deleting || asanaSyncing || webSyncing;
+
+  const toggleId = useCallback((id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const toggleAll = useCallback(() => {
+    setSelectedIds((prev) => {
+      if (filtered.length > 0 && filtered.every((c) => prev.has(c.id))) return new Set();
+      return new Set(filtered.map((c) => c.id));
+    });
+  }, [filtered]);
+
+  const clearSelection = useCallback(() => setSelectedIds(new Set()), []);
+
+  const patchCompanyLocal = useCallback((updated: PortfolioCompany) => {
+    setCompanies((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+    setSelectedCompany((prev) => (prev?.id === updated.id ? updated : prev));
+  }, []);
+
+  const deleteSelected = async () => {
+    if (sheetSelected.length === 0) {
+      toast.error("Selected companies are Asana-only — nothing to delete from the sheet.");
+      setConfirmDeleteOpen(false);
+      return;
     }
-    return true;
-  });
+    setDeleting(true);
+    try {
+      const entries = sheetSelected.map((c) => ({ urid: c.urid, name: c.name }));
+      const res = await bulkDeletePortfolioCompanies({ data: { entries } });
+      const goneIds = new Set(sheetSelected.map((c) => c.id));
+      setCompanies((prev) => prev.filter((c) => !goneIds.has(c.id)));
+      if (selectedCompany && goneIds.has(selectedCompany.id)) {
+        setDetailOpen(false);
+        setSelectedCompany(null);
+      }
+      clearSelection();
+      toast.success(`Deleted ${res.deleted} compan${res.deleted !== 1 ? "ies" : "y"}.`);
+      void router.invalidate();
+    } catch (e) {
+      console.error("bulkDeletePortfolioCompanies failed", e);
+      toast.error("Delete failed — see console.");
+    } finally {
+      setDeleting(false);
+      setConfirmDeleteOpen(false);
+    }
+  };
+
+  const bulkAsanaSync = async () => {
+    const chosen = selectedCompanies;
+    if (chosen.length === 0) return;
+    setAsanaSyncing(true);
+    let ok = 0;
+    let failed = 0;
+    try {
+      for (const company of chosen) {
+        try {
+          const res = await syncPortcoFromAsana({ data: { companyName: company.name } });
+          if (!res.ok) {
+            failed += 1;
+            continue;
+          }
+          ok += 1;
+          const profileWebsite =
+            Object.entries(res.asanaFields).find(([k]) => /website|^url$|web\s*site/i.test(k))?.[1] ||
+            "";
+          const profileLinkedin =
+            Object.entries(res.asanaFields).find(([k]) => /linkedin/i.test(k))?.[1] || "";
+          const profileLocation =
+            Object.entries(res.asanaFields).find(([k]) =>
+              /^hq$|headquarter|location|city|geograph/i.test(k),
+            )?.[1] || "";
+          const profileDescription =
+            Object.entries(res.asanaFields).find(([k]) =>
+              /summary|description|about|overview/i.test(k),
+            )?.[1] || "";
+          patchCompanyLocal({
+            ...company,
+            asanaFields:
+              Object.keys(res.asanaFields).length > 0 ? res.asanaFields : company.asanaFields,
+            events: res.events,
+            website: company.website || profileWebsite || company.website,
+            linkedinUrl: company.linkedinUrl || profileLinkedin || company.linkedinUrl,
+            location: company.location || profileLocation || company.location,
+            description: company.description || profileDescription || company.description,
+          });
+        } catch {
+          failed += 1;
+        }
+      }
+      const parts = [`${ok} synced`];
+      if (failed) parts.push(`${failed} failed`);
+      (failed ? toast.warning : toast.success)(`Asana sync · ${parts.join(" · ")}`);
+      if (ok > 0) void router.invalidate();
+    } finally {
+      setAsanaSyncing(false);
+    }
+  };
+
+  const bulkWebSync = async () => {
+    const chosen = selectedCompanies;
+    if (chosen.length === 0) return;
+    setWebSyncing(true);
+    let ok = 0;
+    let failed = 0;
+    try {
+      for (const company of chosen) {
+        try {
+          const res = await syncPortcoFromWeb({
+            data: {
+              companyName: company.name,
+              website: company.website || undefined,
+              location: company.location || undefined,
+            },
+          });
+          if (!res.ok) {
+            failed += 1;
+            continue;
+          }
+          ok += 1;
+          patchCompanyLocal({
+            ...company,
+            website: company.website || res.website || company.website,
+            linkedinUrl: company.linkedinUrl || res.linkedinUrl || company.linkedinUrl,
+            location: company.location || res.location || company.location,
+            description: company.description || res.description || company.description,
+          });
+        } catch {
+          failed += 1;
+        }
+      }
+      const parts = [`${ok} synced`];
+      if (failed) parts.push(`${failed} failed`);
+      (failed ? toast.warning : toast.success)(`Web sync · ${parts.join(" · ")}`);
+      if (ok > 0) void router.invalidate();
+    } finally {
+      setWebSyncing(false);
+    }
+  };
+
+  const actionBtnClass = "h-8 text-xs";
 
   // Filtered companies grouped by sector, each with the deduped set of PortCo
   // contacts (people whose email domain matches a company in that sector).
@@ -378,6 +614,85 @@ function PortfolioPage() {
         </div>
       </div>
 
+      {/* Count + multi-select bulk actions */}
+      <div className="flex items-center justify-between gap-2 mb-3">
+        <div className="flex items-center gap-2">
+          <Checkbox
+            checked={allSelected ? true : someSelected ? "indeterminate" : false}
+            onCheckedChange={toggleAll}
+            disabled={filtered.length === 0 || busy}
+            aria-label="Select all portfolio companies"
+          />
+          <p className="text-xs text-muted-foreground">
+            <span className="font-semibold text-foreground">{filtered.length}</span> compan
+            {filtered.length !== 1 ? "ies" : "y"}
+            {selectedIds.size > 0 && (
+              <>
+                {" · "}
+                <span className="font-semibold text-foreground">{selectedIds.size}</span> selected
+              </>
+            )}
+          </p>
+        </div>
+        {selectedIds.size > 0 && (
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              className={actionBtnClass}
+              onClick={() => void bulkAsanaSync()}
+              disabled={busy}
+            >
+              {asanaSyncing ? (
+                <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+              ) : (
+                <RefreshCw className="h-3 w-3 mr-1" />
+              )}
+              {asanaSyncing ? "Syncing Asana…" : "Asana Sync"}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className={actionBtnClass}
+              onClick={() => void bulkWebSync()}
+              disabled={busy}
+            >
+              {webSyncing ? (
+                <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+              ) : (
+                <Globe className="h-3 w-3 mr-1" />
+              )}
+              {webSyncing ? "Syncing Web…" : "Web Sync"}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className={`${actionBtnClass} text-destructive border-destructive/30 hover:bg-destructive/10 hover:text-destructive`}
+              onClick={() => setConfirmDeleteOpen(true)}
+              disabled={busy || sheetSelected.length === 0}
+              title={
+                sheetSelected.length === 0
+                  ? "Asana-only companies can't be deleted from the sheet"
+                  : undefined
+              }
+            >
+              <Trash2 className="h-3 w-3 mr-1" />
+              Delete
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              className={actionBtnClass}
+              onClick={clearSelection}
+              disabled={busy}
+            >
+              <X className="h-3 w-3 mr-1" />
+              Clear
+            </Button>
+          </div>
+        )}
+      </div>
+
       {showContactsBySector ? (
         <div className="space-y-8">
           {sectorGroups.map(({ sector, companies: comps, people }) => (
@@ -400,6 +715,8 @@ function PortfolioPage() {
                       company,
                     )}
                     onClick={() => handleCardClick(company)}
+                    selected={selectedIds.has(company.id)}
+                    onToggleSelect={toggleId}
                   />
                 ))}
               </div>
@@ -434,6 +751,8 @@ function PortfolioPage() {
                 company,
               )}
               onClick={() => handleCardClick(company)}
+              selected={selectedIds.has(company.id)}
+              onToggleSelect={toggleId}
             />
           ))}
         </div>
@@ -445,6 +764,41 @@ function PortfolioPage() {
           <p className="text-sm text-muted-foreground">No portfolio companies match your filters</p>
         </div>
       )}
+
+      <AlertDialog open={confirmDeleteOpen} onOpenChange={setConfirmDeleteOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Delete {sheetSelected.length} compan{sheetSelected.length !== 1 ? "ies" : "y"}?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              This permanently removes{" "}
+              {sheetSelected.length === 1 ? "this company" : "these companies"} from the Portfolio
+              Companies sheet. Asana-only cards in the selection are skipped. This can&apos;t be
+              undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleting}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault();
+                void deleteSelected();
+              }}
+              disabled={deleting || sheetSelected.length === 0}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {deleting ? (
+                <>
+                  <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> Deleting…
+                </>
+              ) : (
+                <>Delete {sheetSelected.length}</>
+              )}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <PortfolioDetail
         company={selectedCompany}

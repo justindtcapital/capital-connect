@@ -6,6 +6,7 @@ import {
   buildAppEvents,
   addPortfolioCompany as addPortfolioCompanyServer,
   deletePortfolioCompany as deletePortfolioCompanyServer,
+  bulkDeletePortfolioCompanies as bulkDeletePortfolioCompaniesServer,
   addContactRow,
   appendSheetRow,
   appendInteractionRows,
@@ -118,6 +119,13 @@ export const deletePortfolioCompany = createServerFn({ method: "POST" })
   .inputValidator((data: { urid?: string; name?: string }) => data)
   .handler(async ({ data }) => {
     return await deletePortfolioCompanyServer(data);
+  });
+
+// Delete many portfolio companies in one sheet pass (URID preferred, name fallback).
+export const bulkDeletePortfolioCompanies = createServerFn({ method: "POST" })
+  .inputValidator((data: { entries: { urid?: string; name?: string }[] }) => data)
+  .handler(async ({ data }) => {
+    return await bulkDeletePortfolioCompaniesServer(data.entries || []);
   });
 
 // App-added events (stored in the Sheet's "App Events" tab — never written to Asana).

@@ -3,10 +3,12 @@ import type { PortfolioFilters } from "./types";
 
 const defaultFilters: PortfolioFilters = {
   search: "",
-  sector: "all",
-  domain: "all",
-  city: "all",
-  dtcPriority: "all",
+  sector: [],
+  domain: [],
+  city: [],
+  dtcPriority: [],
+  companyStage: [],
+  leadInvestor: [],
 };
 
 interface PortfolioFilterContextValue {

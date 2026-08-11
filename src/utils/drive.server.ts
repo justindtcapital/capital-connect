@@ -62,7 +62,9 @@ export function emailPdfFolderId(): string {
   );
 }
 
-/** Stable short fingerprint for a Gmail attachment (fits Drive appProperties). */
+/** Stable short fingerprint for a Gmail attachment (fits Drive appProperties).
+ *  Uses pure-JS sha256 (not node:crypto) so this module is safe if pulled into
+ *  the client bundle via route imports. */
 export function gmailAttachmentKey(messageId: string, attachmentId: string): string {
   return sha256Hex(`${messageId}:${attachmentId}`).slice(0, 40);
 }

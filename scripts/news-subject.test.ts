@@ -60,6 +60,38 @@ console.log("— parseResearchSubject entities —");
   );
 }
 {
+  const parsed = parseResearchSubject("RE: Gartner: Snowflake, Databricks, Palantir");
+  check("Gartner publisher", parsed.publisher?.name === "Gartner", JSON.stringify(parsed));
+  check(
+    "Gartner entity list",
+    parsed.entities.join("|") === "Snowflake|Databricks|Palantir",
+    JSON.stringify(parsed.entities),
+  );
+}
+{
+  const parsed = parseResearchSubject("FW: Forrester: Acme Corp, Beta Systems");
+  check("Forrester publisher", parsed.publisher?.name === "Forrester", JSON.stringify(parsed));
+  check(
+    "Forrester entities",
+    parsed.entities.join("|") === "Acme Corp|Beta Systems",
+    JSON.stringify(parsed.entities),
+  );
+}
+{
+  // Unknown boutique label — still explode A, B, C.
+  const parsed = parseResearchSubject("FW: Canalys Briefing: VendorOne, VendorTwo, Theme AI");
+  check(
+    "unknown label still publishes",
+    parsed.publisher?.name === "Canalys Briefing",
+    JSON.stringify(parsed.publisher),
+  );
+  check(
+    "unknown label entities",
+    parsed.entities.join("|") === "VendorOne|VendorTwo|Theme AI",
+    JSON.stringify(parsed.entities),
+  );
+}
+{
   const parsed = parseResearchSubject("RE: Gartner: Magic Quadrant update");
   check(
     "single theme entity",

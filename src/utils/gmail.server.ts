@@ -13,6 +13,7 @@
 // and paste the new GOOGLE_REFRESH_TOKEN. Enable the Gmail API in GCP too.
 
 import { getAccessToken } from "./sheets.server";
+import { sanitizeEmailText } from "@/lib/email-body-clean";
 import { extractArticleLinks } from "@/lib/link-digest";
 import {
   isBulkOrAutomatedMail,
@@ -121,7 +122,13 @@ function findPart(part: any, mime: string): string {
 }
 
 function stripHtml(html: string): string {
-  return html
+  // Drop mailto hrefs before stripping tags so we don't glue
+  // "user@x.com" + "mailto:user@x.com" into one token.
+  const withoutMailtoHref = html.replace(
+    /<a\b[^>]*\bhref\s*=\s*["']?\s*mailto:[^"'>\s]+["']?[^>]*>/gi,
+    "<a>",
+  );
+  return withoutMailtoHref
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
     .replace(/<[^>]+>/g, " ")
@@ -129,6 +136,9 @@ function stripHtml(html: string): string {
     .replace(/&amp;/gi, "&")
     .replace(/&lt;/gi, "<")
     .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/([\w.+-]+@[\w.-]+\.\w{2,})mailto:\1/gi, "$1")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -139,8 +149,9 @@ function stripHtml(html: string): string {
 function extractParts(payload: any): { text: string; html: string } {
   const plain = findPart(payload, "text/plain");
   const html = findPart(payload, "text/html");
-  const text =
-    plain.trim() || (html ? stripHtml(html) : "") || decodeB64(payload?.body?.data).trim();
+  const text = sanitizeEmailText(
+    plain.trim() || (html ? stripHtml(html) : "") || decodeB64(payload?.body?.data).trim(),
+  );
   return { text, html: html.slice(0, 300_000) };
 }
 

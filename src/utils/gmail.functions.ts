@@ -12,6 +12,7 @@ import {
   emailPdfFolderId,
   findDriveFileByGmailAttachment,
   uploadDriveFile,
+  downloadDriveFile,
   gmailAttachmentKey,
   GMAIL_ATTACH_PROP,
   MAX_ARCHIVE_PDF_BYTES,
@@ -19,7 +20,7 @@ import {
 } from "./drive.server";
 import { buildContacts, buildPortfolioCompanies } from "./sheets.server";
 import { fetchLinkPreviews, type LinkPreview } from "./link-preview.server";
-import { appendDigestLinkSignals, appendResearchDigestSignals } from "./signal-store.server";
+import { appendDigestLinkSignals, appendResearchDigestSignals, patchWeakResearchSignalHeadlines } from "./signal-store.server";
 import {
   isLinkDigest,
   titleFromSlug,
@@ -28,8 +29,10 @@ import {
   matchCompanyByHost,
 } from "@/lib/link-digest";
 import { parseResearchSubject } from "@/lib/news-subject";
+import { researchCardCopy, isWeakResearchSnippet } from "@/lib/email-body-clean";
 import { guessDomainFromCompanyName } from "@/lib/domain-utils";
 import { companiesMatch } from "@/lib/attribution-score";
+import { driveFileIdFromUrl } from "@/lib/safe-url";
 import type { Contact, PortfolioCompany } from "@/lib/types";
 
 // One email mapped to the Signals feed, tagged with its CRM contact/company.
@@ -351,10 +354,10 @@ export async function gatherNetworkEmails(pre?: {
     const dom = emailDomain(partyEmail) || partyEmail.split("@")[1] || "";
     const newsAlias = isNewsAliasMsg(m);
 
-    // NEWS@ is a forward inbox — From:/To: domains are provenance (Dell, DTC),
-    // not the story. Prefer the research house named in the subject
-    // ("FW: 451 Research: Siemens AG, …") and explode listed entities into
-    // their own cards so Siemens/EnergyHub/etc. attribute as themselves.
+    // NEWS@ is a forward inbox — From:/To: domains are provenance (employer,
+    // mailbox owner), not the story. Prefer the research house named in the
+    // subject ("FW: Publisher: EntityA, EntityB, …") and explode listed
+    // entities into their own cards.
     if (newsAlias) {
       const parsed = parseResearchSubject(m.subject);
       const publisher = parsed.publisher;
@@ -364,6 +367,13 @@ export async function gatherNetworkEmails(pre?: {
       if (parsed.entities.length > 0) {
         return parsed.entities.map((entity, n) => {
           const resolved = resolveResearchEntity(entity, portfolio, contacts, byEmail);
+          const copy = researchCardCopy({
+            rawBody: m.body,
+            gmailSnippet: m.snippet,
+            entity: resolved.company,
+            publisherName: pubLabel,
+            dateLabel: m.dateLabel,
+          });
           return {
             id: `${m.id}-r${n}`,
             subject: `${resolved.company} — ${pubLabel}`,
@@ -371,10 +381,8 @@ export async function gatherNetworkEmails(pre?: {
             fromEmail: m.fromEmail,
             company: resolved.company,
             contactName: contact?.name,
-            snippet:
-              m.snippet?.trim() ||
-              `Covered in ${pubLabel}${m.dateLabel ? ` (${m.dateLabel})` : ""}.`,
-            body: m.body,
+            snippet: copy.snippet,
+            body: copy.body,
             date: m.date,
             dateLabel: m.dateLabel,
             permalink: m.permalink,
@@ -391,6 +399,13 @@ export async function gatherNetworkEmails(pre?: {
       if (pdfs.length > 0) {
         return pdfs.map((a, n) => {
           const title = (a.filename || "Research PDF").replace(/\.pdf$/i, "").trim();
+          const copy = researchCardCopy({
+            rawBody: m.body,
+            gmailSnippet: m.snippet,
+            entity: title,
+            publisherName: pubLabel,
+            dateLabel: m.dateLabel,
+          });
           return {
             id: `${m.id}-p${n}`,
             subject: title,
@@ -398,8 +413,8 @@ export async function gatherNetworkEmails(pre?: {
             fromEmail: m.fromEmail,
             company: title,
             contactName: contact?.name,
-            snippet: `From ${pubLabel}${m.snippet ? `: ${m.snippet}` : ""}`,
-            body: m.body,
+            snippet: copy.snippet,
+            body: copy.body,
             date: m.date,
             dateLabel: m.dateLabel,
             permalink: m.permalink,
@@ -411,24 +426,32 @@ export async function gatherNetworkEmails(pre?: {
         });
       }
 
-      return [
-        {
-          id: m.id,
-          subject: m.subject,
-          fromName: m.fromName,
-          fromEmail: m.fromEmail,
-          company: pubLabel,
-          contactName: contact?.name,
-          snippet: m.snippet,
-          body: m.body,
-          date: m.date,
+      {
+        const copy = researchCardCopy({
+          rawBody: m.body,
+          gmailSnippet: m.snippet,
+          publisherName: pubLabel,
           dateLabel: m.dateLabel,
-          permalink: m.permalink,
-          logoDomain: publisher?.domain,
-          docUrl,
-          sourceHint: "Industry Reports" as const,
-        },
-      ];
+        });
+        return [
+          {
+            id: m.id,
+            subject: m.subject,
+            fromName: m.fromName,
+            fromEmail: m.fromEmail,
+            company: pubLabel,
+            contactName: contact?.name,
+            snippet: copy.snippet,
+            body: copy.body,
+            date: m.date,
+            dateLabel: m.dateLabel,
+            permalink: m.permalink,
+            logoDomain: publisher?.domain,
+            docUrl,
+            sourceHint: "Industry Reports" as const,
+          },
+        ];
+      }
     }
 
     return [
@@ -449,6 +472,15 @@ export async function gatherNetworkEmails(pre?: {
       },
     ];
   });
+
+  // When a NEWS@ forward has a PDF, ask Gemini to read it and write a concrete
+  // per-entity signal line (replaces "X covered in Publisher (date)" placeholders).
+  // Best-effort + cached — never blocks the feed on Vertex failures.
+  try {
+    await enrichResearchSignalsFromPdfs(emails, newsDocs);
+  } catch (e) {
+    console.error("[gmail] research PDF enrichment failed (feed unaffected):", e);
+  }
 
   // Archive exploded digest links + NEWS@ research cards to the Signals sheet
   // so they outlive the Gmail search window. Best-effort — a Sheets hiccup
@@ -530,6 +562,141 @@ function resolveResearchEntity(
     company: raw,
     logoDomain: guessDomainFromCompanyName(raw) || undefined,
   };
+}
+
+/** In-process cache so Signals refreshes don't re-bill Vertex for the same PDF. */
+const researchPdfCache = new Map<
+  string,
+  { at: number; byEntity: Map<string, { signal: string; summary: string }> }
+>();
+const RESEARCH_PDF_CACHE_MS = 6 * 60 * 60 * 1000;
+const MAX_RESEARCH_PDF_BYTES = 8_000_000;
+
+function baseGmailMessageId(signalId: string): string {
+  return (signalId || "").replace(/-[rp]\d+$/i, "");
+}
+
+/**
+ * For NEWS@ research cards still on a weak placeholder snippet, download the
+ * attached/archived PDF once, ask Gemini for a concrete finding per entity,
+ * and stamp snippet/body (+ patch any weak sheet rows).
+ */
+async function enrichResearchSignalsFromPdfs(
+  emails: GmailSignal[],
+  newsDocs: NewsAliasDoc[],
+): Promise<void> {
+  const research = emails.filter(
+    (e) => e.sourceHint === "Industry Reports" && !e.linkUrl && isWeakResearchSnippet(e.snippet),
+  );
+  if (research.length === 0) return;
+
+  // Dynamic import keeps gemini.server out of the static client graph.
+  const { summarizeResearchPdfEntities, isGeminiConfigured } = await import("./gemini.server");
+  if (!isGeminiConfigured()) return;
+
+  const byMsg = new Map<string, GmailSignal[]>();
+  for (const e of research) {
+    const mid = baseGmailMessageId(e.id);
+    if (!mid) continue;
+    const list = byMsg.get(mid) || [];
+    list.push(e);
+    byMsg.set(mid, list);
+  }
+
+  const docsByMsg = new Map<string, NewsAliasDoc[]>();
+  for (const d of newsDocs) {
+    const list = docsByMsg.get(d.messageId) || [];
+    list.push(d);
+    docsByMsg.set(d.messageId, list);
+  }
+
+  const patches: Array<{ sourceUrl: string; company: string; signal: string; body?: string }> =
+    [];
+
+  for (const [messageId, cards] of byMsg) {
+    const entities = [...new Set(cards.map((c) => c.company).filter(Boolean))];
+    if (entities.length === 0) continue;
+
+    const cached = researchPdfCache.get(messageId);
+    let byEntity =
+      cached && Date.now() - cached.at < RESEARCH_PDF_CACHE_MS ? cached.byEntity : null;
+
+    if (!byEntity) {
+      let base64: string | null = null;
+      let mediaType = "application/pdf";
+      const sample = cards[0];
+      const driveId = driveFileIdFromUrl(sample.docUrl);
+      if (driveId) {
+        const file = await downloadDriveFile(driveId);
+        if (file) {
+          base64 = file.base64;
+          mediaType = file.mediaType;
+        }
+      }
+      if (!base64) {
+        const doc =
+          (docsByMsg.get(messageId) || []).find(
+            (d) => !d.sizeBytes || d.sizeBytes <= MAX_RESEARCH_PDF_BYTES,
+          ) || null;
+        if (doc) {
+          base64 = await downloadGmailAttachment(doc.messageId, doc.attachmentId);
+        }
+      }
+      if (!base64) continue;
+      if (base64.length * 0.75 > MAX_RESEARCH_PDF_BYTES) continue;
+
+      const publisher =
+        parseResearchSubject(sample.digestSubject || sample.subject).publisher?.name ||
+        "Industry Report";
+      const result = await summarizeResearchPdfEntities({
+        base64,
+        mediaType,
+        publisher,
+        subject: sample.digestSubject || sample.subject,
+        entities,
+      });
+      if (!result.ok) {
+        console.warn(`[gmail] PDF summarize failed for ${messageId}: ${result.error}`);
+        continue;
+      }
+      byEntity = new Map(
+        result.items.map((it) => [
+          it.entity.toLowerCase(),
+          { signal: it.signal, summary: it.summary },
+        ]),
+      );
+      researchPdfCache.set(messageId, { at: Date.now(), byEntity });
+      console.log(
+        `[gmail] Gemini read PDF for ${messageId}: ${byEntity.size}/${entities.length} entit(y/ies)`,
+      );
+    }
+
+    for (const card of cards) {
+      const direct = byEntity.get(card.company.toLowerCase());
+      const fuzzy = direct
+        ? null
+        : [...byEntity.entries()].find(([k]) => companiesMatch(k, card.company))?.[1];
+      const hit = direct || fuzzy;
+      if (!hit) continue;
+      card.snippet = hit.signal;
+      card.body = hit.summary;
+      patches.push({
+        sourceUrl: card.permalink,
+        company: card.company,
+        signal: hit.signal,
+        body: hit.summary,
+      });
+    }
+  }
+
+  if (patches.length > 0) {
+    try {
+      const n = await patchWeakResearchSignalHeadlines(patches);
+      if (n > 0) console.log(`[gmail] patched ${n} weak research headline(s) on Signals tab`);
+    } catch (e) {
+      console.error("[gmail] patchWeakResearchSignalHeadlines failed:", e);
+    }
+  }
 }
 
 // One digest link → one signal about the article's company. Title/description

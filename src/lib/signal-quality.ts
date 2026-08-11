@@ -55,6 +55,10 @@ export function isUsableDigestSnippet(snippet: string): boolean {
   if (s.length < DIGEST_SNIPPET_MIN_CHARS) return false;
   // Single token / truncated fragments ("AI", "We", "approx. $1.") are not usable.
   if (!/\s/.test(s)) return false;
+  // Forwarded-thread chrome (NEWS@ Outlook dumps) must never become the headline.
+  if (/^(internal use|confidential|from:|to:|cc:|subject:|sent:)/i.test(s)) return false;
+  if (/mailto:/i.test(s) || /&(?:lt|gt);/i.test(s)) return false;
+  if ((s.match(/@/g) || []).length >= 3) return false;
   return true;
 }
 

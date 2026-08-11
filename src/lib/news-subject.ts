@@ -1,10 +1,10 @@
 // Subject-line publisher extraction for NEWS@ / forwarded research digests.
 // Pure — safe to unit-test without Gmail.
 //
-// NEWS@ mail is almost always a human forward. The From: domain (Dell, DTC,
-// etc.) is provenance, NOT the news subject. Prefer the research house named
-// in the subject ("FW: 451 Research: Siemens AG, …"), and explode the listed
-// companies/themes into their own feed cards.
+// NEWS@ mail is almost always a human forward. The From: domain (employer /
+// mailbox owner) is provenance, NOT the news subject. Prefer the research
+// house named in the subject ("FW: Publisher: EntityA, EntityB, …"), and
+// explode the listed companies/themes into their own feed cards.
 
 import { guessDomainFromCompanyName } from "./domain-utils";
 
@@ -57,8 +57,8 @@ export function researchPublisherFromSubject(subject: string): ResearchPublisher
 
 /**
  * Parse a NEWS@ research subject into publisher + listed entities.
- * e.g. "FW: 451 Research: Siemens AG, EnergyHub, Reco" →
- *   publisher 451 Research, entities [Siemens AG, EnergyHub, Reco]
+ * Works for any "Publisher: A, B, C" subject — known houses (Gartner, 451, …)
+ * get a stable domain; unknown labels still explode the entity list.
  */
 export function parseResearchSubject(subject: string): ResearchSubjectParse {
   const s = stripReplyForwardPrefixes(subject);
@@ -87,11 +87,24 @@ export function parseResearchSubject(subject: string): ResearchSubjectParse {
         /[A-Za-z]/.test(name) &&
         name.split(/\s+/).length <= 6
       ) {
-        const domain = guessDomainFromCompanyName(name);
-        if (domain) {
-          publisher = { name, domain };
-          remainder = m[2].trim();
+        const domain = guessDomainFromCompanyName(name) || "";
+        publisher = { name, domain };
+        remainder = m[2].trim();
+      }
+    }
+  }
+
+  // Still no remainder, but the subject looks like "Label: A, B, C" — explode
+  // the list even when the left-hand label isn't a known research house.
+  if (!remainder && /[,;|·]/.test(s)) {
+    const m = s.match(/^([^,:;|·\n]{2,60}?)\s*[:—–-]\s+(.+)$/);
+    if (m && /[,;|·]/.test(m[2])) {
+      const name = m[1].replace(/\s+/g, " ").trim();
+      if (name && !/^(internal|confidential|fw|re|fwd)\b/i.test(name)) {
+        if (!publisher) {
+          publisher = { name, domain: guessDomainFromCompanyName(name) || "" };
         }
+        remainder = m[2].trim();
       }
     }
   }
@@ -100,12 +113,12 @@ export function parseResearchSubject(subject: string): ResearchSubjectParse {
   return { publisher, entities };
 }
 
-/** Split "Siemens AG, EnergyHub, Reco, Trianz, Generative AI" into entities. */
+/** Split a subject-list remainder into entities (companies / themes). */
 export function splitResearchEntities(remainder: string): string[] {
   const raw = (remainder || "").trim();
   if (!raw) return [];
 
-  // Comma / semicolon / " · " / " | " lists. Keep "Siemens AG" intact.
+  // Comma / semicolon / " · " / " | " lists. Keep multi-word names intact.
   const parts = raw
     .split(/\s*[,;|·]\s*|\s+\/\s+/)
     .map((p) => p.replace(/\s+/g, " ").trim())

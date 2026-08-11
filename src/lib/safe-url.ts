@@ -26,3 +26,11 @@ export function driveFileViewUrl(id?: string | null): string {
   if (!fileId) return "";
   return `https://drive.google.com/file/d/${encodeURIComponent(fileId)}/view`;
 }
+
+/** Extract a Drive file id from a /file/d/<id>/… or open?id=<id> URL. */
+export function driveFileIdFromUrl(raw?: string | null): string {
+  const href = absoluteHttpUrl(raw);
+  if (!href) return "";
+  const m = href.match(/\/file\/d\/([^/?#]+)/i) || href.match(/[?&]id=([^&#]+)/i);
+  return m?.[1] ? decodeURIComponent(m[1]) : "";
+}

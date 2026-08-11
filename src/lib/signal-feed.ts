@@ -298,20 +298,21 @@ function dedupeCards(cards: FeedCard[]): FeedCard[] {
     }
   };
   // Event-clustered rows (v2) → ONE card per real-world event, regardless of
-  // how many sources/rows the event has. Then: real URL → dedup by URL. No real
-  // URL → dedup by company + the SPECIFIC content (headline + summary), not the
-  // generic "Company — Category" headline, so distinct awareness items about
-  // the same company aren't wrongly collapsed.
+  // how many sources/rows the event has. Then: real URL → dedup by URL+company
+  // (same article cited for two companies must not collapse; same URL+company
+  // from sheet+live lanes still merges). No real URL → company + content.
   const keyOf = (c: FeedCard): string => {
     if (c.eventId) return `e:${c.eventId}`;
-    if (c.sourceUrl && !c.sourceIsSearch && /^https?:\/\//.test(c.sourceUrl))
-      return `u:${normUrl(c.sourceUrl)}`;
+    const company = (c.company || "").trim().toLowerCase();
+    if (c.sourceUrl && !c.sourceIsSearch && /^https?:\/\//.test(c.sourceUrl)) {
+      return `u:${normUrl(c.sourceUrl)}|${company}`;
+    }
     const content = `${c.headline || ""} ${c.summary || ""}`
       .toLowerCase()
       .replace(/\s+/g, " ")
       .trim()
       .slice(0, 200);
-    return `h:${(c.company || "").toLowerCase()}|${content}`;
+    return `h:${company}|${content}`;
   };
 
   const best = new Map<string, FeedCard>();
@@ -595,6 +596,16 @@ export function buildFeed(input: BuildFeedInput): FeedCard[] {
       e.sourceHint === "Industry Reports" && e.digestSubject
         ? `\n\n_Source: ${e.digestSubject}_`
         : "";
+    // Guard: never seed Why-it-matters from Outlook forward chrome if a
+    // caller still passed a raw Gmail snippet through.
+    const summarySeed = (() => {
+      const snip = (e.snippet || "").trim();
+      const bodyStart = (e.body || "").replace(/\s+/g, " ").trim().slice(0, 220);
+      if (snip && !/^(internal use|confidential|from:|to:|cc:|subject:)/i.test(snip) && !/mailto:/i.test(snip))
+        return snip;
+      if (bodyStart && !/^(internal use|confidential|from:)/i.test(bodyStart)) return bodyStart;
+      return snip || bodyStart;
+    })();
     cards.push({
       id: `gmail-${i}-${e.id}`,
       // Portco emails are typically the "PortCo blogs" digest lane; NEWS@ research
@@ -610,7 +621,7 @@ export function buildFeed(input: BuildFeedInput): FeedCard[] {
       industry: inferIndustry(blob),
       investor: investorFor(e.company || ""),
       headline: e.subject,
-      summary: e.snippet || e.body.slice(0, 160),
+      summary: summarySeed || e.body.slice(0, 160),
       body:
         (e.body || e.snippet || "_(no body)_") +
         researchProvenance +

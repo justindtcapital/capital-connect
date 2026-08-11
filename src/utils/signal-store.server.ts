@@ -17,8 +17,9 @@ import {
   digestHeadline,
   passesAwarenessQualityGate,
 } from "@/lib/signal-quality";
-import { fetchSheetTab, appendSheetRows, TAB_NAMES } from "./sheets.server";
+import { fetchSheetTab, appendSheetRows, updateSheetCells, colLetters, TAB_NAMES } from "./sheets.server";
 import { articleUrlKey } from "./news.server";
+import { isWeakResearchSnippet } from "@/lib/email-body-clean";
 
 export interface StoredSignal {
   id: string;
@@ -322,7 +323,7 @@ function storedFromResearchDigest(
   const headline =
     digestHeadline(s.snippet || "", title) ||
     `${s.company} — industry research`;
-  // Stable per company-within-email so Siemens + EnergyHub from the same forward
+  // Stable per company-within-email so multi-entity research forwards
   // don't collapse together (they share the Gmail permalink).
   const identity = `${s.permalink || ""}|${s.company || ""}|${title}`;
   const proxy = awarenessRelevanceProxy({ isPortco, isWatch, networkContactCount }, cfg);
@@ -340,7 +341,7 @@ function storedFromResearchDigest(
     signal: clampHeadline(headline),
     sourceUrl: s.permalink || "",
     subject: clampText(title, 200),
-    body: "",
+    body: clampText((s.body || "").trim(), 4000),
     relevance,
     justification: s.digestSubject
       ? `NEWS@ · ${s.digestSubject}`
@@ -349,7 +350,7 @@ function storedFromResearchDigest(
     timing: "",
     sourceType: s.sourceHint || "Industry Reports",
     docUrl: (s.docUrl || "").trim(),
-    hasBody: false,
+    hasBody: Boolean((s.body || "").trim()),
   };
 }
 
@@ -437,4 +438,62 @@ export async function appendResearchDigestSignals(
     await appendSheetRows(TAB_NAMES.signals, toAppend.map(rowFromStored));
   }
   return toAppend.length;
+}
+
+/**
+ * Upgrade weak NEWS@ research headlines already on the Signals tab once Gemini
+ * has read the PDF. Matches on Gmail permalink + company. Returns rows patched.
+ */
+export async function patchWeakResearchSignalHeadlines(
+  patches: Array<{ sourceUrl: string; company: string; signal: string; body?: string }>,
+): Promise<number> {
+  const usable = patches.filter(
+    (p) =>
+      (p.sourceUrl || "").trim() &&
+      (p.company || "").trim() &&
+      (p.signal || "").trim() &&
+      !isWeakResearchSnippet(p.signal),
+  );
+  if (usable.length === 0) return 0;
+
+  let rows: string[][] = [];
+  try {
+    rows = await fetchSheetTab(TAB_NAMES.signals);
+  } catch {
+    return 0;
+  }
+  if (rows.length === 0) return 0;
+
+  const isHeader = (r: string[]) =>
+    (r[0] || "").trim().toLowerCase() === "id" && (r[2] || "").trim().toLowerCase() === "type";
+  const start = rows.length && isHeader(rows[0]) ? 1 : 0;
+  const want = new Map<string, { signal: string; body?: string }>();
+  for (const p of usable) {
+    const k = `${urlKey(p.sourceUrl)}|${p.company.trim().toLowerCase()}`;
+    if (k.startsWith("|")) continue;
+    want.set(k, { signal: clampHeadline(p.signal), body: (p.body || "").trim() || undefined });
+  }
+
+  const cellUpdates: Array<{ range: string; value: string }> = [];
+  for (let i = start; i < rows.length; i++) {
+    const row = rows[i] || [];
+    const company = (row[5] || "").trim().toLowerCase();
+    const sourceUrl = (row[9] || "").trim();
+    const current = (row[8] || "").trim();
+    if (!company || !sourceUrl) continue;
+    const hit = want.get(`${urlKey(sourceUrl)}|${company}`);
+    if (!hit) continue;
+    if (!isWeakResearchSnippet(current) && current.length >= hit.signal.length * 0.6) continue;
+    const rowNum = i + 1; // sheets 1-indexed
+    cellUpdates.push({ range: `${colLetters(8)}${rowNum}`, value: hit.signal }); // Signal
+    if (hit.body) {
+      cellUpdates.push({
+        range: `${colLetters(11)}${rowNum}`,
+        value: clampText(hit.body, SIGNAL_BODY_MAX),
+      }); // Body
+    }
+  }
+  if (cellUpdates.length === 0) return 0;
+  await updateSheetCells(TAB_NAMES.signals, cellUpdates);
+  return cellUpdates.filter((u) => u.range.startsWith(colLetters(8))).length;
 }

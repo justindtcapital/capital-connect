@@ -1029,3 +1029,148 @@ export async function scanSignals(input: SignalScanInput): Promise<SignalScanRes
     return { found: false, error: "Gemini returned malformed JSON", raw: text, ...empty };
   }
 }
+
+// ── Research PDF → per-entity signal lines ───────────────────────
+// Used by the NEWS@ feed path: one PDF often names several companies in the
+// subject. We ask Gemini to read the PDF once and return a concrete finding
+// per entity so cards aren't stuck on "X covered in Publisher (date)".
+
+export interface ResearchPdfEntitySummary {
+  entity: string;
+  /** 1–2 sentence card headline (the Signals "signal" line). */
+  signal: string;
+  /** Short supporting blurb for the card body. */
+  summary: string;
+}
+
+export interface SummarizeResearchPdfInput {
+  base64: string;
+  mediaType?: string;
+  publisher?: string;
+  subject?: string;
+  entities: string[];
+}
+
+export async function summarizeResearchPdfEntities(
+  input: SummarizeResearchPdfInput,
+): Promise<
+  | { ok: true; items: ResearchPdfEntitySummary[] }
+  | { ok: false; error: string; errorCode?: string }
+> {
+  if (!isGeminiConfigured())
+    return { ok: false, error: "GOOGLE_CLOUD_PROJECT is not configured", errorCode: "no_key" };
+
+  const entities = [...new Set((input.entities || []).map((e) => e.trim()).filter(Boolean))].slice(
+    0,
+    12,
+  );
+  if (!input.base64 || entities.length === 0) {
+    return { ok: false, error: "PDF bytes and at least one entity are required" };
+  }
+
+  const publisher = (input.publisher || "").trim() || "Industry research";
+  const subject = (input.subject || "").trim();
+  const system = [
+    "You extract concrete findings from industry research PDFs for a venture CRM.",
+    "Return STRICT JSON only. No markdown fences.",
+    "For EACH listed entity, write a signal line grounded ONLY in the attached PDF.",
+    "Rules:",
+    '- "signal": 1–2 short sentences (≤ ~40 words). Lead with the concrete finding about THAT entity.',
+    '- Do NOT write placeholders like "X covered in Y" or "mentioned in the report".',
+    "- Do NOT invent facts, figures, or quotes that are not in the PDF.",
+    "- If the PDF barely mentions an entity, say what little is known — still concrete.",
+    '- "summary": 2–4 sentences expanding the finding for the card body.',
+    '- "entity": copy the entity name from the input list (same spelling).',
+    'Schema: {"items":[{"entity":"","signal":"","summary":""}]}',
+  ].join("\n");
+
+  const userText = [
+    `Publisher: ${publisher}`,
+    subject ? `Email subject: ${subject}` : "",
+    `Entities to cover (one item each): ${entities.join(" | ")}`,
+    "",
+    "Read the attached PDF and return JSON for every entity listed above.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const r = await callGeminiRaw(
+    {
+      systemInstruction: { parts: [{ text: system }] },
+      contents: [
+        {
+          role: "user",
+          parts: [
+            { text: userText },
+            {
+              inlineData: {
+                mimeType: input.mediaType || "application/pdf",
+                data: input.base64,
+              },
+            },
+          ],
+        },
+      ],
+      // PDF read needs a bit of thinking; keep answer budget for ~12 entities.
+      generationConfig: genConfig(3500, 1024, { responseMimeType: "application/json" }),
+    },
+    GEMINI_MODEL,
+  );
+  if (!r.ok) return { ok: false, error: r.error, errorCode: codeFor(r.status) };
+
+  const text = responseText(r.data);
+  if (!text) return { ok: false, error: "Gemini returned an empty response", errorCode: "parse" };
+
+  const candidate = extractJsonObject(text) || text;
+  let parsed: { items?: ResearchPdfEntitySummary[] } | null = null;
+  try {
+    parsed = JSON.parse(candidate) as { items?: ResearchPdfEntitySummary[] };
+  } catch {
+    const repaired = repairJson(candidate);
+    if (repaired) {
+      try {
+        parsed = JSON.parse(repaired) as { items?: ResearchPdfEntitySummary[] };
+      } catch {
+        parsed = null;
+      }
+    }
+  }
+  if (!parsed?.items || !Array.isArray(parsed.items)) {
+    return { ok: false, error: "Gemini returned malformed JSON", errorCode: "parse" };
+  }
+
+  const byLower = new Map(entities.map((e) => [e.toLowerCase(), e]));
+  const items: ResearchPdfEntitySummary[] = [];
+  const seen = new Set<string>();
+  for (const raw of parsed.items) {
+    const entityRaw = String(raw?.entity || "").trim();
+    const signal = String(raw?.signal || "")
+      .trim()
+      .replace(/\s+/g, " ");
+    const summary = String(raw?.summary || "")
+      .trim()
+      .replace(/\s+/g, " ");
+    if (!entityRaw || !signal || signal.length < 28) continue;
+    // Reject leftover placeholders.
+    if (/\bcovered in\b/i.test(signal)) continue;
+
+    let entity = byLower.get(entityRaw.toLowerCase());
+    if (!entity) {
+      entity = entities.find((e) => companiesMatch(e, entityRaw));
+    }
+    if (!entity) continue;
+    const key = entity.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    items.push({
+      entity,
+      signal: signal.slice(0, 320),
+      summary: (summary || signal).slice(0, 1200),
+    });
+  }
+
+  if (items.length === 0) {
+    return { ok: false, error: "Gemini returned no usable entity findings", errorCode: "parse" };
+  }
+  return { ok: true, items };
+}

@@ -146,7 +146,7 @@ function CrmPage() {
       setAddContactOpen(false);
       setAddForm({ name: "", email: "", company: "", title: "", linkedinUrl: "" });
       await router.invalidate();
-      await navigate({ search: (prev) => ({ ...prev, contact: emailAddr }) });
+      await navigate({ search: (prev: Record<string, unknown>) => ({ ...prev, contact: emailAddr }) });
     } catch (e) {
       console.error("addContact failed", e);
       const msg = e instanceof Error ? e.message : String(e);

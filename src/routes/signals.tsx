@@ -665,7 +665,7 @@ function SignalsPage() {
     const out = feed.filter((c) => {
       if (terms.length > 0) {
         const hay = `${c.headline} ${c.summary} ${c.company} ${c.category || ""}`.toLowerCase();
-        if (!terms.every((t) => hay.includes(t))) return false;
+        if (!terms.every((t: string) => hay.includes(t))) return false;
       }
       if (minTs && (!c.sortTs || c.sortTs < minTs)) return false;
       if (sourceSel.length && !sourceSel.includes(c.sourceType)) return false;

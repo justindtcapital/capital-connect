@@ -60,7 +60,7 @@ export function hasGoogleOAuth(): boolean {
 }
 
 export function getSpreadsheetId(): string | undefined {
-  return process.env.GOOGLE_SPREADSHEET_ID;
+  return cleanSecret(process.env.GOOGLE_SPREADSHEET_ID, ["GOOGLE_SPREADSHEET_ID"]);
 }
 
 // Throwing accessor for the many Sheets calls that can't proceed without it.

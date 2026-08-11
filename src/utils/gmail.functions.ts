@@ -27,7 +27,9 @@ import {
   companyFromHost,
   matchCompanyByHost,
 } from "@/lib/link-digest";
-import { researchPublisherFromSubject } from "@/lib/news-subject";
+import { parseResearchSubject } from "@/lib/news-subject";
+import { guessDomainFromCompanyName } from "@/lib/domain-utils";
+import { companiesMatch } from "@/lib/attribution-score";
 import type { Contact, PortfolioCompany } from "@/lib/types";
 
 // One email mapped to the Signals feed, tagged with its CRM contact/company.
@@ -351,16 +353,71 @@ export async function gatherNetworkEmails(pre?: {
 
     // NEWS@ is a forward inbox — From:/To: domains are provenance (Dell, DTC),
     // not the story. Prefer the research house named in the subject
-    // ("FW: 451 Research: Siemens AG, …") over the forwarder's email domain.
+    // ("FW: 451 Research: Siemens AG, …") and explode listed entities into
+    // their own cards so Siemens/EnergyHub/etc. attribute as themselves.
     if (newsAlias) {
-      const publisher = researchPublisherFromSubject(m.subject);
+      const parsed = parseResearchSubject(m.subject);
+      const publisher = parsed.publisher;
+      const docUrl = driveByMessage.get(m.id);
+      const pubLabel = publisher?.name || "Industry Report";
+
+      if (parsed.entities.length > 0) {
+        return parsed.entities.map((entity, n) => {
+          const resolved = resolveResearchEntity(entity, portfolio, contacts, byEmail);
+          return {
+            id: `${m.id}-r${n}`,
+            subject: `${resolved.company} — ${pubLabel}`,
+            fromName: m.fromName,
+            fromEmail: m.fromEmail,
+            company: resolved.company,
+            contactName: contact?.name,
+            snippet:
+              m.snippet?.trim() ||
+              `Covered in ${pubLabel}${m.dateLabel ? ` (${m.dateLabel})` : ""}.`,
+            body: m.body,
+            date: m.date,
+            dateLabel: m.dateLabel,
+            permalink: m.permalink,
+            logoDomain: resolved.logoDomain,
+            docUrl,
+            digestSubject: m.subject,
+            sourceHint: "Industry Reports" as const,
+          };
+        });
+      }
+
+      // No entity list — one card per PDF title when attachments exist.
+      const pdfs = m.attachments || [];
+      if (pdfs.length > 0) {
+        return pdfs.map((a, n) => {
+          const title = (a.filename || "Research PDF").replace(/\.pdf$/i, "").trim();
+          return {
+            id: `${m.id}-p${n}`,
+            subject: title,
+            fromName: m.fromName,
+            fromEmail: m.fromEmail,
+            company: title,
+            contactName: contact?.name,
+            snippet: `From ${pubLabel}${m.snippet ? `: ${m.snippet}` : ""}`,
+            body: m.body,
+            date: m.date,
+            dateLabel: m.dateLabel,
+            permalink: m.permalink,
+            logoDomain: publisher?.domain || guessDomainFromCompanyName(title) || undefined,
+            docUrl,
+            digestSubject: m.subject,
+            sourceHint: "Industry Reports" as const,
+          };
+        });
+      }
+
       return [
         {
           id: m.id,
           subject: m.subject,
           fromName: m.fromName,
           fromEmail: m.fromEmail,
-          company: publisher?.name || "Industry Report",
+          company: pubLabel,
           contactName: contact?.name,
           snippet: m.snippet,
           body: m.body,
@@ -368,8 +425,8 @@ export async function gatherNetworkEmails(pre?: {
           dateLabel: m.dateLabel,
           permalink: m.permalink,
           logoDomain: publisher?.domain,
-          docUrl: driveByMessage.get(m.id),
-          sourceHint: "Industry Reports",
+          docUrl,
+          sourceHint: "Industry Reports" as const,
         },
       ];
     }
@@ -423,6 +480,45 @@ export async function gatherNetworkEmails(pre?: {
   }
 
   return { configured: true, ok: true, emails, newsDocs };
+}
+
+/** Resolve a research-subject entity to a CRM/portco name + logo domain. */
+function resolveResearchEntity(
+  entity: string,
+  portfolio: PortfolioCompany[],
+  contacts: Contact[],
+  byEmail: Map<string, { name: string; company: string }>,
+): { company: string; logoDomain?: string } {
+  const raw = entity.trim();
+  if (!raw) return { company: "Industry Report" };
+
+  for (const p of portfolio) {
+    if (!p.name?.trim()) continue;
+    if (companiesMatch(p.name, raw)) {
+      return { company: p.name, logoDomain: hostFromUrl(p.website) || undefined };
+    }
+  }
+  for (const c of contacts) {
+    if (!c.company?.trim()) continue;
+    if (companiesMatch(c.company, raw)) {
+      const d = emailDomain(c.email);
+      return { company: c.company, logoDomain: d || guessDomainFromCompanyName(c.company) || undefined };
+    }
+  }
+  // Rare: entity string is literally an email we know.
+  const asEmail = raw.toLowerCase();
+  if (asEmail.includes("@") && byEmail.has(asEmail)) {
+    const hit = byEmail.get(asEmail)!;
+    return {
+      company: hit.company || raw,
+      logoDomain: emailDomain(asEmail) || undefined,
+    };
+  }
+
+  return {
+    company: raw,
+    logoDomain: guessDomainFromCompanyName(raw) || undefined,
+  };
 }
 
 // One digest link → one signal about the article's company. Title/description

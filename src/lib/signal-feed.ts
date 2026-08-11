@@ -591,6 +591,10 @@ export function buildFeed(input: BuildFeedInput): FeedCard[] {
         e.sourceHint
         ? logoFor(company)
         : logoFor(company, { email: e.fromEmail });
+    const researchProvenance =
+      e.sourceHint === "Industry Reports" && e.digestSubject
+        ? `\n\n_Source: ${e.digestSubject}_`
+        : "";
     cards.push({
       id: `gmail-${i}-${e.id}`,
       // Portco emails are typically the "PortCo blogs" digest lane; NEWS@ research
@@ -609,6 +613,7 @@ export function buildFeed(input: BuildFeedInput): FeedCard[] {
       summary: e.snippet || e.body.slice(0, 160),
       body:
         (e.body || e.snippet || "_(no body)_") +
+        researchProvenance +
         (absoluteHttpUrl(e.docUrl)
           ? `\n\n[Open PDF in Drive](${absoluteHttpUrl(e.docUrl)})`
           : ""),

@@ -3,7 +3,8 @@
 //
 // NEWS@ mail is almost always a human forward. The From: domain (Dell, DTC,
 // etc.) is provenance, NOT the news subject. Prefer the research house named
-// in the subject ("FW: 451 Research: Siemens AG, …").
+// in the subject ("FW: 451 Research: Siemens AG, …"), and explode the listed
+// companies/themes into their own feed cards.
 
 import { guessDomainFromCompanyName } from "./domain-utils";
 
@@ -39,30 +40,87 @@ export interface ResearchPublisher {
   domain: string;
 }
 
+export interface ResearchSubjectParse {
+  publisher: ResearchPublisher | null;
+  /** Companies / themes after "Publisher: A, B, C" (empty when none). */
+  entities: string[];
+}
+
 /**
  * Pull the research/publisher house from a forwarded digest subject.
  * Returns null when we can't confidently name a publisher (caller should
  * avoid falling back to the forwarder's email domain for NEWS@).
  */
 export function researchPublisherFromSubject(subject: string): ResearchPublisher | null {
+  return parseResearchSubject(subject).publisher;
+}
+
+/**
+ * Parse a NEWS@ research subject into publisher + listed entities.
+ * e.g. "FW: 451 Research: Siemens AG, EnergyHub, Reco" →
+ *   publisher 451 Research, entities [Siemens AG, EnergyHub, Reco]
+ */
+export function parseResearchSubject(subject: string): ResearchSubjectParse {
   const s = stripReplyForwardPrefixes(subject);
-  if (!s) return null;
+  if (!s) return { publisher: null, entities: [] };
+
+  let publisher: ResearchPublisher | null = null;
+  let remainder = "";
 
   for (const k of KNOWN_PUBLISHERS) {
-    if (k.re.test(s)) return { name: k.name, domain: k.domain };
+    if (!k.re.test(s)) continue;
+    publisher = { name: k.name, domain: k.domain };
+    // Prefer "Publisher: rest" / "Publisher — rest"; else drop the publisher token.
+    const afterColon = s.match(new RegExp(`${k.re.source}\\s*[:—–-]\\s*(.+)$`, "i"));
+    if (afterColon?.[1]) remainder = afterColon[1].trim();
+    break;
   }
 
-  // Generic "Publisher Name: rest…" / "Publisher Name — rest…"
-  // Keep the left side short and free of person-name commas.
-  const m = s.match(/^([A-Z0-9][\w&.''' +-]{0,48}?)\s*[:—–-]\s+\S/);
-  if (!m) return null;
-  const name = m[1].replace(/\s+/g, " ").trim();
-  if (!name || /,/.test(name)) return null;
-  if (/^(internal|confidential|urgent|update|notes?|fyi)\b/i.test(name)) return null;
-  // Require at least one letter and look like a title, not a full sentence.
-  if (!/[A-Za-z]/.test(name) || name.split(/\s+/).length > 6) return null;
+  if (!publisher) {
+    const m = s.match(/^([A-Z0-9][\w&.''' +-]{0,48}?)\s*[:—–-]\s+(\S.*)$/);
+    if (m) {
+      const name = m[1].replace(/\s+/g, " ").trim();
+      if (
+        name &&
+        !/,/.test(name) &&
+        !/^(internal|confidential|urgent|update|notes?|fyi)\b/i.test(name) &&
+        /[A-Za-z]/.test(name) &&
+        name.split(/\s+/).length <= 6
+      ) {
+        const domain = guessDomainFromCompanyName(name);
+        if (domain) {
+          publisher = { name, domain };
+          remainder = m[2].trim();
+        }
+      }
+    }
+  }
 
-  const domain = guessDomainFromCompanyName(name);
-  if (!domain) return null;
-  return { name, domain };
+  const entities = splitResearchEntities(remainder);
+  return { publisher, entities };
+}
+
+/** Split "Siemens AG, EnergyHub, Reco, Trianz, Generative AI" into entities. */
+export function splitResearchEntities(remainder: string): string[] {
+  const raw = (remainder || "").trim();
+  if (!raw) return [];
+
+  // Comma / semicolon / " · " / " | " lists. Keep "Siemens AG" intact.
+  const parts = raw
+    .split(/\s*[,;|·]\s*|\s+\/\s+/)
+    .map((p) => p.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const p of parts) {
+    // Drop leftover reply crumbs / confidentiality stamps.
+    if (/^(internal use|confidential|fw|re|fwd)\b/i.test(p)) continue;
+    if (p.length < 2 || p.length > 80) continue;
+    const key = p.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(p);
+  }
+  return out;
 }

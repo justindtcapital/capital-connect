@@ -88,9 +88,20 @@ export const Route = createFileRoute("/events")({
   head: () => ({
     meta: [
       { title: "Events — VenturePulse" },
-      { name: "description", content: "Track Asana-sourced events and Network attendance" },
+      {
+        name: "description",
+        content:
+          "Track Asana-sourced events and network attendance: who is going, which relationships are exposed and follow-ups after each event.",
+      },
+      { property: "og:title", content: "Events — VenturePulse" },
+      {
+        property: "og:description",
+        content:
+          "Track Asana-sourced events and network attendance: who is going, which relationships are exposed and follow-ups after each event.",
+      },
     ],
   }),
+
   validateSearch: (search: Record<string, unknown>) => ({ cf: parseCfParam(search.cf) }),
   loader: async () => {
     const [asanaEvents, appEvents, contacts, emailActivity, synopses] = await Promise.all([

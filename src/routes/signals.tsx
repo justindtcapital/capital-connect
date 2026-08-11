@@ -83,10 +83,18 @@ export const Route = createFileRoute("/signals")({
       { title: "Signals — VenturePulse" },
       {
         name: "description",
-        content: "Relationship radar: recent news + LinkedIn mapped to your network",
+        content:
+          "Relationship radar: recent news, LinkedIn posts and email intelligence mapped to the people and companies in your DTC network.",
+      },
+      { property: "og:title", content: "Signals — VenturePulse" },
+      {
+        property: "og:description",
+        content:
+          "Relationship radar: recent news, LinkedIn posts and email intelligence mapped to the people and companies in your DTC network.",
       },
     ],
   }),
+
   loader: async () => ({
     signals: await fetchSignals(),
     linkedin: await fetchLinkedInFeed(),

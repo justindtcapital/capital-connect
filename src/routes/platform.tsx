@@ -121,10 +121,18 @@ export const Route = createFileRoute("/platform")({
       { title: "Platform — VenturePulse" },
       {
         name: "description",
-        content: "Thematic research, deal sourcing and diligence",
+        content:
+          "Thematic research, deal sourcing and diligence: investment theses, market radars and company KPIs in one platform workspace.",
+      },
+      { property: "og:title", content: "Platform — VenturePulse" },
+      {
+        property: "og:description",
+        content:
+          "Thematic research, deal sourcing and diligence: investment theses, market radars and company KPIs in one platform workspace.",
       },
     ],
   }),
+
   validateSearch: (search: Record<string, unknown>) => ({
     tab:
       typeof search.tab === "string" && (TABS as readonly string[]).includes(search.tab)

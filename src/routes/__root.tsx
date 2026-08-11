@@ -43,6 +43,10 @@ export const Route = createRootRoute({
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
+      {
+        name: "google-site-verification",
+        content: "NvWt2XDT4dElPA3wUm7cAPJQBpwFP1ZHkzEnM23Gehg",
+      },
       { title: "VenturePulse — DTC Network Intelligence" },
       {
         name: "description",

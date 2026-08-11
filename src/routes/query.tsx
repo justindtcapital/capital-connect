@@ -48,9 +48,20 @@ export const Route = createFileRoute("/query")({
   head: () => ({
     meta: [
       { title: "Query — VenturePulse" },
-      { name: "description", content: "Ask questions across your VenturePulse data" },
+      {
+        name: "description",
+        content:
+          "Ask natural-language questions across your VenturePulse data: contacts, portfolio companies, targets, signals and activity history.",
+      },
+      { property: "og:title", content: "Query — VenturePulse" },
+      {
+        property: "og:description",
+        content:
+          "Ask natural-language questions across your VenturePulse data: contacts, portfolio companies, targets, signals and activity history.",
+      },
     ],
   }),
+
   component: QueryPage,
 });
 

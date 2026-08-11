@@ -1,0 +1,15 @@
+User-agent: *
+Allow: /$
+Disallow: /activity
+Disallow: /companies
+Disallow: /crm
+Disallow: /dashboard
+Disallow: /events
+Disallow: /platform
+Disallow: /portfolio
+Disallow: /query
+Disallow: /signals
+Disallow: /targeting
+Disallow: /api/
+
+Sitemap: https://testcrm.dt-capital.net/sitemap.xml

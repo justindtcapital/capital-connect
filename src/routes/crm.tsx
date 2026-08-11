@@ -53,9 +53,20 @@ export const Route = createFileRoute("/crm")({
   head: () => ({
     meta: [
       { title: "CRM — VenturePulse" },
-      { name: "description", content: "Manage your DTC network contacts" },
+      {
+        name: "description",
+        content:
+          "Manage DTC network contacts: relationship temperature, engagement history, follow-ups and Asana-synced activity in one CRM view.",
+      },
+      { property: "og:title", content: "CRM — VenturePulse" },
+      {
+        property: "og:description",
+        content:
+          "Manage DTC network contacts: relationship temperature, engagement history, follow-ups and Asana-synced activity in one CRM view.",
+      },
     ],
   }),
+
   loader: async () => {
     const [contacts, companies] = await Promise.all([
       fetchContacts(),

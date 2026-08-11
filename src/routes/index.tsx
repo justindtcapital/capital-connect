@@ -121,10 +121,21 @@ async function buildHomeDigest(portco: Set<string>): Promise<HomeDigest> {
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
-      { title: "Home — VenturePulse" },
-      { name: "description", content: "Your DTC network at a glance" },
+      { title: "Network Intelligence Dashboard — VenturePulse" },
+      {
+        name: "description",
+        content:
+          "Your DTC network at a glance: daily briefing, hot relationships, open follow-ups and portfolio signals in one workspace.",
+      },
+      { property: "og:title", content: "Network Intelligence Dashboard — VenturePulse" },
+      {
+        property: "og:description",
+        content:
+          "Your DTC network at a glance: daily briefing, hot relationships, open follow-ups and portfolio signals in one workspace.",
+      },
     ],
   }),
+
   loader: async () => {
     const [contactsAll, targets, companies, briefing] = await Promise.all([
       fetchContacts().catch((): Contact[] => []),
@@ -393,7 +404,12 @@ function HomePage() {
       <section className="flex flex-col lg:flex-row lg:items-center gap-8 lg:gap-12">
         <div className="flex-1 min-w-0 space-y-3">
           <h1 className="font-display text-3xl sm:text-[2rem] font-semibold text-foreground tracking-tight">
-            {greetingFor(now.getHours())}, {name}
+            <span aria-hidden="true">
+              {greetingFor(now.getHours())}, {name}
+            </span>
+            <span className="sr-only">
+              Network Intelligence Dashboard — {greetingFor(now.getHours())}, {name}
+            </span>
           </h1>
           <p className="text-sm text-muted-foreground max-w-md">
             {longDate}

@@ -83,9 +83,20 @@ export const Route = createFileRoute("/companies")({
   head: () => ({
     meta: [
       { title: "Company Intelligence — VenturePulse" },
-      { name: "description", content: "Every signal, contact, and competitor — per company" },
+      {
+        name: "description",
+        content:
+          "Every signal, contact and competitor per company: news, hiring, tech stack and relationship coverage across your DTC network.",
+      },
+      { property: "og:title", content: "Company Intelligence — VenturePulse" },
+      {
+        property: "og:description",
+        content:
+          "Every signal, contact and competitor per company: news, hiring, tech stack and relationship coverage across your DTC network.",
+      },
     ],
   }),
+
   validateSearch: (search: Record<string, unknown>) => ({
     c: typeof search.c === "string" ? search.c : undefined,
   }),

@@ -44,13 +44,26 @@ export const Route = createRootRoute({
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
       { title: "VenturePulse — DTC Network Intelligence" },
-      { name: "description", content: "DTC network management" },
+      {
+        name: "description",
+        content:
+          "VenturePulse is the Dell Technologies Capital network intelligence platform for relationship management, deal sourcing and portfolio signals.",
+      },
       { name: "author", content: "Dell Technologies Capital" },
       { property: "og:title", content: "VenturePulse — DTC Network Intelligence" },
-      { property: "og:description", content: "DTC network management" },
+      {
+        property: "og:description",
+        content:
+          "VenturePulse is the Dell Technologies Capital network intelligence platform for relationship management, deal sourcing and portfolio signals.",
+      },
       { property: "og:type", content: "website" },
       { name: "twitter:title", content: "VenturePulse — DTC Network Intelligence" },
-      { name: "twitter:description", content: "DTC network management" },
+      {
+        name: "twitter:description",
+        content:
+          "VenturePulse is the Dell Technologies Capital network intelligence platform for relationship management, deal sourcing and portfolio signals.",
+      },
+
       { name: "twitter:card", content: "summary" },
       { property: "og:image", content: "https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/eec20a45-e73e-4a3e-aff1-da50fc1c15c9/id-preview-82758b98--33c9a4dc-3d95-4e54-9da9-413bf3238ece.lovable.app-1782850835844.png" },
       { name: "twitter:image", content: "https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/eec20a45-e73e-4a3e-aff1-da50fc1c15c9/id-preview-82758b98--33c9a4dc-3d95-4e54-9da9-413bf3238ece.lovable.app-1782850835844.png" },

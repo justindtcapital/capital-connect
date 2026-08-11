@@ -32,9 +32,20 @@ export const Route = createFileRoute("/activity")({
   head: () => ({
     meta: [
       { title: "Activity Log — VenturePulse" },
-      { name: "description", content: "Audit trail of every import, export, sync, edit and delete" },
+      {
+        name: "description",
+        content:
+          "Audit trail of every import, export, sync, edit and delete across your VenturePulse workspace, with who did what and when.",
+      },
+      { property: "og:title", content: "Activity Log — VenturePulse" },
+      {
+        property: "og:description",
+        content:
+          "Audit trail of every import, export, sync, edit and delete across your VenturePulse workspace, with who did what and when.",
+      },
     ],
   }),
+
   loader: async (): Promise<{ entries: OpsLogEntry[] }> => ({ entries: await fetchOpsLog() }),
   component: ActivityPage,
 });

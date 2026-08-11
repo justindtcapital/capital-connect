@@ -27,6 +27,7 @@ import {
   companyFromHost,
   matchCompanyByHost,
 } from "@/lib/link-digest";
+import { researchPublisherFromSubject } from "@/lib/news-subject";
 import type { Contact, PortfolioCompany } from "@/lib/types";
 
 // One email mapped to the Signals feed, tagged with its CRM contact/company.
@@ -53,6 +54,8 @@ export interface GmailSignal {
   digestSubject?: string;
   /** Durable Drive copy of an attached PDF (when archived). */
   docUrl?: string;
+  /** Preferred feed source-type when subject names a research publisher. */
+  sourceHint?: "Industry Reports" | "Industry News" | "PortCo Blogs";
 }
 
 export interface GmailFeedResult {
@@ -344,6 +347,33 @@ export async function gatherNetworkEmails(pre?: {
     const contact = matchEmail ? byEmail.get(matchEmail) : undefined;
     const partyEmail = matchEmail || m.fromEmail;
     const dom = emailDomain(partyEmail) || partyEmail.split("@")[1] || "";
+    const newsAlias = isNewsAliasMsg(m);
+
+    // NEWS@ is a forward inbox — From:/To: domains are provenance (Dell, DTC),
+    // not the story. Prefer the research house named in the subject
+    // ("FW: 451 Research: Siemens AG, …") over the forwarder's email domain.
+    if (newsAlias) {
+      const publisher = researchPublisherFromSubject(m.subject);
+      return [
+        {
+          id: m.id,
+          subject: m.subject,
+          fromName: m.fromName,
+          fromEmail: m.fromEmail,
+          company: publisher?.name || "Industry Report",
+          contactName: contact?.name,
+          snippet: m.snippet,
+          body: m.body,
+          date: m.date,
+          dateLabel: m.dateLabel,
+          permalink: m.permalink,
+          logoDomain: publisher?.domain,
+          docUrl: driveByMessage.get(m.id),
+          sourceHint: "Industry Reports",
+        },
+      ];
+    }
+
     return [
       {
         id: m.id,

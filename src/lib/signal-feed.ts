@@ -371,6 +371,7 @@ export function buildFeed(input: BuildFeedInput): FeedCard[] {
   const JUNK_LOGO_COMPANIES = new Set([
     "network",
     "industry",
+    "industry report",
     "company page",
     "email",
     "n/a",
@@ -585,11 +586,19 @@ export function buildFeed(input: BuildFeedInput): FeedCard[] {
     const company = e.company || e.fromName || "Email";
     const logo = e.logoDomain
       ? { domain: e.logoDomain, confident: true }
-      : logoFor(company, { email: e.fromEmail });
+      : // NEWS@ research digests: never fall back to the forwarder's email domain.
+        e.sourceHint
+        ? logoFor(company)
+        : logoFor(company, { email: e.fromEmail });
     cards.push({
       id: `gmail-${i}-${e.id}`,
-      // Portco emails are typically the "PortCo blogs" digest lane; others are news.
-      sourceType: isPortcoName(e.company || "") ? "PortCo Blogs" : "Industry News",
+      // Portco emails are typically the "PortCo blogs" digest lane; NEWS@ research
+      // digests (451, Gartner, …) are Industry Reports; otherwise Industry News.
+      sourceType: e.sourceHint
+        ? e.sourceHint
+        : isPortcoName(e.company || "")
+          ? "PortCo Blogs"
+          : "Industry News",
       company,
       segment: seg,
       segmentBucket: bucketOf(seg),

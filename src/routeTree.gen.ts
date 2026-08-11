@@ -10,6 +10,7 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as TargetingRouteImport } from './routes/targeting'
+import { Route as SitemapDotxmlRouteImport } from './routes/sitemap[.]xml'
 import { Route as SignalsRouteImport } from './routes/signals'
 import { Route as QueryRouteImport } from './routes/query'
 import { Route as PortfolioRouteImport } from './routes/portfolio'
@@ -28,6 +29,11 @@ import { Route as ApiCronIntelScanRouteImport } from './routes/api/cron/intel-sc
 const TargetingRoute = TargetingRouteImport.update({
   id: '/targeting',
   path: '/targeting',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SitemapDotxmlRoute = SitemapDotxmlRouteImport.update({
+  id: '/sitemap.xml',
+  path: '/sitemap.xml',
   getParentRoute: () => rootRouteImport,
 } as any)
 const SignalsRoute = SignalsRouteImport.update({
@@ -112,6 +118,7 @@ export interface FileRoutesByFullPath {
   '/portfolio': typeof PortfolioRoute
   '/query': typeof QueryRoute
   '/signals': typeof SignalsRoute
+  '/sitemap.xml': typeof SitemapDotxmlRoute
   '/targeting': typeof TargetingRoute
   '/api/cron/intel-scan': typeof ApiCronIntelScanRoute
   '/api/cron/scan-signals': typeof ApiCronScanSignalsRoute
@@ -129,6 +136,7 @@ export interface FileRoutesByTo {
   '/portfolio': typeof PortfolioRoute
   '/query': typeof QueryRoute
   '/signals': typeof SignalsRoute
+  '/sitemap.xml': typeof SitemapDotxmlRoute
   '/targeting': typeof TargetingRoute
   '/api/cron/intel-scan': typeof ApiCronIntelScanRoute
   '/api/cron/scan-signals': typeof ApiCronScanSignalsRoute
@@ -147,6 +155,7 @@ export interface FileRoutesById {
   '/portfolio': typeof PortfolioRoute
   '/query': typeof QueryRoute
   '/signals': typeof SignalsRoute
+  '/sitemap.xml': typeof SitemapDotxmlRoute
   '/targeting': typeof TargetingRoute
   '/api/cron/intel-scan': typeof ApiCronIntelScanRoute
   '/api/cron/scan-signals': typeof ApiCronScanSignalsRoute
@@ -166,6 +175,7 @@ export interface FileRouteTypes {
     | '/portfolio'
     | '/query'
     | '/signals'
+    | '/sitemap.xml'
     | '/targeting'
     | '/api/cron/intel-scan'
     | '/api/cron/scan-signals'
@@ -183,6 +193,7 @@ export interface FileRouteTypes {
     | '/portfolio'
     | '/query'
     | '/signals'
+    | '/sitemap.xml'
     | '/targeting'
     | '/api/cron/intel-scan'
     | '/api/cron/scan-signals'
@@ -200,6 +211,7 @@ export interface FileRouteTypes {
     | '/portfolio'
     | '/query'
     | '/signals'
+    | '/sitemap.xml'
     | '/targeting'
     | '/api/cron/intel-scan'
     | '/api/cron/scan-signals'
@@ -218,6 +230,7 @@ export interface RootRouteChildren {
   PortfolioRoute: typeof PortfolioRoute
   QueryRoute: typeof QueryRoute
   SignalsRoute: typeof SignalsRoute
+  SitemapDotxmlRoute: typeof SitemapDotxmlRoute
   TargetingRoute: typeof TargetingRoute
   ApiCronIntelScanRoute: typeof ApiCronIntelScanRoute
   ApiCronScanSignalsRoute: typeof ApiCronScanSignalsRoute
@@ -232,6 +245,13 @@ declare module '@tanstack/react-router' {
       path: '/targeting'
       fullPath: '/targeting'
       preLoaderRoute: typeof TargetingRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/sitemap.xml': {
+      id: '/sitemap.xml'
+      path: '/sitemap.xml'
+      fullPath: '/sitemap.xml'
+      preLoaderRoute: typeof SitemapDotxmlRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/signals': {
@@ -346,6 +366,7 @@ const rootRouteChildren: RootRouteChildren = {
   PortfolioRoute: PortfolioRoute,
   QueryRoute: QueryRoute,
   SignalsRoute: SignalsRoute,
+  SitemapDotxmlRoute: SitemapDotxmlRoute,
   TargetingRoute: TargetingRoute,
   ApiCronIntelScanRoute: ApiCronIntelScanRoute,
   ApiCronScanSignalsRoute: ApiCronScanSignalsRoute,
@@ -355,13 +376,3 @@ const rootRouteChildren: RootRouteChildren = {
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
   ._addFileTypes<FileRouteTypes>()
-
-import type { getRouter } from './router.tsx'
-import type { startInstance } from './start.ts'
-declare module '@tanstack/react-start' {
-  interface Register {
-    ssr: true
-    router: Awaited<ReturnType<typeof getRouter>>
-    config: Awaited<ReturnType<typeof startInstance.getOptions>>
-  }
-}

@@ -15,7 +15,7 @@
 // Everything degrades gracefully when GOOGLE_DRIVE_SIGNALS_FOLDER_ID is unset
 // (isDriveConfigured() === false), mirroring the LinkedIn connector.
 
-import { createHash } from "node:crypto";
+import { sha256Hex } from "./sha256";
 import { getAccessToken } from "./sheets.server";
 import { driveFileViewUrl } from "@/lib/safe-url";
 
@@ -64,10 +64,7 @@ export function emailPdfFolderId(): string {
 
 /** Stable short fingerprint for a Gmail attachment (fits Drive appProperties). */
 export function gmailAttachmentKey(messageId: string, attachmentId: string): string {
-  return createHash("sha256")
-    .update(`${messageId}:${attachmentId}`)
-    .digest("hex")
-    .slice(0, 40);
+  return sha256Hex(`${messageId}:${attachmentId}`).slice(0, 40);
 }
 
 function mapDriveFile(f: Record<string, unknown>): DriveDoc {

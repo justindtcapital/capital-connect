@@ -7,7 +7,7 @@ import { createFileRoute } from "@tanstack/react-router";
  * All Inngest imports stay inside handlers so the client route tree never
  * pulls Node-only packages into the browser bundle.
  */
-export const Route = createFileRoute("/api/inngest")({
+export const Route = createFileRoute("/api/public/inngest")({
   server: {
     handlers: {
       GET: async ({ request }) => {

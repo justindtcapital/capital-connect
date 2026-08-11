@@ -121,10 +121,21 @@ async function buildHomeDigest(portco: Set<string>): Promise<HomeDigest> {
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
-      { title: "Home — VenturePulse" },
-      { name: "description", content: "Your DTC network at a glance" },
+      { title: "Network Intelligence Dashboard — VenturePulse" },
+      {
+        name: "description",
+        content:
+          "Your DTC network at a glance: daily briefing, hot relationships, open follow-ups and portfolio signals in one workspace.",
+      },
+      { property: "og:title", content: "Network Intelligence Dashboard — VenturePulse" },
+      {
+        property: "og:description",
+        content:
+          "Your DTC network at a glance: daily briefing, hot relationships, open follow-ups and portfolio signals in one workspace.",
+      },
     ],
   }),
+
   loader: async () => {
     const [contactsAll, targets, companies, briefing] = await Promise.all([
       fetchContacts().catch((): Contact[] => []),

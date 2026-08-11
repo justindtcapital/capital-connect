@@ -63,6 +63,7 @@ import { useAsanaActivities } from "@/lib/use-activities";
 import { matchActivitiesToCompany } from "@/lib/activity-match";
 import type { PortcoIntelResult, PortcoBriefResult } from "@/utils/sumble.server";
 import { CustomerDiscoveryPanel } from "./CustomerDiscoveryPanel";
+import { EditPortfolioCompanyDialog } from "./EditPortfolioCompanyDialog";
 import { PortcoKpiSection } from "@/components/platform/CompanyKpiPanel";
 import { PortcoSignalsPanel } from "./PortcoSignalsPanel";
 import { companyIntroInsights, type InsightNarrative } from "@/utils/insights.functions";
@@ -129,6 +130,7 @@ export function PortfolioDetail({
   const [addPersonOpen, setAddPersonOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
   const { activities, loading: activitiesLoading } = useAsanaActivities();
 
   if (!company) return null;
@@ -436,14 +438,17 @@ export function PortfolioDetail({
                         Company Information
                       </h3>
                       <div className="flex flex-col items-end gap-1">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="h-6 px-1.5 text-[10px] font-medium"
-                        >
-                          <Pencil className="h-3 w-3 mr-1" />
-                          Edit
-                        </Button>
+                        {isSheetBacked && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-6 px-1.5 text-[10px] font-medium"
+                            onClick={() => setEditOpen(true)}
+                          >
+                            <Pencil className="h-3 w-3 mr-1" />
+                            Edit
+                          </Button>
+                        )}
                         <Button
                           variant="ghost"
                           size="sm"
@@ -1028,6 +1033,13 @@ export function PortfolioDetail({
         website={company.website}
         domain={companyDomain}
         onAdded={onPersonAdded}
+      />
+
+      <EditPortfolioCompanyDialog
+        company={company}
+        open={editOpen}
+        onOpenChange={setEditOpen}
+        onSaved={onCompanyUpdate}
       />
 
       <AlertDialog open={deleteOpen} onOpenChange={(o) => !deleting && setDeleteOpen(o)}>

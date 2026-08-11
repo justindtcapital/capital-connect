@@ -1019,6 +1019,10 @@ export interface AddContactInput {
   headline?: string;
   /** Pre-formatted employment history (written to "Employment History"). */
   employmentHistory?: string;
+  /** When true, do not auto-stamp sector "Portfolio" from employer name.
+   *  Used by the CRM "Add Contact" dialog so individual network adds stay on
+   *  the Network page instead of disappearing into Portfolio-only. */
+  skipPortfolioSector?: boolean;
 }
 
 // Portfolio-company match: returns "Portfolio" when the given company (or any
@@ -1058,9 +1062,12 @@ export async function addContactRow(data: AddContactInput): Promise<void> {
   if (data.employmentHistory) await ensureColumn(TAB_NAMES.contacts, "Employment History");
   if (data.linkedin) await ensureColumn(TAB_NAMES.contacts, "LinkedIn");
 
-  // Sector: a portfolio-company employer always wins ("Portfolio"); otherwise
-  // keep whatever sector was passed in (e.g. the Apollo industry).
-  const portfolioSector = await resolvePortfolioSector(data.company);
+  // Sector: a portfolio-company employer usually wins ("Portfolio"); otherwise
+  // keep whatever sector was passed in (e.g. the Apollo industry). CRM manual
+  // adds can opt out so the contact stays visible on the Network page.
+  const portfolioSector = data.skipPortfolioSector
+    ? ""
+    : await resolvePortfolioSector(data.company);
   const sector = portfolioSector || data.sector;
 
   const valueByHeader: Record<string, string> = {
@@ -2954,6 +2961,84 @@ export async function addPortfolioCompany(data: PortfolioCompanyInput): Promise<
     );
   }
   return { urid };
+}
+
+// Overwrite sheet fields for an existing portfolio company (URID preferred, else
+// exact name match via matchName). Unlike fillBlankPortfolioFields, this always
+// writes the provided values — including clearing a cell when the value is "".
+export async function updatePortfolioCompany(entry: {
+  urid?: string;
+  /** Name used to locate the row when URID is missing or not found. */
+  matchName?: string;
+  name: string;
+  website?: string;
+  focusArea?: string;
+  location?: string;
+  description?: string;
+}): Promise<{ updated: number }> {
+  const wantUrid = (entry.urid || "").trim().toLowerCase();
+  const wantName = (entry.matchName || entry.name || "").trim().toLowerCase();
+  const newName = (entry.name || "").trim();
+  if (!newName) throw new Error("Company name is required");
+  if (!wantUrid && !wantName) return { updated: 0 };
+
+  await ensureTab(TAB_NAMES.portfolio, PORTFOLIO_HEADERS);
+  await ensureColumn(TAB_NAMES.portfolio, "URID");
+
+  const rows = await fetchSheetTab(TAB_NAMES.portfolio);
+  if (rows.length < 2) return { updated: 0 };
+  const headers = rows[0].map((h) => h.trim().toLowerCase());
+  const uridIdx = headers.indexOf("urid");
+  const nameIdx = headers.indexOf("company name");
+
+  let rowNumber = -1;
+  for (let i = 1; i < rows.length; i++) {
+    const rowUrid = uridIdx !== -1 ? (rows[i][uridIdx] || "").trim().toLowerCase() : "";
+    if (wantUrid && rowUrid && rowUrid === wantUrid) {
+      rowNumber = i + 1;
+      break;
+    }
+  }
+  // Name fallback only when we weren't asked to match a URID (or URID miss with
+  // no urid on the request — same spirit as deletePortfolioCompany).
+  if (rowNumber === -1 && !wantUrid && wantName && nameIdx !== -1) {
+    for (let i = 1; i < rows.length; i++) {
+      const rowName = (rows[i][nameIdx] || "").trim().toLowerCase();
+      if (rowName && rowName === wantName) {
+        rowNumber = i + 1;
+        break;
+      }
+    }
+  }
+  // Stale URID: fall back to matchName so a rename/edit still lands.
+  if (rowNumber === -1 && wantUrid && wantName && nameIdx !== -1) {
+    for (let i = 1; i < rows.length; i++) {
+      const rowName = (rows[i][nameIdx] || "").trim().toLowerCase();
+      if (rowName && rowName === wantName) {
+        rowNumber = i + 1;
+        break;
+      }
+    }
+  }
+  if (rowNumber === -1) return { updated: 0 };
+
+  const valueByHeader: Record<string, string> = {
+    "company name": newName,
+    website: (entry.website || "").trim(),
+    "focus area(s)": (entry.focusArea || "").trim(),
+    hq: (entry.location || "").trim(),
+    summary: (entry.description || "").trim(),
+  };
+
+  const updates: { range: string; value: string }[] = [];
+  for (const [header, value] of Object.entries(valueByHeader)) {
+    const colIdx = headers.indexOf(header);
+    if (colIdx === -1) continue;
+    updates.push({ range: `${colLetters(colIdx)}${rowNumber}`, value });
+  }
+  if (updates.length === 0) return { updated: 0 };
+  await updateSheetCells(TAB_NAMES.portfolio, updates);
+  return { updated: 1 };
 }
 
 // Hard-delete a portfolio company from the Portfolio Companies tab. Matched by

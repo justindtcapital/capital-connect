@@ -7,6 +7,7 @@ import {
   addPortfolioCompany as addPortfolioCompanyServer,
   deletePortfolioCompany as deletePortfolioCompanyServer,
   bulkDeletePortfolioCompanies as bulkDeletePortfolioCompaniesServer,
+  updatePortfolioCompany as updatePortfolioCompanyServer,
   addContactRow,
   appendSheetRow,
   appendInteractionRows,
@@ -112,6 +113,24 @@ export const addPortfolioCompany = createServerFn({ method: "POST" })
       location: data.location,
       description: data.description,
     });
+  });
+
+// Update an existing portfolio company row (URID preferred, name fallback).
+export const updatePortfolioCompany = createServerFn({ method: "POST" })
+  .inputValidator(
+    (data: {
+      urid?: string;
+      matchName?: string;
+      name: string;
+      website?: string;
+      focusArea?: string;
+      location?: string;
+      description?: string;
+    }) => data,
+  )
+  .handler(async ({ data }) => {
+    if (!data.name?.trim()) throw new Error("Company name is required");
+    return await updatePortfolioCompanyServer(data);
   });
 
 // Delete a portfolio company (by stable URID, falling back to exact name match).
@@ -308,6 +327,8 @@ export const addContact = createServerFn({ method: "POST" })
       employmentHistory?: string;
       /** Sourced LinkedIn profile URL (written to the "LinkedIn" column). */
       linkedinUrl?: string;
+      /** Keep on Network CRM even if employer matches a PortCo name. */
+      skipPortfolioSector?: boolean;
     }) => data,
   )
   .handler(async ({ data }) => {

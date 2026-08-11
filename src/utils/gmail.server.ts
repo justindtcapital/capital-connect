@@ -14,9 +14,24 @@
 
 import { getAccessToken } from "./sheets.server";
 import { extractArticleLinks } from "@/lib/link-digest";
+import {
+  isBulkOrAutomatedMail,
+  isNoiseEmail,
+  pickPrimaryCounterparty,
+  type Counterparty,
+} from "@/lib/email-noise";
 import type { AsanaActivity } from "@/lib/types";
 
 const GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me";
+
+/** A PDF attached to a message — metadata only; bytes come via
+ *  downloadGmailAttachment on demand (attachments can be large). */
+export interface GmailAttachment {
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+  attachmentId: string;
+}
 
 export interface GmailMessage {
   id: string;
@@ -26,6 +41,9 @@ export interface GmailMessage {
   fromEmail: string;
   toEmails: string[];
   ccEmails: string[];
+  /** Delivered-To header values (lowercased) — how alias-forwarded mail is
+   *  recognized even when the alias never appears in From/To/Cc. */
+  deliveredTo: string[];
   /** Received time, epoch ms. */
   date: number;
   dateLabel: string;
@@ -34,9 +52,12 @@ export interface GmailMessage {
   /** Cleaned candidate article links from the FULL body (pre-truncation) —
    *  used to detect + explode link-digest emails into per-article signals. */
   links: string[];
+  /** PDF attachments (metadata only). */
+  attachments: GmailAttachment[];
   permalink: string;
+  /** True when List-Unsubscribe / Precedence / Auto-Submitted look like bulk mail. */
+  isBulk?: boolean;
 }
-
 export interface GmailResult {
   ok: boolean;
   messages: GmailMessage[];
@@ -70,6 +91,13 @@ export function getActivityAliases(): string[] {
     ...parseAliasList(process.env.GMAIL_BD_ALIAS),
     ...parseAliasList(process.env.GMAIL_GTM_ALIAS),
   ];
+}
+
+/** NEWS@ ingestion alias addresses (lowercased) — the diagram's "forward it for
+ *  processing" inbox. One alias is enough: the scan's own classification routes
+ *  each item by type, so per-type aliases buy nothing. */
+export function getNewsAliases(): string[] {
+  return parseAliasList(process.env.GMAIL_NEWS_ALIAS);
 }
 
 function decodeB64(data?: string): string {
@@ -121,6 +149,35 @@ function header(headers: any[], name: string): string {
   return h?.value || "";
 }
 
+// Some headers repeat (Delivered-To appears once per delivery hop) — collect all.
+function headerAll(headers: any[], name: string): string[] {
+  return (headers || [])
+    .filter((x) => (x.name || "").toLowerCase() === name.toLowerCase())
+    .map((x) => String(x.value || "").trim().toLowerCase())
+    .filter(Boolean);
+}
+
+// Recursively collect PDF attachment metadata. Attachment bytes are NOT
+// fetched here — they're downloaded on demand (downloadGmailAttachment) only
+// for messages the Signals pipeline actually wants documents from.
+function collectPdfAttachments(part: any, out: GmailAttachment[]): void {
+  if (!part) return;
+  const filename = String(part.filename || "");
+  const mime = String(part.mimeType || "");
+  if (
+    part.body?.attachmentId &&
+    (mime === "application/pdf" || /\.pdf$/i.test(filename))
+  ) {
+    out.push({
+      filename: filename || "attachment.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: Number(part.body.size) || 0,
+      attachmentId: String(part.body.attachmentId),
+    });
+  }
+  for (const p of part.parts || []) collectPdfAttachments(p, out);
+}
+
 function parseAddr(v: string): { name: string; email: string } {
   const m = v.match(/^\s*"?([^"<]*)"?\s*<([^>]+)>/);
   if (m) return { name: m[1].trim(), email: m[2].trim().toLowerCase() };
@@ -156,8 +213,18 @@ async function getMessage(token: string, id: string): Promise<GmailMessage | nul
       .filter(Boolean);
   const to = parseList(header(headers, "To"));
   const cc = parseList(header(headers, "Cc"));
+  const deliveredTo = headerAll(headers, "Delivered-To").map((v) => parseAddr(v).email);
   const date = Number(m.internalDate) || 0;
   const parts = extractParts(m.payload);
+  const attachments: GmailAttachment[] = [];
+  collectPdfAttachments(m.payload, attachments);
+  const isBulk = isBulkOrAutomatedMail({
+    listUnsubscribe: header(headers, "List-Unsubscribe"),
+    precedence: header(headers, "Precedence"),
+    autoSubmitted: header(headers, "Auto-Submitted"),
+    feedbackId: header(headers, "Feedback-ID") || header(headers, "X-Feedback-ID"),
+    xMailer: header(headers, "X-Mailer"),
+  });
   return {
     id: String(m.id || id),
     threadId: String(m.threadId || ""),
@@ -166,15 +233,44 @@ async function getMessage(token: string, id: string): Promise<GmailMessage | nul
     fromEmail: from.email,
     toEmails: to,
     ccEmails: cc,
+    deliveredTo,
     date,
     dateLabel: toLabel(date),
     snippet: String(m.snippet || ""),
     body: parts.text.slice(0, 3000),
     links: extractArticleLinks(parts),
+    attachments,
     permalink: `https://mail.google.com/mail/u/0/#all/${m.id}`,
+    isBulk,
   };
 }
 
+// Download one attachment's bytes as STANDARD base64 (Gmail returns base64url;
+// Gemini inlineData wants classic base64). Null on any failure — callers treat
+// attachments as best-effort grounding, never a scan blocker.
+export async function downloadGmailAttachment(
+  messageId: string,
+  attachmentId: string,
+): Promise<string | null> {
+  let token: string;
+  try {
+    token = await getAccessToken();
+  } catch {
+    return null;
+  }
+  try {
+    const res = await fetch(
+      `${GMAIL_API}/messages/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(attachmentId)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) return null;
+    const data = (await res.json()) as { data?: string };
+    if (!data.data) return null;
+    return Buffer.from(data.data, "base64url").toString("base64");
+  } catch {
+    return null;
+  }
+}
 // Low-level search — needs a valid Google token with gmail.readonly, not Signals.
 async function searchGmailRaw(query: string, max = 25): Promise<GmailResult> {
   let token: string;
@@ -277,47 +373,56 @@ function titleCaseLocal(local: string): string {
     .slice(0, 80);
 }
 
-// Counterparties = people on the thread who are NOT our BD/GTM aliases (and not
-// obvious noreply/system boxes). Their emails go into notes so contact matching
-// can join on email the same way Asana matches on name.
-function counterparties(m: GmailMessage, aliases: Set<string>): { name: string; email: string }[] {
-  const system =
-    /^(no-?reply|do-?not-?reply|notifications?|mailer-daemon|postmaster|calendar|info|support|admin|team|hello|contact|help)$/i;
-  const out = new Map<string, { name: string; email: string }>();
-  const consider = (name: string, email: string) => {
+// Counterparties = real people on the thread who are NOT our BD/GTM aliases and
+// not newsletter/system mailboxes. Emails land in notes for exact contact join.
+function counterparties(
+  m: GmailMessage,
+  aliases: Set<string>,
+): Counterparty[] {
+  const out = new Map<string, Counterparty>();
+  const consider = (name: string, email: string, role: Counterparty["role"]) => {
     const e = (email || "").trim().toLowerCase();
-    if (!e || aliases.has(e) || out.has(e)) return;
-    const local = e.split("@")[0] || "";
-    if (system.test(local)) return;
-    out.set(e, { name: name || titleCaseLocal(local), email: e });
+    if (!e || aliases.has(e) || out.has(e) || isNoiseEmail(e)) return;
+    out.set(e, { name: name || titleCaseLocal(e.split("@")[0] || ""), email: e, role });
   };
-  consider(m.fromName, m.fromEmail);
-  for (const e of m.toEmails) consider("", e);
-  for (const e of m.ccEmails) consider("", e);
+  consider(m.fromName, m.fromEmail, "from");
+  for (const e of m.toEmails) consider("", e, "to");
+  for (const e of m.ccEmails) consider("", e, "cc");
   return [...out.values()];
 }
 
-function messageToActivity(
+/** Convert a Gmail message into a BD/GTM activity, or null when it is noise. */
+export function messageToActivity(
   m: GmailMessage,
   track: "BD" | "GTM",
   aliases: Set<string>,
-): AsanaActivity {
+): AsanaActivity | null {
+  if (m.isBulk) return null;
+  // Inbound blast from a noise mailbox (newsletter/noreply) — skip entirely.
+  const fromLower = (m.fromEmail || "").toLowerCase();
+  if (fromLower && isNoiseEmail(fromLower) && !aliases.has(fromLower)) return null;
+
   const others = counterparties(m, aliases);
-  const primary = others[0];
   const fromEmail = (m.fromEmail || "").toLowerCase();
   const outbound = aliases.has(fromEmail);
+  const primary = pickPrimaryCounterparty(others, outbound);
+  // No human counterparty left after noise filter → do not create a Person row.
+  if (!primary) return null;
+
   // Attribute ownership to the human on the From line when they mailed the
   // tracking alias (the usual BD/GTM workflow). When the alias itself sends,
   // Owner stays the alias address.
   const owner =
-    fromEmail && !/^no-?reply/i.test(fromEmail.split("@")[0] || "") ? m.fromEmail : undefined;
-  // The `People:` line carries the counterparty emails that contact-matching joins
-  // on (matchActivitiesToContact). It comes BEFORE the free-text snippet so the
-  // length cap below can only ever truncate the snippet, never the emails — else
-  // real participants on a long thread would silently miss the attribution.
+    fromEmail && !isNoiseEmail(fromEmail) ? m.fromEmail : undefined;
+  // People line lists the primary first, then other clean counterparties — email
+  // join in matchActivitiesToContact (gmail path is email-only).
+  const peopleOrdered = [
+    primary,
+    ...others.filter((p) => p.email !== primary.email),
+  ];
   const notesParts = [
     outbound ? "Outbound email" : "Inbound email",
-    others.length ? `People: ${others.map((p) => `${p.name} <${p.email}>`).join("; ")}` : "",
+    `People: ${peopleOrdered.map((p) => `${p.name} <${p.email}>`).join("; ")}`,
     m.snippet || m.body.slice(0, 400),
   ].filter(Boolean);
 
@@ -330,13 +435,12 @@ function messageToActivity(
     status: outbound ? "Sent" : "Received",
     owner,
     type: "Email",
-    company: primary ? companyFromEmail(primary.email) : undefined,
-    person: primary?.name || undefined,
+    company: companyFromEmail(primary.email) || undefined,
+    person: primary.name || undefined,
     notes: notesParts.join("\n").slice(0, 1000),
     url: m.permalink,
   };
 }
-
 async function fetchTrackFromAliases(
   track: "BD" | "GTM",
   aliases: string[],
@@ -353,7 +457,12 @@ async function fetchTrackFromAliases(
     return [];
   }
   const aliasSet = new Set(aliases);
-  return res.messages.map((m) => messageToActivity(m, track, aliasSet));
+  const out: AsanaActivity[] = [];
+  for (const m of res.messages) {
+    const act = messageToActivity(m, track, aliasSet);
+    if (act) out.push(act);
+  }
+  return out;
 }
 
 // Pull BD/GTM emails from the configured Gmail aliases into AsanaActivity-shaped

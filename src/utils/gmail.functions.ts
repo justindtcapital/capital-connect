@@ -3,7 +3,9 @@ import {
   searchGmail,
   isGmailConfigured,
   getActivityAliases,
+  getNewsAliases,
   type GmailMessage,
+  type GmailAttachment,
 } from "./gmail.server";
 import { buildContacts, buildPortfolioCompanies } from "./sheets.server";
 import { fetchLinkPreviews, type LinkPreview } from "./link-preview.server";
@@ -48,6 +50,14 @@ export interface GmailFeedResult {
   error?: string;
 }
 
+/** A PDF forwarded to the NEWS@ alias — reference only; the scan downloads the
+ *  bytes on demand and feeds them to Gemini as document grounding. */
+export interface NewsAliasDoc extends GmailAttachment {
+  messageId: string;
+  subject: string;
+  permalink: string;
+}
+
 const FREE_EMAIL = new Set([
   "gmail.com",
   "googlemail.com",
@@ -88,8 +98,15 @@ export async function gatherNetworkEmails(pre?: {
   contacts?: Contact[];
   portfolio?: PortfolioCompany[];
   persistDigest?: boolean;
-}): Promise<{ configured: boolean; ok: boolean; emails: GmailSignal[]; error?: string }> {
-  if (!isGmailConfigured()) return { configured: false, ok: false, emails: [] };
+}): Promise<{
+  configured: boolean;
+  ok: boolean;
+  emails: GmailSignal[];
+  /** PDFs forwarded to the NEWS@ alias (refs only — bytes downloaded on demand). */
+  newsDocs: NewsAliasDoc[];
+  error?: string;
+}> {
+  if (!isGmailConfigured()) return { configured: false, ok: false, emails: [], newsDocs: [] };
 
   const contacts = pre?.contacts ?? (await buildContacts());
   const portfolio = pre?.portfolio ?? (await buildPortfolioCompanies());
@@ -122,12 +139,25 @@ export async function gatherNetworkEmails(pre?: {
 
   // Optional manual override (e.g. `subject:"portco blogs" OR from:dell.com`).
   const custom = process.env.GMAIL_SIGNALS_QUERY?.trim();
-  if (!custom && domList.length === 0) return { configured: true, ok: true, emails: [] };
+  // NEWS@ ingestion alias: anything the team forwards there is signal by
+  // definition, so it's ORed in regardless of domain matching. deliveredto:
+  // catches alias-inbox delivery where the alias never shows in To/Cc.
+  const newsAliases = getNewsAliases();
+  const newsAliasSet = new Set(newsAliases);
+  const aliasClause = newsAliases
+    .flatMap((a) => [`deliveredto:${a}`, `to:${a}`, `cc:${a}`])
+    .join(" OR ");
+  if (!custom && domList.length === 0 && newsAliases.length === 0)
+    return { configured: true, ok: true, emails: [], newsDocs: [] };
 
   // Match a portfolio/network domain ANYWHERE in the message (headers OR body) so
   // internal digests that merely LINK to those sites (e.g. a "Portco blogs"
   // forward) are caught — not just direct emails with the network.
-  const terms = domList.join(" OR ");
+  const clauses = [
+    domList.length > 0 ? `(${domList.join(" OR ")})` : "",
+    aliasClause ? `(${aliasClause})` : "",
+  ].filter(Boolean);
+  const terms = clauses.join(" OR ");
   const base = custom
     ? /(newer_than|older_than|after:|before:)/.test(custom)
       ? custom
@@ -147,11 +177,28 @@ export async function gatherNetworkEmails(pre?: {
   const q = exclude ? `${base} ${exclude}` : base;
 
   const res = await searchGmail(q, max);
-  if (!res.ok) return { configured: true, ok: false, emails: [], error: res.error };
+  if (!res.ok) return { configured: true, ok: false, emails: [], newsDocs: [], error: res.error };
 
   const involvesAlias = (m: (typeof res.messages)[number]): boolean =>
     [m.fromEmail, ...m.toEmails, ...m.ccEmails].some((e) => aliasSet.has((e || "").toLowerCase()));
   const kept = res.messages.filter((m) => !involvesAlias(m));
+
+  // PDF attachments on NEWS@-alias messages become scan grounding documents —
+  // the diagram's "scraper needs to handle PDFs" lane. Refs only; the scan
+  // downloads bytes for the few it can afford to feed Gemini.
+  const isNewsAliasMsg = (m: GmailMessage): boolean =>
+    newsAliasSet.size > 0 &&
+    [...m.toEmails, ...m.ccEmails, ...m.deliveredTo].some((e) => newsAliasSet.has(e));
+  const newsDocs: NewsAliasDoc[] = kept
+    .filter(isNewsAliasMsg)
+    .flatMap((m) =>
+      (m.attachments || []).map((a) => ({
+        ...a,
+        messageId: m.id,
+        subject: m.subject,
+        permalink: m.permalink,
+      })),
+    );
 
   // Link-digest emails (e.g. the weekly "Portco blogs" forward) become one
   // signal per article, attributed to the ARTICLE's company — the raw email
@@ -240,7 +287,7 @@ export async function gatherNetworkEmails(pre?: {
     }
   }
 
-  return { configured: true, ok: true, emails };
+  return { configured: true, ok: true, emails, newsDocs };
 }
 
 // One digest link → one signal about the article's company. Title/description

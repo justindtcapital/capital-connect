@@ -488,7 +488,7 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
 
   return (
     <Dialog open={open} onOpenChange={(o) => { if (!o) reset(); onOpenChange(o); }}>
-      <DialogContent className="sm:max-w-2xl">
+      <DialogContent className="sm:max-w-2xl max-h-[90vh] grid-rows-[auto_1fr_auto]">
         <DialogHeader>
           <DialogTitle>Bulk import contacts</DialogTitle>
           <DialogDescription className="text-xs">
@@ -497,7 +497,8 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-4 py-2">
+        {/* Body scrolls; header + footer stay pinned so Import is always reachable. */}
+        <div className="space-y-4 py-2 min-h-0 overflow-y-auto -mx-6 px-6">
           <div>
             <Label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">CSV file</Label>
             <Input

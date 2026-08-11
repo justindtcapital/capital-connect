@@ -61,6 +61,8 @@ export interface ReconcileResult {
   rowsResynced: number;
   ignoredComputed: number;
   precisionAt10: number | null;
+  /** Rows removed by the retention pass (null = pass disabled or failed). */
+  pruned: number | null;
 }
 
 const today = () => new Date().toISOString().split("T")[0];
@@ -300,11 +302,25 @@ export async function runSignalsReconcile(): Promise<ReconcileResult> {
     await persistSignalEvents({ created: [], updated: [...updatedEvents] });
     const stamped = await stampSignalRowsById(stamps);
 
+    // ── Pass F: retention prune ───────────────────────────────────
+    // Hold the Signals tab to its rolling window (SIGNALS_RETENTION_DAYS,
+    // default 365; archive mode). Best-effort — a prune failure must never
+    // fail the reconcile, and it logs its own ops event.
+    let pruned: number | null = null;
+    if ((process.env["SIGNALS_RETENTION_ENABLED"] || "true").toLowerCase() !== "false") {
+      try {
+        const { runSignalsPrune } = await import("./signals-prune.server");
+        pruned = (await runSignalsPrune()).deleted;
+      } catch (err) {
+        console.error("[signals-reconcile] retention prune failed:", err);
+      }
+    }
+
     await logOpsEvent({
       action: "sync",
       source: "signals_reconcile",
       status: "ok",
-      summary: `Signals reconcile · ${lateMerges} late merge${lateMerges === 1 ? "" : "s"} · ${dbp} detected-before-press · ${lateClustered} late-clustered · ${ignoredRows.length} ignored · ${stamped} rows restamped${precisionAt10 != null ? ` · p@10 ${precisionAt10}` : ""}`,
+      summary: `Signals reconcile · ${lateMerges} late merge${lateMerges === 1 ? "" : "s"} · ${dbp} detected-before-press · ${lateClustered} late-clustered · ${ignoredRows.length} ignored · ${stamped} rows restamped${precisionAt10 != null ? ` · p@10 ${precisionAt10}` : ""}${pruned != null ? ` · ${pruned} pruned` : ""}`,
       records: stamped,
       details: {
         lateMerges,
@@ -314,6 +330,7 @@ export async function runSignalsReconcile(): Promise<ReconcileResult> {
         stamped,
         ignoredComputed: ignoredRows.length,
         precisionAt10,
+        pruned,
       },
     });
 
@@ -324,6 +341,7 @@ export async function runSignalsReconcile(): Promise<ReconcileResult> {
       rowsResynced: resync,
       ignoredComputed: ignoredRows.length,
       precisionAt10,
+      pruned,
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : "Signals reconcile failed";
@@ -343,6 +361,7 @@ export async function runSignalsReconcile(): Promise<ReconcileResult> {
       rowsResynced: 0,
       ignoredComputed: 0,
       precisionAt10: null,
+      pruned: null,
     };
   }
 }

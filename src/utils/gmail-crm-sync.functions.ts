@@ -18,6 +18,7 @@ import {
   type InteractionRowInput,
   type EventAttendanceInput,
 } from "./sheets.server";
+import { isNoiseEmail } from "@/lib/email-noise";
 import type { Contact, InteractionType } from "@/lib/types";
 
 function syncKey(email: string, gid: string): string {
@@ -35,15 +36,19 @@ function allEmails(c: Contact): string[] {
     .filter((e) => e.includes("@"));
 }
 
-/** Message participants we might match to CRM (from / to / cc). */
+/** Message participants we might match to CRM (from / to / cc) — skip noise mailboxes. */
 function participantEmails(m: GmailMessage): string[] {
+  if (m.isBulk) return [];
   const out = new Set<string>();
-  if (m.fromEmail) out.add(m.fromEmail.toLowerCase());
-  for (const e of m.toEmails) out.add(e.toLowerCase());
-  for (const e of m.ccEmails) out.add(e.toLowerCase());
+  const add = (email: string) => {
+    const e = (email || "").toLowerCase();
+    if (e && !isNoiseEmail(e)) out.add(e);
+  };
+  add(m.fromEmail);
+  for (const e of m.toEmails) add(e);
+  for (const e of m.ccEmails) add(e);
   return [...out];
 }
-
 async function existingGmailSyncKeys(): Promise<Set<string>> {
   const rows = await fetchSheetTab(TAB_NAMES.interactions).catch(() => [] as string[][]);
   const keys = new Set<string>();

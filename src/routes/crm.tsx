@@ -1,5 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
-import { createFileRoute, useRouter } from "@tanstack/react-router";
+import { createFileRoute, useNavigate, useRouter } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import {
   fetchContacts,
@@ -20,6 +19,7 @@ import { Plus, Upload, Download, ClipboardPaste, ChevronDown, Gauge, Loader2, Ac
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -42,6 +42,7 @@ import { contactsToCsv, downloadCsv } from "@/lib/csv-export";
 import { contactsToXlsx, downloadXlsx } from "@/lib/xlsx-export";
 import { FileSpreadsheet, FileText } from "lucide-react";
 import { toast } from "sonner";
+import { useEffect, useMemo, useState } from "react";
 
 export const Route = createFileRoute("/crm")({
   // `?contact=<email>` deep-links to a single contact (e.g. from the home page's
@@ -93,6 +94,7 @@ function CrmPage() {
   const { updateOptions } = useFilterOptions();
   const { allFilteredContacts, selectedContacts, setOnBulkDelete } = useSelection();
   const router = useRouter();
+  const navigate = useNavigate({ from: "/crm" });
   const [bulkUploadOpen, setBulkUploadOpen] = useState(false);
   const [pasteOpen, setPasteOpen] = useState(false);
   const [addContactOpen, setAddContactOpen] = useState(false);
@@ -109,36 +111,50 @@ function CrmPage() {
 
   const handleAddContact = async () => {
     const name = addForm.name.trim();
-    const email = addForm.email.trim();
-    if (!name && !email) {
-      toast.error("Name or email is required.");
+    const emailAddr = addForm.email.trim().toLowerCase();
+    if (!name) {
+      toast.error("Name is required.");
+      return;
+    }
+    if (!emailAddr || !emailAddr.includes("@")) {
+      toast.error("A valid email is required so we can find and update this contact later.");
       return;
     }
     if (addBusy) return;
     setAddBusy(true);
     try {
+      // Stamp the signed-in teammate as Relationship Prime so the contact shows
+      // under the default "Mine" ownership filter (not just Everyone).
+      const prime = profile?.displayName || email || "";
       await addContact({
         data: {
-          name: name || email,
+          name,
           role: addForm.title.trim(),
           company: addForm.company.trim(),
-          email,
+          email: emailAddr,
           phone: "",
           location: "",
           linkedinUrl: addForm.linkedinUrl.trim(),
-          prime: "",
+          prime,
           sector: "",
           temperature: "Warm",
           source: "Manual Entry",
+          skipPortfolioSector: true,
         },
       });
-      toast.success(`Saved ${name || email} to Contacts.`);
+      toast.success(`Added ${name} to your network.`);
       setAddContactOpen(false);
       setAddForm({ name: "", email: "", company: "", title: "", linkedinUrl: "" });
       await router.invalidate();
+      await navigate({ search: (prev) => ({ ...prev, contact: emailAddr }) });
     } catch (e) {
       console.error("addContact failed", e);
-      toast.error("Couldn't save contact to the sheet — see console.");
+      const msg = e instanceof Error ? e.message : String(e);
+      toast.error(
+        /ENOTFOUND|fetch failed|network/i.test(msg)
+          ? "Couldn't reach Google Sheets — check your network connection."
+          : "Couldn't save contact to the sheet — see console.",
+      );
     } finally {
       setAddBusy(false);
     }
@@ -451,28 +467,41 @@ function CrmPage() {
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>Add Contact</DialogTitle>
+            <DialogDescription>
+              Add one person to your network. They’ll be assigned to you as Relationship Prime.
+            </DialogDescription>
           </DialogHeader>
-          <div className="space-y-3 py-2">
+          <form
+            className="space-y-3 py-2"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void handleAddContact();
+            }}
+          >
             <div>
               <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
-                Name
+                Name <span className="text-destructive">*</span>
               </label>
               <Input
                 value={addForm.name}
                 onChange={(e) => setAddForm((f) => ({ ...f, name: e.target.value }))}
                 placeholder="Full name"
                 className="h-9 text-sm"
+                autoFocus
+                required
               />
             </div>
             <div>
               <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
-                Email
+                Email <span className="text-destructive">*</span>
               </label>
               <Input
+                type="email"
                 value={addForm.email}
                 onChange={(e) => setAddForm((f) => ({ ...f, email: e.target.value }))}
                 placeholder="name@company.com"
                 className="h-9 text-sm"
+                required
               />
             </div>
             <div>
@@ -508,24 +537,26 @@ function CrmPage() {
                 className="h-9 text-sm"
               />
             </div>
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setAddContactOpen(false)}>
-              Cancel
-            </Button>
-            <Button
-              onClick={() => void handleAddContact()}
-              disabled={addBusy || (!addForm.name.trim() && !addForm.email.trim())}
-            >
-              {addBusy ? (
-                <>
-                  <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" /> Saving…
-                </>
-              ) : (
-                "Save to sheet"
-              )}
-            </Button>
-          </DialogFooter>
+            <DialogFooter className="pt-2">
+              <Button type="button" variant="outline" onClick={() => setAddContactOpen(false)}>
+                Cancel
+              </Button>
+              <Button
+                type="submit"
+                disabled={
+                  addBusy || !addForm.name.trim() || !addForm.email.trim().includes("@")
+                }
+              >
+                {addBusy ? (
+                  <>
+                    <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" /> Saving…
+                  </>
+                ) : (
+                  "Add contact"
+                )}
+              </Button>
+            </DialogFooter>
+          </form>
         </DialogContent>
       </Dialog>
 

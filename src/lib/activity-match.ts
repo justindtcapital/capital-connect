@@ -32,18 +32,23 @@ export function matchActivitiesToContact(
   const company = norm(contact.company);
   if (!name && emails.length === 0 && !company) return [];
   return activities.filter((a) => {
+    const gmailSourced = a.gid.startsWith("gmail-");
+    const hay = `${a.name} ${a.notes || ""} ${a.person || ""} ${a.url || ""}`.toLowerCase();
+
+    // Gmail BD/GTM rows always carry exact counterparty emails in notes. Match by
+    // email only — fuzzy name substring was attaching noise to wrong Contacts
+    // (e.g. short names / shared first names in subject lines).
+    if (gmailSourced) {
+      return emails.some((e) => e && hay.includes(e));
+    }
+
     if (name && norm(a.person) === name) return true;
     // Person named in the task title/notes (full name or email — specific enough).
-    // Gmail-synced activities embed counterparty emails in notes, so email join works here.
-    const hay = `${a.name} ${a.notes || ""} ${a.person || ""} ${a.url || ""}`.toLowerCase();
     if (name && name.length > 3 && hay.includes(name)) return true;
     if (emails.some((e) => e && hay.includes(e))) return true;
     // Contact works at a company the activity is tagged to (exact, per-name).
-    // Gmail emails name their exact participants (emails are in notes above), so we
-    // never company-fan-out — that would put a 1:1 email onto uninvolved colleagues.
-    // The email still surfaces company-wide via matchActivitiesToCompany (PortCo view).
-    const gmailSourced = a.gid.startsWith("gmail-");
-    if (!gmailSourced && company && taggedCompanies(a).includes(company)) return true;
+    // Never company-fan-out for Gmail (handled above); Asana GTM often only tags company.
+    if (company && taggedCompanies(a).includes(company)) return true;
     return false;
   });
 }

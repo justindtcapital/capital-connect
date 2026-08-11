@@ -16,6 +16,7 @@ import { isDriveConfigured, listDriveDocs, downloadDriveFile } from "./drive.ser
 import { isNewsConfigured, fetchNewsForCompanies, articleUrlKey, uniqueSearchNames } from "./news.server";
 import { isPerplexityConfigured, fetchPerplexityNews } from "./perplexity.server";
 import { gatherNetworkEmails, type GmailSignal } from "./gmail.functions";
+import { downloadGmailAttachment } from "./gmail.server";
 import { buildRadarWatchlist } from "./platform.server";
 import { scoreAttribution, isSelfCompanyAttribution } from "@/lib/attribution-score";
 import type { Contact } from "@/lib/types";
@@ -32,9 +33,7 @@ import {
 import {
   buildContacts,
   buildPortfolioCompanies,
-  fetchSheetTab,
   appendSheetRows,
-  deleteSheetRows,
   ensureTab,
   ensureHeaderRow,
   ensureHeaderWidth,
@@ -513,6 +512,24 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
             linkSeen.add(k);
             return true;
           });
+          // PDFs forwarded to the NEWS@ alias join the scan's document
+          // grounding beside the shared-drive PDFs — own count budget so a
+          // full Drive lane can't starve them; same per-file size ceiling.
+          // Like Drive docs, they re-feed while inside the Gmail window
+          // (the window rolling off is the retention cutoff).
+          const pickedDocs = g.newsDocs
+            .filter((d) => !d.sizeBytes || d.sizeBytes <= MAX_SIGNAL_DOC_BYTES)
+            .slice(0, MAX_SIGNAL_DOCS);
+          for (const d of pickedDocs) {
+            const base64 = await downloadGmailAttachment(d.messageId, d.attachmentId);
+            if (base64)
+              documents.push({
+                name: d.filename || d.subject,
+                base64,
+                mediaType: "application/pdf",
+                link: d.permalink,
+              });
+          }
         }
       } catch (e) {
         console.error("[gemini] gatherNetworkEmails for scan failed (continuing):", e);
@@ -942,105 +959,16 @@ export const fetchSignalBody = createServerFn({ method: "POST" })
   });
 
 // ── Retention prune (SPEC #3) ────────────────────────────────────
-// Hold the Signals tab to a rolling window (default 365d) so reads stay fast.
-// Archive-then-delete keeps full history out of the hot path.
+// Core lives in signals-prune.server.ts — it also runs nightly as the final
+// pass of runSignalsReconcile. This server fn is the on-demand entry point.
 
-export interface PruneSignalsResult {
-  /** Non-empty data rows examined. */
-  scanned: number;
-  /** Rows copied to the Signals Archive tab (0 in delete mode). */
-  archived: number;
-  /** Rows physically removed from the Signals tab. */
-  deleted: number;
-  /** Retention cutoff (YYYY-MM-DD); rows dated before this are stale. */
-  cutoff: string;
-}
+export type { PruneSignalsResult } from "./signals-prune.server";
 
-// A row is stale when "Date Found" is a valid YYYY-MM-DD strictly before the
-// cutoff. Blank/invalid dates are NOT stale by default (safe); pruneUndated
-// flips that so undated rows are pruned too.
-function signalIsStale(dateFound: string, cutoff: string, pruneUndated: boolean): boolean {
-  const d = (dateFound || "").trim();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return pruneUndated;
-  return d < cutoff;
-}
-
-// Prune stale rows from the Signals tab to a rolling retention window. In
-// "archive" mode stale rows are copied to "Signals Archive" (same SIGNAL_HEADERS,
-// full Body preserved) BEFORE deletion; "delete" mode removes them outright.
-// Deletion is bottom-up (handled by deleteSheetRows) so earlier deletes don't
-// shift later sheet indices. Idempotent: a re-run after a successful prune finds
-// nothing new (fetchSignals then returns only within-window rows).
 export const pruneSignals = createServerFn({ method: "POST" })
   .inputValidator(
     (data: { retentionDays?: number; mode?: "archive" | "delete"; pruneUndated?: boolean }) => data,
   )
-  .handler(async ({ data }): Promise<PruneSignalsResult> => {
-    const opts = data || {};
-    const retentionDays =
-      opts.retentionDays && opts.retentionDays > 0
-        ? Math.floor(opts.retentionDays)
-        : Number(process.env.SIGNALS_RETENTION_DAYS) || 365;
-    const mode: "archive" | "delete" = opts.mode === "delete" ? "delete" : "archive";
-    const pruneUndated = !!opts.pruneUndated;
-
-    // Cutoff = today − retentionDays (UTC, YYYY-MM-DD), matching how "Date Found"
-    // is written (new Date().toISOString().split("T")[0]).
-    const cutoffDate = new Date();
-    cutoffDate.setUTCDate(cutoffDate.getUTCDate() - retentionDays);
-    const cutoff = cutoffDate.toISOString().split("T")[0];
-
-    let rows: string[][] = [];
-    try {
-      rows = await fetchSheetTab(TAB_NAMES.signals);
-    } catch {
-      return { scanned: 0, archived: 0, deleted: 0, cutoff };
-    }
-    if (rows.length === 0) return { scanned: 0, archived: 0, deleted: 0, cutoff };
-
-    // Same header detection as fetchStoredSignals so the data-row → sheet-row
-    // offset (for deleteDimension) stays correct.
-    const isHeader = (r: string[]) =>
-      (r[0] || "").trim().toLowerCase() === "id" && (r[2] || "").trim().toLowerCase() === "type";
-    const startIdx = isHeader(rows[0]) ? 1 : 0;
-
-    const staleRows: string[][] = [];
-    const staleSheetRows: number[] = [];
-    let scanned = 0;
-    for (let i = startIdx; i < rows.length; i++) {
-      const row = rows[i];
-      if (!row || row.every((c) => (c || "").trim() === "")) continue; // skip blank rows
-      scanned++;
-      const sheetRow = i + 1; // 1-based sheet row
-      if (sheetRow < 2) continue; // never touch row 1 — keeps archive & delete in sync
-      // "Date Found" is column index 1 in SIGNAL_HEADERS.
-      if (signalIsStale((row[1] || "").trim(), cutoff, pruneUndated)) {
-        staleRows.push(row);
-        staleSheetRows.push(sheetRow);
-      }
-    }
-
-    if (staleRows.length === 0) {
-      return { scanned, archived: 0, deleted: 0, cutoff };
-    }
-
-    // Archive first (history survives), THEN delete from the hot tab.
-    let archived = 0;
-    if (mode === "archive") {
-      await ensureTab(TAB_NAMES.signalsArchive, SIGNAL_HEADERS);
-      await appendSheetRows(TAB_NAMES.signalsArchive, staleRows);
-      archived = staleRows.length;
-    }
-    const deleted = await deleteSheetRows(TAB_NAMES.signals, staleSheetRows);
-
-    await logOpsEvent({
-      action: "prune",
-      source: "signals_retention",
-      status: "ok",
-      summary: `Pruned ${deleted} signal${deleted === 1 ? "" : "s"} older than ${cutoff} (${retentionDays}d · ${mode})`,
-      records: deleted,
-      details: { retentionDays, mode, cutoff, scanned, archived, pruneUndated },
-    });
-
-    return { scanned, archived, deleted, cutoff };
+  .handler(async ({ data }) => {
+    const { runSignalsPrune } = await import("./signals-prune.server");
+    return runSignalsPrune(data || {});
   });

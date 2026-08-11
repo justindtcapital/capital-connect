@@ -126,12 +126,15 @@ export function buildOwnedGidSet(
   return owned;
 }
 
-/** Contact is "mine" via Notes Owner column or a sourceRef pointing at my activity GIDs. */
+/** Contact is "mine" via Relationship Prime, Notes Owner, or a sourceRef to my activity GIDs. */
 export function isMyContact(
   contact: Contact,
   ownedGids: Set<string>,
   profile: TeamProfile,
 ): boolean {
+  // Manual adds / imports stamp Relationship Prime with the DTC owner — count that
+  // as "mine" so freshly added contacts aren't invisible under the default Mine filter.
+  if (ownerMatches(contact.prime, profile)) return true;
   for (const i of contact.interactions || []) {
     if (interactionOwnedBy(i, ownedGids, profile)) return true;
   }

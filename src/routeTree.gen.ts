@@ -20,7 +20,7 @@ import { Route as CrmRouteImport } from './routes/crm'
 import { Route as CompaniesRouteImport } from './routes/companies'
 import { Route as ActivityRouteImport } from './routes/activity'
 import { Route as IndexRouteImport } from './routes/index'
-import { Route as ApiInngestRouteImport } from './routes/api/inngest'
+import { Route as ApiPublicInngestRouteImport } from './routes/api/public/inngest'
 import { Route as ApiCronSignalsReconcileRouteImport } from './routes/api/cron/signals-reconcile'
 import { Route as ApiCronScanSignalsRouteImport } from './routes/api/cron/scan-signals'
 import { Route as ApiCronIntelScanRouteImport } from './routes/api/cron/intel-scan'
@@ -80,9 +80,9 @@ const IndexRoute = IndexRouteImport.update({
   path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
-const ApiInngestRoute = ApiInngestRouteImport.update({
-  id: '/api/inngest',
-  path: '/api/inngest',
+const ApiPublicInngestRoute = ApiPublicInngestRouteImport.update({
+  id: '/api/public/inngest',
+  path: '/api/public/inngest',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ApiCronSignalsReconcileRoute = ApiCronSignalsReconcileRouteImport.update({
@@ -113,10 +113,10 @@ export interface FileRoutesByFullPath {
   '/query': typeof QueryRoute
   '/signals': typeof SignalsRoute
   '/targeting': typeof TargetingRoute
-  '/api/inngest': typeof ApiInngestRoute
   '/api/cron/intel-scan': typeof ApiCronIntelScanRoute
   '/api/cron/scan-signals': typeof ApiCronScanSignalsRoute
   '/api/cron/signals-reconcile': typeof ApiCronSignalsReconcileRoute
+  '/api/public/inngest': typeof ApiPublicInngestRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -130,10 +130,10 @@ export interface FileRoutesByTo {
   '/query': typeof QueryRoute
   '/signals': typeof SignalsRoute
   '/targeting': typeof TargetingRoute
-  '/api/inngest': typeof ApiInngestRoute
   '/api/cron/intel-scan': typeof ApiCronIntelScanRoute
   '/api/cron/scan-signals': typeof ApiCronScanSignalsRoute
   '/api/cron/signals-reconcile': typeof ApiCronSignalsReconcileRoute
+  '/api/public/inngest': typeof ApiPublicInngestRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -148,10 +148,10 @@ export interface FileRoutesById {
   '/query': typeof QueryRoute
   '/signals': typeof SignalsRoute
   '/targeting': typeof TargetingRoute
-  '/api/inngest': typeof ApiInngestRoute
   '/api/cron/intel-scan': typeof ApiCronIntelScanRoute
   '/api/cron/scan-signals': typeof ApiCronScanSignalsRoute
   '/api/cron/signals-reconcile': typeof ApiCronSignalsReconcileRoute
+  '/api/public/inngest': typeof ApiPublicInngestRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -167,10 +167,10 @@ export interface FileRouteTypes {
     | '/query'
     | '/signals'
     | '/targeting'
-    | '/api/inngest'
     | '/api/cron/intel-scan'
     | '/api/cron/scan-signals'
     | '/api/cron/signals-reconcile'
+    | '/api/public/inngest'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -184,10 +184,10 @@ export interface FileRouteTypes {
     | '/query'
     | '/signals'
     | '/targeting'
-    | '/api/inngest'
     | '/api/cron/intel-scan'
     | '/api/cron/scan-signals'
     | '/api/cron/signals-reconcile'
+    | '/api/public/inngest'
   id:
     | '__root__'
     | '/'
@@ -201,10 +201,10 @@ export interface FileRouteTypes {
     | '/query'
     | '/signals'
     | '/targeting'
-    | '/api/inngest'
     | '/api/cron/intel-scan'
     | '/api/cron/scan-signals'
     | '/api/cron/signals-reconcile'
+    | '/api/public/inngest'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -219,10 +219,10 @@ export interface RootRouteChildren {
   QueryRoute: typeof QueryRoute
   SignalsRoute: typeof SignalsRoute
   TargetingRoute: typeof TargetingRoute
-  ApiInngestRoute: typeof ApiInngestRoute
   ApiCronIntelScanRoute: typeof ApiCronIntelScanRoute
   ApiCronScanSignalsRoute: typeof ApiCronScanSignalsRoute
   ApiCronSignalsReconcileRoute: typeof ApiCronSignalsReconcileRoute
+  ApiPublicInngestRoute: typeof ApiPublicInngestRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -304,11 +304,11 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/api/inngest': {
-      id: '/api/inngest'
-      path: '/api/inngest'
-      fullPath: '/api/inngest'
-      preLoaderRoute: typeof ApiInngestRouteImport
+    '/api/public/inngest': {
+      id: '/api/public/inngest'
+      path: '/api/public/inngest'
+      fullPath: '/api/public/inngest'
+      preLoaderRoute: typeof ApiPublicInngestRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/api/cron/signals-reconcile': {
@@ -347,10 +347,10 @@ const rootRouteChildren: RootRouteChildren = {
   QueryRoute: QueryRoute,
   SignalsRoute: SignalsRoute,
   TargetingRoute: TargetingRoute,
-  ApiInngestRoute: ApiInngestRoute,
   ApiCronIntelScanRoute: ApiCronIntelScanRoute,
   ApiCronScanSignalsRoute: ApiCronScanSignalsRoute,
   ApiCronSignalsReconcileRoute: ApiCronSignalsReconcileRoute,
+  ApiPublicInngestRoute: ApiPublicInngestRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

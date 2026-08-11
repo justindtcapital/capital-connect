@@ -310,6 +310,11 @@ export interface ApolloSearchParams {
   titles?: string[];
   /** Apollo person_seniorities, e.g. "c_suite" | "vp" | "director" | "manager" | "senior". */
   seniorities?: string[];
+  /**
+   * When true (or when titles are present and this is omitted), include people
+   * whose titles are similar to person_titles — softens exact title matching.
+   */
+  includeSimilarTitles?: boolean;
   locations?: string[];
   organizationDomains?: string[];
   employeeRanges?: string[];
@@ -328,6 +333,11 @@ export async function searchPeople(params: ApolloSearchParams): Promise<ApolloSe
   };
   if (params.titles?.length) body.person_titles = params.titles;
   if (params.seniorities?.length) body.person_seniorities = params.seniorities;
+  // Default on whenever titles are sent so callers get hierarchy-tolerant recall
+  // unless they explicitly pass includeSimilarTitles: false.
+  if (params.titles?.length) {
+    body.include_similar_titles = params.includeSimilarTitles !== false;
+  }
   if (params.locations?.length) body.person_locations = params.locations;
   if (params.organizationDomains?.length) body.q_organization_domains = params.organizationDomains.join("\n");
   if (params.employeeRanges?.length) body.organization_num_employees_ranges = params.employeeRanges;

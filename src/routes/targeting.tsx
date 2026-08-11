@@ -23,7 +23,6 @@ import {
   MessageSquare,
   AlertCircle,
   FileUp,
-  UserSearch,
   Building2,
   ChevronDown,
   ChevronUp,
@@ -1258,25 +1257,9 @@ function TargetingPage() {
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="w-48">
-                <DropdownMenuItem onClick={() => setNetworkBuilderOpen(true)}>
-                  <Telescope className="h-3.5 w-3.5 mr-2" />
-                  Find Contacts
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => setFinderOpen(true)}>
-                  <UserSearch className="h-3.5 w-3.5 mr-2" />
-                  Find People
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => setFindCompaniesOpen(true)}>
-                  <Building2 className="h-3.5 w-3.5 mr-2" />
-                  Find Companies
-                </DropdownMenuItem>
                 <DropdownMenuItem onClick={() => setFindCompaniesOpen(true)}>
                   <Search className="h-3.5 w-3.5 mr-2" />
                   Find
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={() => setAccountsOpen(true)}>
-                  <Building2 className="h-3.5 w-3.5 mr-2" />
-                  Target Accounts
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>

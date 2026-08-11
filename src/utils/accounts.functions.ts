@@ -1,5 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
 import { searchPeople, enrichPerson } from "./apollo.server";
+import { expandFindRoleQuery } from "./find-role-expand";
 import { matchOrganization, isSumbleConfigured } from "./sumble.server";
 import {
   buildContacts,
@@ -126,7 +127,9 @@ export const findAccountPeople = createServerFn({ method: "POST" })
       };
 
     const perCompany = Math.min(25, Math.max(1, data.perCompany ?? 5));
+    // Audit label stays user-facing; Apollo gets soft-band + synonym expansion.
     const roleLabel = [...titles, ...seniorities].join(", ");
+    const expanded = expandFindRoleQuery({ titles, seniorities });
     const people: AccountPerson[] = [];
     const unresolved: string[] = [];
     const foundRows: string[][] = [];
@@ -156,8 +159,9 @@ export const findAccountPeople = createServerFn({ method: "POST" })
 
       try {
         const res = await searchPeople({
-          titles,
-          seniorities,
+          titles: expanded.titles,
+          seniorities: expanded.seniorities,
+          includeSimilarTitles: expanded.titles.length > 0,
           organizationDomains: [domain],
           perPage: perCompany,
         });
@@ -275,12 +279,15 @@ export const findPeopleByLocation = createServerFn({ method: "POST" })
 
     const limit = Math.min(100, Math.max(1, data.limit ?? 25));
     const employeeRanges = (data.sizes || []).map((s) => APOLLO_SIZE_RANGES[s]).filter(Boolean);
+    // Audit label stays user-facing; Apollo gets soft-band + synonym expansion.
     const roleLabel = [...titles, ...seniorities].join(", ");
+    const expanded = expandFindRoleQuery({ titles, seniorities });
 
     try {
       const res = await searchPeople({
-        titles,
-        seniorities,
+        titles: expanded.titles,
+        seniorities: expanded.seniorities,
+        includeSimilarTitles: expanded.titles.length > 0,
         locations: [location],
         employeeRanges,
         perPage: limit,

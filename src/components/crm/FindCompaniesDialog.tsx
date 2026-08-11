@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Dialog,
   DialogContent,
@@ -81,15 +81,23 @@ const PURPOSES = [
   { value: "Both", label: "Both" },
 ];
 
-// Two-phase prospecting: Sumble company search (by installed technology) →
-// Apollo people search at the selected companies → add to Targets as Prospecting.
+// Two-phase prospecting: Sumble company search (by installed technology) OR
+// a pasted company list → Apollo people search → add to Targets as Prospecting.
+type CompanySource = "tech" | "paste";
+
 export function FindCompaniesDialog({ open, onOpenChange, onImported, companies = [] }: Props) {
   // Phase 1 — company criteria
+  const [companySource, setCompanySource] = useState<CompanySource>("tech");
   const [technology, setTechnology] = useState("");
   const [city, setCity] = useState("");
   const [limit, setLimit] = useState("15");
   const [sizes, setSizes] = useState<Set<string>>(new Set());
   const [taggedPortcos, setTaggedPortcos] = useState<string[]>([]);
+  const [pastedCompanies, setPastedCompanies] = useState("");
+  // Paste flow: companies first, then the Apollo people-criteria screen.
+  const [pasteStep, setPasteStep] = useState<"companies" | "people">("companies");
+  const roleInputRef = useRef<HTMLInputElement>(null);
+  const peoplePhaseRef = useRef<HTMLDivElement>(null);
 
   const [searchingCompanies, setSearchingCompanies] = useState(false);
   const [companyResults, setCompanyResults] = useState<FoundCompany[] | null>(null);
@@ -114,16 +122,26 @@ export function FindCompaniesDialog({ open, onOpenChange, onImported, companies 
     [companies],
   );
 
+  const pasteMode = companySource === "paste";
   // Location-only mode: no installed technology, but a location is given → skip
   // Sumble company discovery and search Apollo directly for people there.
-  const locationOnlyMode = !technology.trim() && !!city.trim();
+  const locationOnlyMode = !pasteMode && !technology.trim() && !!city.trim();
+
+  const pastedCompanyLines = (): string[] =>
+    pastedCompanies
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
 
   const reset = () => {
+    setCompanySource("tech");
     setTechnology("");
     setCity("");
     setLimit("15");
     setSizes(new Set());
     setTaggedPortcos([]);
+    setPastedCompanies("");
+    setPasteStep("companies");
     setSearchingCompanies(false);
     setCompanyResults(null);
     setTechResolved("");
@@ -140,8 +158,40 @@ export function FindCompaniesDialog({ open, onOpenChange, onImported, companies 
     setAdding(false);
   };
 
+  const switchCompanySource = (next: CompanySource) => {
+    if (next === companySource) return;
+    setCompanySource(next);
+    setPasteStep("companies");
+    // Switching source invalidates downstream company/people results.
+    setCompanyResults(null);
+    setTechResolved("");
+    setSelectedCompanies(new Set());
+    setPeople(null);
+    setUnresolved([]);
+    setSelectedPeople(new Set());
+    setAccessDenied(false);
+  };
+
+  const advancePasteToPeople = () => {
+    const lines = pastedCompanyLines();
+    if (lines.length === 0) {
+      toast.error("Paste at least one company (one per line).");
+      return;
+    }
+    setPasteStep("people");
+  };
+
+  // After advancing from paste → people, surface the criteria screen and focus roles.
+  useEffect(() => {
+    if (!pasteMode || pasteStep !== "people") return;
+    peoplePhaseRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    const t = window.setTimeout(() => roleInputRef.current?.focus(), 150);
+    return () => window.clearTimeout(t);
+  }, [pasteMode, pasteStep]);
+
   // The technology context we attribute the sourcing to (audit + why-surfaced).
-  const techContext = () => techResolved || technology.trim();
+  const techContext = () =>
+    pasteMode ? "Manual list" : techResolved || technology.trim();
 
   const toggleSize = (key: string) =>
     setSizes((prev) => {
@@ -232,9 +282,11 @@ export function FindCompaniesDialog({ open, onOpenChange, onImported, companies 
 
   // Selected companies → "Name | domain" lines for the Apollo people search.
   const selectedCompanyLines = (): string[] =>
-    (companyResults || [])
-      .filter((_, i) => selectedCompanies.has(i))
-      .map((c) => (c.domain ? `${c.name} | ${c.domain}` : c.name));
+    pasteMode
+      ? pastedCompanyLines()
+      : (companyResults || [])
+          .filter((_, i) => selectedCompanies.has(i))
+          .map((c) => (c.domain ? `${c.name} | ${c.domain}` : c.name));
 
   // ── Phase 2: people search ─────────────────────────────────────
   const searchPeople = async () => {
@@ -246,7 +298,7 @@ export function FindCompaniesDialog({ open, onOpenChange, onImported, companies 
     }
     const lines = locationOnlyMode ? [] : selectedCompanyLines();
     if (!locationOnlyMode && lines.length === 0) {
-      toast.error("Select at least one company.");
+      toast.error(pasteMode ? "Paste at least one company (one per line)." : "Select at least one company.");
       return;
     }
     setSearchingPeople(true);
@@ -402,7 +454,10 @@ export function FindCompaniesDialog({ open, onOpenChange, onImported, companies 
     }
   };
 
-  const showPeoplePhase = locationOnlyMode || (!!companyResults && selectedCompanies.size > 0);
+  const showPeoplePhase =
+    locationOnlyMode ||
+    (pasteMode && pasteStep === "people" && pastedCompanyLines().length > 0) ||
+    (!pasteMode && !!companyResults && selectedCompanies.size > 0);
 
   return (
     <Dialog
@@ -415,186 +470,318 @@ export function FindCompaniesDialog({ open, onOpenChange, onImported, companies 
       <DialogContent className="sm:max-w-3xl max-h-[90vh] grid-rows-[auto_1fr_auto]">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
-            <Building2 className="h-4 w-4 text-primary" /> Find companies by installed tech
+            <Building2 className="h-4 w-4 text-primary" /> Find companies
           </DialogTitle>
           <DialogDescription className="text-xs">
-            Search Sumble for companies running a specific technology, pick the ones you want, then
-            find decision-makers via Apollo. Leave technology blank and enter a location to search
-            people directly via Apollo. Selected people enter the Targets pipeline as{" "}
+            Discover companies by installed technology (Sumble), paste your own list and skip Sumble
+            discovery, or leave technology blank and enter a location to search people directly via
+            Apollo. Then find decision-makers and add them to Targets as{" "}
             <span className="font-medium">Prospecting</span>.
           </DialogDescription>
         </DialogHeader>
 
         {/* Body scrolls; header + footer stay pinned so "Add as Prospecting" is always reachable. */}
         <div className="space-y-4 py-1 min-h-0 overflow-y-auto -mx-6 px-6">
+          {/* Company source toggle */}
+          <div className="flex flex-wrap gap-1.5">
+            {(
+              [
+                { key: "tech" as const, label: "By installed tech" },
+                { key: "paste" as const, label: "Paste company list" },
+              ] as const
+            ).map((opt) => (
+              <button
+                key={opt.key}
+                type="button"
+                onClick={() => switchCompanySource(opt.key)}
+                className={`text-[11px] px-2.5 py-1 rounded border ${
+                  companySource === opt.key
+                    ? "bg-primary text-primary-foreground border-primary"
+                    : "border-border hover:bg-accent"
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+
           {/* ── Phase 1: company criteria ── */}
-          <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
-            <div className="sm:col-span-2 space-y-1">
-              <Label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground">
-                Installed technology <span className="font-normal normal-case">(optional)</span>
-              </Label>
-              <Input
-                value={technology}
-                onChange={(e) => setTechnology(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") searchCompanies();
-                }}
-                placeholder="e.g. Splunk, Snowflake, Kubernetes"
-                className="h-8 text-sm"
-              />
-            </div>
-            <div className="space-y-1">
-              <Label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground">
-                {locationOnlyMode ? "Location" : "HQ State / Country"}{" "}
-                <span className="font-normal normal-case">
-                  {locationOnlyMode ? "(Apollo people search)" : "(optional)"}
-                </span>
-              </Label>
-              <Input
-                value={city}
-                onChange={(e) => setCity(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") searchCompanies();
-                }}
-                placeholder="e.g. California or United States"
-                className="h-8 text-sm"
-              />
-            </div>
-            {!locationOnlyMode && (
-              <div className="space-y-1">
-                <Label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground">
-                  Max companies
-                </Label>
-                <Select value={limit} onValueChange={setLimit}>
-                  <SelectTrigger className="h-8 text-sm">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {[10, 15, 25, 40, 50].map((n) => (
-                      <SelectItem key={n} value={String(n)}>
-                        {n}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-            )}
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <div className="space-y-1">
-              <Label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground">
-                Company size <span className="font-normal normal-case">(optional)</span>
-              </Label>
-              <div className="flex flex-wrap gap-1.5">
-                {SIZE_BANDS.map((b) => (
-                  <button
-                    key={b.key}
-                    type="button"
-                    onClick={() => toggleSize(b.key)}
-                    className={`text-[11px] px-2 py-1 rounded border ${
-                      sizes.has(b.key)
-                        ? "bg-primary text-primary-foreground border-primary"
-                        : "border-border hover:bg-accent"
-                    }`}
+          {pasteMode ? (
+            pasteStep === "companies" ? (
+              <div className="space-y-3">
+                <div className="space-y-1">
+                  <Label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground">
+                    Target companies{" "}
+                    <span className="font-normal normal-case">(one per line — name or domain)</span>
+                  </Label>
+                  <textarea
+                    value={pastedCompanies}
+                    onChange={(e) => {
+                      setPastedCompanies(e.target.value);
+                      // Editing the list invalidates people results.
+                      setPeople(null);
+                      setUnresolved([]);
+                      setSelectedPeople(new Set());
+                      setAccessDenied(false);
+                    }}
+                    onPaste={(e) => {
+                      const clip = e.clipboardData.getData("text");
+                      if (!clip.trim()) return;
+                      e.preventDefault();
+                      const el = e.currentTarget;
+                      const start = el.selectionStart ?? pastedCompanies.length;
+                      const end = el.selectionEnd ?? start;
+                      const next =
+                        pastedCompanies.slice(0, start) + clip + pastedCompanies.slice(end);
+                      setPastedCompanies(next);
+                      setPeople(null);
+                      setUnresolved([]);
+                      setSelectedPeople(new Set());
+                      setAccessDenied(false);
+                      const lines = next
+                        .split("\n")
+                        .map((s) => s.trim())
+                        .filter(Boolean);
+                      if (lines.length > 0) setPasteStep("people");
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                        e.preventDefault();
+                        advancePasteToPeople();
+                      }
+                    }}
+                    rows={5}
+                    placeholder={
+                      "JPMorgan Chase\nGoldman Sachs\nCiti Ventures | citi.com\ncapitalone.com"
+                    }
+                    className="w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring resize-y"
+                  />
+                  <p className="text-[10px] text-muted-foreground">
+                    Skips Sumble company discovery. Paste domains to skip name→domain resolution too;
+                    bare names still resolve via Sumble (1 credit each).
+                  </p>
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground">
+                    Tag portfolio companies{" "}
+                    <span className="font-normal normal-case">(optional)</span>
+                  </Label>
+                  <MultiSelect
+                    options={portcoOptions}
+                    value={taggedPortcos}
+                    onChange={setTaggedPortcos}
+                    placeholder="None — general prospecting"
+                  />
+                </div>
+                <div className="flex items-center justify-end">
+                  <Button
+                    onClick={advancePasteToPeople}
+                    disabled={pastedCompanyLines().length === 0}
                   >
-                    {b.label}
-                  </button>
-                ))}
+                    <Search className="h-4 w-4 mr-1" /> Continue to find people
+                  </Button>
+                </div>
               </div>
-            </div>
-            <div className="space-y-1">
-              <Label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground">
-                Tag portfolio companies <span className="font-normal normal-case">(optional)</span>
-              </Label>
-              <MultiSelect
-                options={portcoOptions}
-                value={taggedPortcos}
-                onChange={setTaggedPortcos}
-                placeholder="None — general prospecting"
-              />
-            </div>
-          </div>
-
-          {!locationOnlyMode && (
-            <div className="flex items-center justify-end">
-              <Button onClick={searchCompanies} disabled={searchingCompanies}>
-                {searchingCompanies ? (
-                  <>
-                    <Loader2 className="h-4 w-4 mr-1 animate-spin" /> Searching…
-                  </>
-                ) : (
-                  <>
-                    <Search className="h-4 w-4 mr-1" /> Search companies
-                  </>
-                )}
-              </Button>
-            </div>
-          )}
-
-          {/* ── Company results ── */}
-          {!locationOnlyMode && companyResults && companyResults.length > 0 && (
-            <div>
-              <div className="flex items-center justify-between mb-1">
-                <Label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground">
-                  {companyResults.length} found · {selectedCompanies.size} selected
-                  {techResolved && (
-                    <span className="font-normal normal-case"> · {techResolved}</span>
-                  )}
-                </Label>
+            ) : (
+              <div className="flex items-center justify-between gap-2 rounded-md border border-border bg-muted/40 px-3 py-2">
+                <p className="text-xs text-muted-foreground min-w-0">
+                  <span className="font-medium text-foreground">
+                    {pastedCompanyLines().length} compan
+                    {pastedCompanyLines().length === 1 ? "y" : "ies"}
+                  </span>{" "}
+                  ready for Apollo — set roles/seniority below, then Find people.
+                </p>
                 <button
                   type="button"
-                  onClick={selectAllCompanies}
-                  className="text-[10px] text-primary hover:underline"
+                  onClick={() => {
+                    setPasteStep("companies");
+                    setPeople(null);
+                    setUnresolved([]);
+                    setSelectedPeople(new Set());
+                    setAccessDenied(false);
+                  }}
+                  className="text-[10px] text-primary hover:underline shrink-0"
                 >
-                  {allCompaniesSelected ? "Clear all" : "Select all"}
+                  Edit list
                 </button>
               </div>
-              <ScrollArea className="h-52 border border-border rounded">
-                <div className="divide-y divide-border">
-                  {companyResults.map((c, i) => (
-                    <div key={`${c.domain}-${i}`} className="flex items-center gap-2 px-2 py-1.5">
-                      <Checkbox
-                        checked={selectedCompanies.has(i)}
-                        onCheckedChange={() => toggleCompany(i)}
-                      />
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-xs font-medium truncate">{c.name}</span>
-                          <span className="text-[10px] font-mono text-muted-foreground/70 truncate">
-                            {c.domain}
-                          </span>
-                        </div>
-                        <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
-                          {c.industry && <span className="truncate">{c.industry}</span>}
-                          {c.location && (
-                            <span className="inline-flex items-center gap-0.5 truncate">
-                              <MapPin className="h-2.5 w-2.5" /> {c.location}
-                            </span>
-                          )}
-                          {c.employees != null && (
-                            <span className="inline-flex items-center gap-0.5 shrink-0">
-                              <Users className="h-2.5 w-2.5" /> {c.employees.toLocaleString()}
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  ))}
+            )
+          ) : (
+            <>
+              <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+                <div className="sm:col-span-2 space-y-1">
+                  <Label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground">
+                    Installed technology{" "}
+                    <span className="font-normal normal-case">(optional)</span>
+                  </Label>
+                  <Input
+                    value={technology}
+                    onChange={(e) => setTechnology(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") searchCompanies();
+                    }}
+                    placeholder="e.g. Splunk, Snowflake, Kubernetes"
+                    className="h-8 text-sm"
+                  />
                 </div>
-              </ScrollArea>
-            </div>
-          )}
-          {!locationOnlyMode && companyResults && companyResults.length === 0 && (
-            <p className="text-xs text-muted-foreground text-center py-3">
-              No companies matched. Try a different technology, drop the location, or widen the size
-              bands.
-            </p>
+                <div className="space-y-1">
+                  <Label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground">
+                    {locationOnlyMode ? "Location" : "HQ State / Country"}{" "}
+                    <span className="font-normal normal-case">
+                      {locationOnlyMode ? "(Apollo people search)" : "(optional)"}
+                    </span>
+                  </Label>
+                  <Input
+                    value={city}
+                    onChange={(e) => setCity(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") searchCompanies();
+                    }}
+                    placeholder="e.g. California or United States"
+                    className="h-8 text-sm"
+                  />
+                </div>
+                {!locationOnlyMode && (
+                  <div className="space-y-1">
+                    <Label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground">
+                      Max companies
+                    </Label>
+                    <Select value={limit} onValueChange={setLimit}>
+                      <SelectTrigger className="h-8 text-sm">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {[10, 15, 25, 40, 50].map((n) => (
+                          <SelectItem key={n} value={String(n)}>
+                            {n}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                )}
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="space-y-1">
+                  <Label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground">
+                    Company size <span className="font-normal normal-case">(optional)</span>
+                  </Label>
+                  <div className="flex flex-wrap gap-1.5">
+                    {SIZE_BANDS.map((b) => (
+                      <button
+                        key={b.key}
+                        type="button"
+                        onClick={() => toggleSize(b.key)}
+                        className={`text-[11px] px-2 py-1 rounded border ${
+                          sizes.has(b.key)
+                            ? "bg-primary text-primary-foreground border-primary"
+                            : "border-border hover:bg-accent"
+                        }`}
+                      >
+                        {b.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground">
+                    Tag portfolio companies{" "}
+                    <span className="font-normal normal-case">(optional)</span>
+                  </Label>
+                  <MultiSelect
+                    options={portcoOptions}
+                    value={taggedPortcos}
+                    onChange={setTaggedPortcos}
+                    placeholder="None — general prospecting"
+                  />
+                </div>
+              </div>
+
+              {!locationOnlyMode && (
+                <div className="flex items-center justify-end">
+                  <Button onClick={searchCompanies} disabled={searchingCompanies}>
+                    {searchingCompanies ? (
+                      <>
+                        <Loader2 className="h-4 w-4 mr-1 animate-spin" /> Searching…
+                      </>
+                    ) : (
+                      <>
+                        <Search className="h-4 w-4 mr-1" /> Search companies
+                      </>
+                    )}
+                  </Button>
+                </div>
+              )}
+
+              {/* ── Company results ── */}
+              {companyResults && companyResults.length > 0 && (
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <Label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground">
+                      {companyResults.length} found · {selectedCompanies.size} selected
+                      {techResolved && (
+                        <span className="font-normal normal-case"> · {techResolved}</span>
+                      )}
+                    </Label>
+                    <button
+                      type="button"
+                      onClick={selectAllCompanies}
+                      className="text-[10px] text-primary hover:underline"
+                    >
+                      {allCompaniesSelected ? "Clear all" : "Select all"}
+                    </button>
+                  </div>
+                  <ScrollArea className="h-52 border border-border rounded">
+                    <div className="divide-y divide-border">
+                      {companyResults.map((c, i) => (
+                        <div key={`${c.domain}-${i}`} className="flex items-center gap-2 px-2 py-1.5">
+                          <Checkbox
+                            checked={selectedCompanies.has(i)}
+                            onCheckedChange={() => toggleCompany(i)}
+                          />
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-1.5">
+                              <span className="text-xs font-medium truncate">{c.name}</span>
+                              <span className="text-[10px] font-mono text-muted-foreground/70 truncate">
+                                {c.domain}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+                              {c.industry && <span className="truncate">{c.industry}</span>}
+                              {c.location && (
+                                <span className="inline-flex items-center gap-0.5 truncate">
+                                  <MapPin className="h-2.5 w-2.5" /> {c.location}
+                                </span>
+                              )}
+                              {c.employees != null && (
+                                <span className="inline-flex items-center gap-0.5 shrink-0">
+                                  <Users className="h-2.5 w-2.5" /> {c.employees.toLocaleString()}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </ScrollArea>
+                </div>
+              )}
+              {companyResults && companyResults.length === 0 && (
+                <p className="text-xs text-muted-foreground text-center py-3">
+                  No companies matched. Try a different technology, drop the location, or widen the
+                  size bands.
+                </p>
+              )}
+            </>
           )}
 
-          {/* ── Phase 2: people criteria (after companies selected) ── */}
+          {/* ── Phase 2: people criteria (after companies selected / pasted) ── */}
           {showPeoplePhase && !accessDenied && (
-            <div className="space-y-3 border-t border-border pt-4">
+            <div
+              ref={peoplePhaseRef}
+              className={`space-y-3 ${pasteMode && pasteStep === "people" ? "" : "border-t border-border pt-4"}`}
+            >
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                 <div className="space-y-1">
                   <Label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground">
@@ -634,6 +821,11 @@ export function FindCompaniesDialog({ open, onOpenChange, onImported, companies 
                   <p className="text-[10px] text-muted-foreground">
                     {locationOnlyMode ? (
                       <>Searching people located in {city.trim()} via Apollo.</>
+                    ) : pasteMode ? (
+                      <>
+                        Searching {pastedCompanyLines().length} pasted compan
+                        {pastedCompanyLines().length === 1 ? "y" : "ies"} via Apollo.
+                      </>
                     ) : (
                       <>
                         Searching {selectedCompanies.size} selected compan
@@ -650,6 +842,7 @@ export function FindCompaniesDialog({ open, onOpenChange, onImported, companies 
                     Role / keywords / titles <span className="text-red-500">*</span>
                   </Label>
                   <Input
+                    ref={roleInputRef}
                     value={roleTerms}
                     onChange={(e) => setRoleTerms(e.target.value)}
                     onKeyDown={(e) => {
@@ -680,8 +873,8 @@ export function FindCompaniesDialog({ open, onOpenChange, onImported, companies 
                     ))}
                   </div>
                   <p className="text-[10px] text-muted-foreground">
-                    Either works alone — keywords search titles, seniority filters Apollo's level
-                    facet; combine them to narrow.
+                    Either works alone — keywords match similar titles; seniority is a soft band
+                    (nearby levels + common title variants) so org ladders don&apos;t miss.
                   </p>
                 </div>
               </div>

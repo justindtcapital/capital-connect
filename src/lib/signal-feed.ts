@@ -597,9 +597,12 @@ export function buildFeed(input: BuildFeedInput): FeedCard[] {
       investor: investorFor(e.company || ""),
       headline: e.subject,
       summary: e.snippet || e.body.slice(0, 160),
-      body: e.body || e.snippet || "_(no body)_",
+      body:
+        (e.body || e.snippet || "_(no body)_") +
+        (e.docUrl ? `\n\n[Open PDF in Drive](${e.docUrl})` : ""),
       sourceUrl: e.permalink, // real Gmail permalink → durable
       sourceIsSearch: false,
+      docUrl: e.docUrl || undefined,
       logoDomain: logo.domain,
       logoConfident: logo.confident,
       initial: initialOf(company),

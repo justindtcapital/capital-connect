@@ -18,7 +18,8 @@ import { isPerplexityConfigured, fetchPerplexityNews } from "./perplexity.server
 import { gatherNetworkEmails, type GmailSignal } from "./gmail.functions";
 import { downloadGmailAttachment } from "./gmail.server";
 import { buildRadarWatchlist } from "./platform.server";
-import { scoreAttribution, isSelfCompanyAttribution } from "@/lib/attribution-score";
+import { scoreAttribution } from "@/lib/attribution-score";
+import { outreachVerdict } from "@/lib/outreach-gate";
 import type { Contact } from "@/lib/types";
 // Signal persistence (Signals tab row contract) lives in signal-store.server —
 // shared with the Gmail digest pipeline, which archives per-link signals too.
@@ -261,6 +262,71 @@ function resultFromStored(
   return { found: true, recommendations, otherSignals, compliance, newCount };
 }
 
+// Resolve a rec's person to a CRM contact: email first, then name — but only
+// when the name is unambiguous (never guess between namesakes).
+function buildContactResolver(contacts: Contact[]) {
+  const byEmail = new Map<string, Contact>();
+  const byName = new Map<string, Contact[]>();
+  for (const c of contacts) {
+    for (const em of (c.email || "").split(";")) {
+      const key = em.trim().toLowerCase();
+      if (key && !byEmail.has(key)) byEmail.set(key, c);
+    }
+    const nameKey = c.name.trim().toLowerCase();
+    if (nameKey) byName.set(nameKey, [...(byName.get(nameKey) || []), c]);
+  }
+  return (email: string, person: string): Contact | undefined => {
+    const hit = byEmail.get((email || "").trim().toLowerCase());
+    if (hit) return hit;
+    const named = byName.get((person || "").trim().toLowerCase());
+    return named && named.length === 1 ? named[0] : undefined;
+  };
+}
+
+// Read-time outreach gate: demote stored recommendation rows that no longer
+// clear the quality bar — legacy rows written before the gate existed, or
+// contacts who have since joined a portfolio company. Display-only (the sheet
+// rows are not rewritten): the story survives as an awareness card, the
+// outreach suggestion does not. Dedups against rows that already exist as
+// awareness (a prior scan may have stored the same story both ways).
+function gateStoredRecs(
+  stored: StoredSignal[],
+  contacts: Contact[],
+  portcoNames: Set<string>,
+): StoredSignal[] {
+  const resolve = buildContactResolver(contacts);
+  const out: StoredSignal[] = [];
+  const seen = new Set<string>();
+  for (const s of stored) {
+    let row = s;
+    if (s.type === "recommendation") {
+      const verdict = outreachVerdict({
+        contact: resolve(s.email, s.person),
+        storyCompany: s.company,
+        relevance: s.relevance,
+        portcoNames,
+      });
+      if (!verdict.ok) {
+        row = {
+          ...s,
+          type: "awareness",
+          person: "",
+          email: "",
+          subject: "",
+          body: "",
+          hasBody: false,
+          relevance: 0,
+        };
+      }
+    }
+    const k = keyForStored(row);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(row);
+  }
+  return out;
+}
+
 // Scan recent news for the firm's portfolio + network companies and attribute
 // signals to network people. Pulls portcos + contacts from the sheet server-side
 // so the client just triggers the run.
@@ -486,7 +552,10 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
           reason: "all_articles_seen",
         },
       });
-      return scopeResult(resultFromStored(existing, [], 0), scoped);
+      return scopeResult(
+        resultFromStored(gateStoredRecs(existing, contacts, portcoNames), [], 0),
+        scoped,
+      );
     }
 
     // Links from the network's recent emails — pre-attributed to a company by
@@ -527,7 +596,8 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
                 name: d.filename || d.subject,
                 base64,
                 mediaType: "application/pdf",
-                link: d.permalink,
+                // Prefer the archived Drive copy so citations stay openable.
+                link: d.driveWebViewLink || d.permalink,
               });
           }
         }
@@ -595,39 +665,12 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
     const portfolioSectors = [
       ...new Set(portfolio.map((p) => (p.sector || "").trim().toLowerCase()).filter(Boolean)),
     ];
-    const contactByEmail = new Map<string, Contact>();
-    const contactsByName = new Map<string, Contact[]>();
-    for (const c of contacts) {
-      for (const em of (c.email || "").split(";")) {
-        const key = em.trim().toLowerCase();
-        if (key && !contactByEmail.has(key)) contactByEmail.set(key, c);
-      }
-      const nameKey = c.name.trim().toLowerCase();
-      if (nameKey) contactsByName.set(nameKey, [...(contactsByName.get(nameKey) || []), c]);
-    }
-    const resolveContact = (email: string, person: string): Contact | undefined => {
-      const byEmail = contactByEmail.get((email || "").trim().toLowerCase());
-      if (byEmail) return byEmail;
-      // Name fallback only when unambiguous — never guess between namesakes.
-      const byName = contactsByName.get((person || "").trim().toLowerCase());
-      return byName && byName.length === 1 ? byName[0] : undefined;
-    };
+    const resolveContact = buildContactResolver(contacts);
     const demotedToAwareness: typeof fresh.otherSignals = [];
     const rescoredRecs = [];
     for (const r of fresh.recommendations) {
       const contact = resolveContact(r.email, r.person);
       const isPortcoCompany = portcoNames.has((r.company || "").trim().toLowerCase());
-      // Portco stories must not suggest people who work at that portco.
-      if (isPortcoCompany && isSelfCompanyAttribution(contact, r.company)) {
-        demotedToAwareness.push({
-          company: r.company,
-          person: "",
-          category: r.category,
-          summary: r.signal,
-          sourceUrl: r.sourceUrl,
-        });
-        continue;
-      }
       const att = scoreAttribution(
         {
           person: r.person,
@@ -647,8 +690,16 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
           portfolioSectors,
         },
       );
-      // Belt-and-suspenders: scoreAttribution zeroes these, but never store them as recs.
-      if (isPortcoCompany && att.selfCompanyAttribution) {
+      // Outreach quality gate: portfolio stories never suggest portco people
+      // (or unverified recipients), and weak fits don't become suggestions at
+      // all — the story is kept as awareness, the outreach is dropped.
+      const verdict = outreachVerdict({
+        contact,
+        storyCompany: r.company,
+        relevance: att.relevance,
+        portcoNames,
+      });
+      if (!verdict.ok) {
         demotedToAwareness.push({
           company: r.company,
           person: "",
@@ -729,6 +780,8 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
         documents: documents.length,
         existing: existing.length,
         new: toAppend.length,
+        // Outreach suggestions the quality gate demoted to awareness this scan.
+        demotedRecs: demotedToAwareness.length,
       },
       items: toAppend.slice(0, 40).map((s) => {
         const who = s.person || s.company || "—";
@@ -738,7 +791,11 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
     });
 
     return scopeResult(
-      resultFromStored([...existing, ...toAppend], fresh.compliance, toAppend.length),
+      resultFromStored(
+        gateStoredRecs([...existing, ...toAppend], contacts, portcoNames),
+        fresh.compliance,
+        toAppend.length,
+      ),
       scoped,
     );
   } catch (err) {
@@ -932,7 +989,19 @@ export const fetchSignals = createServerFn({ method: "GET" }).handler(
   async (): Promise<SignalScanResult> => {
     try {
       const stored = await fetchStoredSignals();
-      return resultFromStored(stored, [], 0);
+      // Read-time outreach gate — rows written before the gate existed still
+      // get cleaned up on display. If CRM/portfolio loads fail, gate on what
+      // we have (empty portco set = relevance floor only) rather than skip it.
+      let contacts: Contact[] = [];
+      let portcoNames = new Set<string>();
+      try {
+        const [c, portfolio] = await Promise.all([buildContacts(), buildPortfolioCompanies()]);
+        contacts = c;
+        portcoNames = new Set(portfolio.map((p) => p.name.trim().toLowerCase()));
+      } catch (e) {
+        console.error("[gemini] fetchSignals: contacts/portfolio load failed, floor-only gate:", e);
+      }
+      return resultFromStored(gateStoredRecs(stored, contacts, portcoNames), [], 0);
     } catch (err) {
       console.error("[gemini] fetchSignals failed:", err);
       return { found: true, recommendations: [], otherSignals: [], compliance: [], newCount: 0 };

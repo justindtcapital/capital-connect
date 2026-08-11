@@ -1,14 +1,16 @@
-// Google Drive integration — read PDFs from a shared drive for the Signals tab.
+// Google Drive integration — read PDFs from a shared drive for the Signals tab,
+// and archive Gmail PDF attachments into that folder for durable "Open in Drive".
 //
 // Reuses the SAME Google OAuth refresh token as Sheets (getAccessToken). For this
-// to work the refresh token must be minted with the Drive read-only scope
-// (https://www.googleapis.com/auth/drive.readonly) — re-run mint-google-token.mjs
-// (the scope is already added there) and paste the new GOOGLE_REFRESH_TOKEN.
+// to work the refresh token must be minted with the Drive write scope
+// (https://www.googleapis.com/auth/drive) — re-run mint-google-token.mjs and paste
+// the new GOOGLE_REFRESH_TOKEN.
 //
-// Two layers:
-//  - listDriveDocs():    cheap metadata-only listing (powers the Signals reel lane).
-//  - downloadDriveFile(): pulls one file's raw bytes as base64 (for feeding PDFs to
-//    Claude as document blocks during a scan).
+// Layers:
+//  - listDriveDocs():         cheap metadata-only listing (Signals reel lane).
+//  - downloadDriveFile():     raw bytes as base64 (scan grounding).
+//  - uploadDriveFile() / findDriveFileByGmailAttachment(): archive Gmail PDFs
+//    (orchestration lives in gmail.functions to avoid import cycles).
 //
 // Everything degrades gracefully when GOOGLE_DRIVE_SIGNALS_FOLDER_ID is unset
 // (isDriveConfigured() === false), mirroring the LinkedIn connector.
@@ -16,6 +18,10 @@
 import { getAccessToken } from "./sheets.server";
 
 const DRIVE_API = "https://www.googleapis.com/drive/v3";
+const DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3";
+/** Soft ceiling for archiving email PDFs (Gmail attachments are usually smaller). */
+export const MAX_ARCHIVE_PDF_BYTES = 25_000_000;
+export const GMAIL_ATTACH_PROP = "gmailAttachmentKey";
 
 export interface DriveDoc {
   id: string;
@@ -42,6 +48,32 @@ export interface DriveFeedResult {
 
 export function isDriveConfigured(): boolean {
   return Boolean(process.env.GOOGLE_DRIVE_SIGNALS_FOLDER_ID);
+}
+
+/** Folder for email-PDF archives — optional override, else the Signals folder. */
+export function emailPdfFolderId(): string {
+  return (
+    process.env.GOOGLE_DRIVE_EMAIL_PDF_FOLDER_ID?.trim() ||
+    process.env.GOOGLE_DRIVE_SIGNALS_FOLDER_ID?.trim() ||
+    ""
+  );
+}
+
+export function gmailAttachmentKey(messageId: string, attachmentId: string): string {
+  return `${messageId}:${attachmentId}`;
+}
+
+function mapDriveFile(f: Record<string, unknown>): DriveDoc {
+  const modifiedMs = f.modifiedTime ? Date.parse(String(f.modifiedTime)) || 0 : 0;
+  return {
+    id: String(f.id || ""),
+    name: String(f.name || "Untitled"),
+    mimeType: String(f.mimeType || ""),
+    modifiedTime: modifiedMs,
+    modifiedLabel: toLabel(modifiedMs),
+    webViewLink: String(f.webViewLink || ""),
+    sizeBytes: Number(f.size) || 0,
+  };
 }
 
 function toLabel(ms: number): string {
@@ -101,7 +133,8 @@ export async function listDriveDocs(limit = 25): Promise<DriveFeedResult> {
     console.error(`[drive] /files ${res.status}: ${body.slice(0, 300)}`);
     let error = `Drive API error ${res.status}.`;
     if (res.status === 401 || /insufficient.*scope|ACCESS_TOKEN_SCOPE/i.test(body)) {
-      error = "Google token lacks Drive access — re-run mint-google-token.mjs (now requests drive.readonly) and update GOOGLE_REFRESH_TOKEN.";
+      error =
+        "Google token lacks Drive access — re-run mint-google-token.mjs (requests drive write scope) and update GOOGLE_REFRESH_TOKEN.";
     } else if (res.status === 403) {
       error = "No permission for this folder/drive, or the Drive API isn't enabled in the Google Cloud project.";
     } else if (res.status === 404) {
@@ -117,21 +150,126 @@ export async function listDriveDocs(limit = 25): Promise<DriveFeedResult> {
     return { configured: true, found: false, docs: [], error: "Drive returned an unreadable response." };
   }
 
-  const docs: DriveDoc[] = (data.files || []).map((f) => {
-    const modifiedMs = f.modifiedTime ? Date.parse(String(f.modifiedTime)) || 0 : 0;
-    return {
-      id: String(f.id || ""),
-      name: String(f.name || "Untitled"),
-      mimeType: String(f.mimeType || ""),
-      modifiedTime: modifiedMs,
-      modifiedLabel: toLabel(modifiedMs),
-      webViewLink: String(f.webViewLink || ""),
-      sizeBytes: Number(f.size) || 0,
-    };
-  });
+  const docs: DriveDoc[] = (data.files || []).map(mapDriveFile);
 
   return { configured: true, found: true, docs };
 }
+
+/** Find a previously archived Gmail attachment by its stable appProperties key. */
+export async function findDriveFileByGmailAttachment(
+  messageId: string,
+  attachmentId: string,
+): Promise<DriveDoc | null> {
+  const folderId = emailPdfFolderId();
+  if (!folderId || !messageId || !attachmentId) return null;
+
+  const key = gmailAttachmentKey(messageId, attachmentId).replace(/'/g, "\\'");
+  const safeFolder = folderId.replace(/'/g, "\\'");
+  const driveId = process.env.GOOGLE_SHARED_DRIVE_ID;
+  const params = new URLSearchParams({
+    q: `'${safeFolder}' in parents and trashed=false and appProperties has { key='${GMAIL_ATTACH_PROP}' and value='${key}' }`,
+    fields: "files(id,name,mimeType,modifiedTime,webViewLink,size)",
+    pageSize: "1",
+    supportsAllDrives: "true",
+    includeItemsFromAllDrives: "true",
+  });
+  if (driveId) {
+    params.set("corpora", "drive");
+    params.set("driveId", driveId);
+  }
+
+  let token: string;
+  try {
+    token = await getAccessToken();
+  } catch (e) {
+    console.error("[drive] auth failed (find):", e);
+    return null;
+  }
+
+  try {
+    const res = await fetch(`${DRIVE_API}/files?${params.toString()}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      console.error(`[drive] find by appProperties ${res.status}: ${body.slice(0, 200)}`);
+      return null;
+    }
+    const data = (await res.json()) as { files?: Array<Record<string, unknown>> };
+    const f = data.files?.[0];
+    return f ? mapDriveFile(f) : null;
+  } catch (e) {
+    console.error("[drive] find network error:", e);
+    return null;
+  }
+}
+
+/** Upload a PDF (base64) into the email-PDF / Signals folder. */
+export async function uploadDriveFile(opts: {
+  name: string;
+  mimeType?: string;
+  base64: string;
+  folderId?: string;
+  appProperties?: Record<string, string>;
+}): Promise<DriveDoc | null> {
+  const folderId = opts.folderId || emailPdfFolderId();
+  if (!folderId || !opts.base64) return null;
+
+  let token: string;
+  try {
+    token = await getAccessToken();
+  } catch (e) {
+    console.error("[drive] auth failed (upload):", e);
+    return null;
+  }
+
+  const mimeType = opts.mimeType || "application/pdf";
+  const metadata: Record<string, unknown> = {
+    name: opts.name || "attachment.pdf",
+    mimeType,
+    parents: [folderId],
+  };
+  if (opts.appProperties && Object.keys(opts.appProperties).length > 0) {
+    metadata.appProperties = opts.appProperties;
+  }
+
+  const boundary = `dtc_boundary_${Date.now().toString(36)}`;
+  const binary = Buffer.from(opts.base64, "base64");
+  const preamble =
+    `--${boundary}\r\n` +
+    `Content-Type: application/json; charset=UTF-8\r\n\r\n` +
+    `${JSON.stringify(metadata)}\r\n` +
+    `--${boundary}\r\n` +
+    `Content-Type: ${mimeType}\r\n` +
+    `Content-Transfer-Encoding: binary\r\n\r\n`;
+  const epilogue = `\r\n--${boundary}--`;
+  const body = Buffer.concat([Buffer.from(preamble, "utf8"), binary, Buffer.from(epilogue, "utf8")]);
+
+  try {
+    const res = await fetch(
+      `${DRIVE_UPLOAD_API}/files?uploadType=multipart&supportsAllDrives=true&fields=id,name,mimeType,modifiedTime,webViewLink,size`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": `multipart/related; boundary=${boundary}`,
+        },
+        body,
+      },
+    );
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => "");
+      console.error(`[drive] upload ${res.status}: ${errBody.slice(0, 300)}`);
+      return null;
+    }
+    const data = (await res.json()) as Record<string, unknown>;
+    return mapDriveFile(data);
+  } catch (e) {
+    console.error("[drive] upload network error:", e);
+    return null;
+  }
+}
+
 
 // Download one file's raw bytes and return them base64-encoded, ready to drop
 // into an Anthropic `document` content block. Returns null on any failure so the

@@ -4,9 +4,19 @@ import {
   isGmailConfigured,
   getActivityAliases,
   getNewsAliases,
+  downloadGmailAttachment,
   type GmailMessage,
   type GmailAttachment,
 } from "./gmail.server";
+import {
+  emailPdfFolderId,
+  findDriveFileByGmailAttachment,
+  uploadDriveFile,
+  gmailAttachmentKey,
+  GMAIL_ATTACH_PROP,
+  MAX_ARCHIVE_PDF_BYTES,
+  type DriveDoc,
+} from "./drive.server";
 import { buildContacts, buildPortfolioCompanies } from "./sheets.server";
 import { fetchLinkPreviews, type LinkPreview } from "./link-preview.server";
 import { appendDigestLinkSignals } from "./signal-store.server";
@@ -41,6 +51,8 @@ export interface GmailSignal {
   linkUrl?: string;
   /** Subject of the digest email the link arrived in (provenance). */
   digestSubject?: string;
+  /** Durable Drive copy of an attached PDF (when archived). */
+  docUrl?: string;
 }
 
 export interface GmailFeedResult {
@@ -56,6 +68,50 @@ export interface NewsAliasDoc extends GmailAttachment {
   messageId: string;
   subject: string;
   permalink: string;
+  /** Drive webViewLink after archive (preferred citation / Open in Drive). */
+  driveWebViewLink?: string;
+}
+
+/**
+ * Archive one Gmail PDF into Drive (deduped by appProperties). Best-effort —
+ * failures return null and never block the feed or scan.
+ */
+async function archiveGmailPdfToDrive(opts: {
+  messageId: string;
+  attachmentId: string;
+  filename: string;
+  mimeType?: string;
+  sizeBytes?: number;
+}): Promise<DriveDoc | null> {
+  if (!emailPdfFolderId()) return null;
+  if (!opts.messageId || !opts.attachmentId) return null;
+  if (opts.sizeBytes && opts.sizeBytes > MAX_ARCHIVE_PDF_BYTES) {
+    console.warn(
+      `[gmail→drive] skip ${opts.filename}: ${opts.sizeBytes} bytes exceeds ${MAX_ARCHIVE_PDF_BYTES}`,
+    );
+    return null;
+  }
+
+  try {
+    const existing = await findDriveFileByGmailAttachment(opts.messageId, opts.attachmentId);
+    if (existing?.webViewLink) return existing;
+
+    const base64 = await downloadGmailAttachment(opts.messageId, opts.attachmentId);
+    if (!base64) return null;
+
+    const safeName = (opts.filename || "attachment.pdf").replace(/[\\/:*?"<>|]+/g, "_");
+    return await uploadDriveFile({
+      name: safeName,
+      mimeType: opts.mimeType || "application/pdf",
+      base64,
+      appProperties: {
+        [GMAIL_ATTACH_PROP]: gmailAttachmentKey(opts.messageId, opts.attachmentId),
+      },
+    });
+  } catch (e) {
+    console.error(`[gmail→drive] archive failed for ${opts.filename}:`, e);
+    return null;
+  }
 }
 
 const FREE_EMAIL = new Set([
@@ -200,6 +256,54 @@ export async function gatherNetworkEmails(pre?: {
       })),
     );
 
+  // Archive PDF attachments from the feed window into Drive so analysts can
+  // open/read them later. Deduped by Gmail attachment key; best-effort.
+  // Prefer NEWS@ docs first, then any other kept-message PDFs.
+  const driveByMessage = new Map<string, string>();
+  if (emailPdfFolderId()) {
+    const seenAttach = new Set<string>();
+    const toArchive: Array<{
+      messageId: string;
+      attachmentId: string;
+      filename: string;
+      mimeType: string;
+      sizeBytes: number;
+    }> = [];
+    const pushAttach = (m: GmailMessage, a: GmailAttachment) => {
+      const k = `${m.id}:${a.attachmentId}`;
+      if (seenAttach.has(k)) return;
+      seenAttach.add(k);
+      toArchive.push({
+        messageId: m.id,
+        attachmentId: a.attachmentId,
+        filename: a.filename,
+        mimeType: a.mimeType,
+        sizeBytes: a.sizeBytes,
+      });
+    };
+    for (const m of kept.filter(isNewsAliasMsg)) {
+      for (const a of m.attachments || []) pushAttach(m, a);
+    }
+    for (const m of kept) {
+      for (const a of m.attachments || []) pushAttach(m, a);
+    }
+
+    for (const job of toArchive) {
+      const archived = await archiveGmailPdfToDrive(job);
+      if (!archived?.webViewLink) continue;
+      if (!driveByMessage.has(job.messageId)) {
+        driveByMessage.set(job.messageId, archived.webViewLink);
+      }
+      const news = newsDocs.find(
+        (d) => d.messageId === job.messageId && d.attachmentId === job.attachmentId,
+      );
+      if (news) news.driveWebViewLink = archived.webViewLink;
+    }
+    if (driveByMessage.size > 0) {
+      console.log(`[gmail→drive] archived/linked ${driveByMessage.size} message PDF(s)`);
+    }
+  }
+
   // Link-digest emails (e.g. the weekly "Portco blogs" forward) become one
   // signal per article, attributed to the ARTICLE's company — the raw email
   // card (headers + a wall of URLs) is meaningless and is dropped.
@@ -254,6 +358,7 @@ export async function gatherNetworkEmails(pre?: {
         dateLabel: m.dateLabel,
         permalink: m.permalink,
         logoDomain: emailDomain(partyEmail) || undefined,
+        docUrl: driveByMessage.get(m.id),
       },
     ];
   });

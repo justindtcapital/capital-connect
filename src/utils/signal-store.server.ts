@@ -137,7 +137,7 @@ export function storedFromRec(
     urgency: String(r.urgency || ""),
     timing: r.timing || "",
     sourceType: newsSourceType(r.category, isPortco, r.sourceUrl),
-    docUrl: driveDocUrl(r.sourceUrl),
+    docUrl: (r.docUrl || "").trim() || driveDocUrl(r.sourceUrl),
     hasBody: Boolean((r.body || "").trim()),
   };
 }
@@ -167,7 +167,7 @@ export function storedFromAwareness(
     urgency: "",
     timing: "",
     sourceType: newsSourceType(a.category, isPortco, a.sourceUrl),
-    docUrl: driveDocUrl(a.sourceUrl),
+    docUrl: (a.docUrl || "").trim() || driveDocUrl(a.sourceUrl),
     hasBody: false,
   };
 }

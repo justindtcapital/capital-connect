@@ -15,6 +15,7 @@
 
 import { getVertexProject, getVertexLocation, getServiceAccountJson } from "./google.server";
 import { articleUrlKey } from "./news.server";
+import { companiesMatch } from "@/lib/attribution-score";
 
 export const GEMINI_MODEL = "gemini-2.5-flash";
 
@@ -725,9 +726,9 @@ Method:
 1. SEARCH the web (Google Search) for recent developments (within the configured window) about the listed portfolio companies, their sectors/themes, and the listed network companies. Search liberally; prefer reputable sources (company blogs, news outlets, regulatory filings). Do NOT fabricate news — every signal must be grounded in a real search result with a URL. You may ALSO be given attached internal PDF documents from the firm's shared drive: treat them as trusted first-party context to corroborate, enrich, or originate signals, and cite such a signal via the document link provided in the prompt.
 2. CATEGORIZE each real signal into exactly one of: "Funding/M&A", "Product/Milestone", "Executive Movement", "Thought Leadership", "Partnership/Customer Win", "Crisis/Regulatory", "Industry Trend", "Personal Milestone".
 3. ATTRIBUTE each signal to one or more people from the provided network list, with a relevance score 1-10. Set "company" to the company the STORY is about (the news subject), not necessarily the person's employer.
-   - CRITICAL for PORTFOLIO COMPANIES: never recommend outreach to someone who works AT that portfolio company about its own news — they already know. Attribute instead to OTHER network people (investors, peers at other companies, customers, advisors, operators in the same sector).
+   - CRITICAL for PORTFOLIO COMPANIES: NEVER recommend outreach about a portfolio company's news to anyone who works at ANY portfolio company (people tagged [PORTFOLIO] in the network list) — not the subject company's own employees (they already know), and not employees of sibling portfolio companies. Portfolio news routes to the EXTERNAL network only (investors, customers, advisors, operators at non-portfolio companies).
    - Prefer strong-indirect (same sector + thesis overlap) and warm-connection (investor/advisor/portfolio overlap). Direct employment at the news-subject company must NOT be used for portfolio-company stories.
-   - ONLY produce an outreach recommendation when relevance >= 7.
+   - ONLY produce an outreach recommendation when relevance >= 7 AND the fit is specific enough that the email would feel personally relevant to that exact person. QUALITY OVER QUANTITY: zero recommendations is a perfectly good outcome — when in doubt, put the signal in otherSignals instead.
 4. DRAFT outreach for each qualifying attribution: a warm personalized subject (<8 words) and a 2-3 sentence body that references the specific signal, adds genuine value, and suggests a concrete next step (congrats, call, intro, share insight). Never spammy or purely self-serving. Use the person's real email from the list.
 5. FLAG any compliance/confidentiality concerns (e.g. material non-public info, regulated communications) in the compliance array.
 
@@ -746,7 +747,7 @@ Output ONLY a single JSON object, no prose, no markdown fences, in exactly this 
   ],
   "compliance": []
 }
-Sort recommendations by relevance then urgency (highest first) and include at most 8. Put real-but-lower-relevance or unattributed signals in otherSignals (at most 12). Keep every string field short — do not pad. If you find no real signals, return empty arrays. Body text uses real \\n newlines.`;
+Sort recommendations by relevance then urgency (highest first) and include at most 8 — fewer, stronger recommendations beat many weak ones, and an empty recommendations array is fine. Put real-but-lower-relevance or unattributed signals in otherSignals (at most 12). Keep every string field short — do not pad. If you find no real signals, return empty arrays. Body text uses real \\n newlines.`;
 
 function buildSignalPrompt(input: SignalScanInput): string {
   const lines: string[] = [];
@@ -775,10 +776,15 @@ function buildSignalPrompt(input: SignalScanInput): string {
     for (const t of input.topics) lines.push(`- ${t}`);
   }
   lines.push("");
-  lines.push("NETWORK PEOPLE (attribution pool — Name | Company | sector | email):");
+  lines.push(
+    "NETWORK PEOPLE (attribution pool — Name | Company | sector | email). People tagged [PORTFOLIO] work at a portfolio company: they may be attributed to non-portfolio stories, but must NEVER get an outreach recommendation about portfolio-company news:",
+  );
+  const portcoNameList = input.portcos.map((p) => p.name);
   for (const person of input.people) {
+    const atPortco =
+      person.company && portcoNameList.some((n) => companiesMatch(n, person.company || ""));
     lines.push(
-      `- ${person.name} | ${person.company || ""} | ${person.sector || ""} | ${person.email || ""}`,
+      `- ${person.name} | ${person.company || ""}${atPortco ? " [PORTFOLIO]" : ""} | ${person.sector || ""} | ${person.email || ""}`,
     );
   }
   if (input.documents && input.documents.length > 0) {

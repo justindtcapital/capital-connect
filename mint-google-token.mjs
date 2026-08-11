@@ -18,11 +18,12 @@ import { spawn } from "node:child_process";
 
 const PORT = 53682;
 const REDIRECT_URI = `http://localhost:${PORT}/`;
-// Sheets (read/write the CRM workbook) + Drive read-only (pull shared-drive PDFs
-// into the Signals tab) + Gmail read-only (pull network emails into Signals).
+// Sheets (read/write the CRM workbook) + Drive (list Signals PDFs + archive
+// Gmail PDF attachments into the Signals folder) + Gmail read-only.
+// `drive` replaces `drive.readonly` so uploads into the shared folder work.
 const SCOPE = [
   "https://www.googleapis.com/auth/spreadsheets",
-  "https://www.googleapis.com/auth/drive.readonly",
+  "https://www.googleapis.com/auth/drive",
   "https://www.googleapis.com/auth/gmail.readonly",
 ].join(" ");
 

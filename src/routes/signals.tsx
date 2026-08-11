@@ -1391,9 +1391,9 @@ function SignalsPage() {
                                     target="_blank"
                                     rel="noopener noreferrer"
                                     className="inline-flex items-center gap-1.5 text-xs font-medium text-primary hover:underline"
-                                    title="Archived copy saved to Drive"
+                                    title="Open the archived PDF in Google Drive"
                                   >
-                                    Saved copy
+                                    Open in Drive
                                     <FileText className="h-3.5 w-3.5" />
                                   </a>
                                 )}

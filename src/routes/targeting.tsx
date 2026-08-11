@@ -133,9 +133,20 @@ export const Route = createFileRoute("/targeting")({
   head: () => ({
     meta: [
       { title: "Targeting — VenturePulse" },
-      { name: "description", content: "DTC network prospecting pipeline" },
+      {
+        name: "description",
+        content:
+          "DTC network prospecting pipeline: build target account lists, enrich leads and track outreach from first touch to warm intro.",
+      },
+      { property: "og:title", content: "Targeting — VenturePulse" },
+      {
+        property: "og:description",
+        content:
+          "DTC network prospecting pipeline: build target account lists, enrich leads and track outreach from first touch to warm intro.",
+      },
     ],
   }),
+
   loader: async () => {
     const [targets, companies] = await Promise.all([
       fetchTargets(),

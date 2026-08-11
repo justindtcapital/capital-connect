@@ -59,9 +59,20 @@ export const Route = createFileRoute("/dashboard")({
   head: () => ({
     meta: [
       { title: "Dashboard — VenturePulse" },
-      { name: "description", content: "DTC network analytics and insights" },
+      {
+        name: "description",
+        content:
+          "DTC network analytics and insights: relationship coverage, engagement trends, pipeline health and portfolio intelligence charts.",
+      },
+      { property: "og:title", content: "Dashboard — VenturePulse" },
+      {
+        property: "og:description",
+        content:
+          "DTC network analytics and insights: relationship coverage, engagement trends, pipeline health and portfolio intelligence charts.",
+      },
     ],
   }),
+
   validateSearch: (search: Record<string, unknown>) => ({ cf: parseCfParam(search.cf) }),
   loader: async () => {
     const [contacts, transitions, asana, portfolio] = await Promise.all([

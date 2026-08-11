@@ -404,7 +404,12 @@ function HomePage() {
       <section className="flex flex-col lg:flex-row lg:items-center gap-8 lg:gap-12">
         <div className="flex-1 min-w-0 space-y-3">
           <h1 className="font-display text-3xl sm:text-[2rem] font-semibold text-foreground tracking-tight">
-            {greetingFor(now.getHours())}, {name}
+            <span aria-hidden="true">
+              {greetingFor(now.getHours())}, {name}
+            </span>
+            <span className="sr-only">
+              Network Intelligence Dashboard — {greetingFor(now.getHours())}, {name}
+            </span>
           </h1>
           <p className="text-sm text-muted-foreground max-w-md">
             {longDate}

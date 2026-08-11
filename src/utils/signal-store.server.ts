@@ -260,7 +260,7 @@ export async function fetchStoredSignals(
   );
 }
 
-// ── Digest-link archiving ────────────────────────────────────────
+// ── Digest-link + NEWS@ research archiving ───────────────────────
 
 function urlKey(u: string): string {
   return articleUrlKey(u);
@@ -302,6 +302,53 @@ function storedFromDigestLink(
     timing: "",
     sourceType: newsSourceType("Thought Leadership", isPortco, s.linkUrl),
     docUrl: "",
+    hasBody: false,
+  };
+}
+
+/** NEWS@ research entity (e.g. Siemens from a 451 subject list) → awareness row. */
+function storedFromResearchDigest(
+  s: GmailSignal,
+  portcoNames: Set<string>,
+  watchNames: Set<string>,
+  networkCompanyNames: Set<string>,
+): StoredSignal {
+  const companyKey = (s.company || "").trim().toLowerCase();
+  const isPortco = portcoNames.has(companyKey);
+  const isWatch = watchNames.has(companyKey);
+  const networkContactCount = networkCompanyNames.has(companyKey) ? 1 : 0;
+  const cfg = DEFAULT_SIGNAL_CONFIG;
+  const title = (s.subject || "").trim();
+  const headline =
+    digestHeadline(s.snippet || "", title) ||
+    `${s.company} — industry research`;
+  // Stable per company-within-email so Siemens + EnergyHub from the same forward
+  // don't collapse together (they share the Gmail permalink).
+  const identity = `${s.permalink || ""}|${s.company || ""}|${title}`;
+  const proxy = awarenessRelevanceProxy({ isPortco, isWatch, networkContactCount }, cfg);
+  // NEWS@ is an intentional forward inbox — always clear the soft gate.
+  const relevance = Math.max(proxy, 6);
+  return {
+    id: signalId("awareness", s.company || "", identity),
+    dateFound: s.dateLabel || new Date().toISOString().split("T")[0],
+    type: "awareness",
+    status: "New",
+    person: "",
+    company: s.company || "",
+    email: "",
+    category: "Industry Research",
+    signal: clampHeadline(headline),
+    sourceUrl: s.permalink || "",
+    subject: clampText(title, 200),
+    body: "",
+    relevance,
+    justification: s.digestSubject
+      ? `NEWS@ · ${s.digestSubject}`
+      : "NEWS@ research forward",
+    urgency: "",
+    timing: "",
+    sourceType: s.sourceHint || "Industry Reports",
+    docUrl: (s.docUrl || "").trim(),
     hasBody: false,
   };
 }
@@ -350,6 +397,43 @@ export async function appendDigestLinkSignals(
   if (toAppend.length > 0) {
     // Stored WITHOUT event clustering — see module header. The nightly
     // reconcile clusters rows that arrive here missing an Event ID.
+    await appendSheetRows(TAB_NAMES.signals, toAppend.map(rowFromStored));
+  }
+  return toAppend.length;
+}
+
+/**
+ * Archive NEWS@ research cards (451 / Gartner subject explosions, PDF titles)
+ * to the Signals tab. Deduped by content key (company + permalink + headline)
+ * so reloads don't duplicate. Returns rows appended.
+ */
+export async function appendResearchDigestSignals(
+  signals: GmailSignal[],
+  portcoNames: Set<string>,
+  opts: DigestArchiveOpts = {},
+): Promise<number> {
+  const research = signals.filter(
+    (s) => s.sourceHint === "Industry Reports" && !s.linkUrl && (s.company || s.subject),
+  );
+  if (research.length === 0) return 0;
+
+  const watchNames = opts.watchNames || new Set<string>();
+  const networkCompanyNames = opts.networkCompanyNames || new Set<string>();
+  const cfg = DEFAULT_SIGNAL_CONFIG;
+
+  const existing = await fetchStoredSignals();
+  const seenKeys = new Set(existing.map(keyForStored));
+
+  const toAppend: StoredSignal[] = [];
+  for (const s of research) {
+    const stored = storedFromResearchDigest(s, portcoNames, watchNames, networkCompanyNames);
+    if (!passesAwarenessQualityGate(stored, cfg)) continue;
+    const k = keyForStored(stored);
+    if (seenKeys.has(k)) continue;
+    seenKeys.add(k);
+    toAppend.push(stored);
+  }
+  if (toAppend.length > 0) {
     await appendSheetRows(TAB_NAMES.signals, toAppend.map(rowFromStored));
   }
   return toAppend.length;

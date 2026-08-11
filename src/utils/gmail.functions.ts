@@ -19,7 +19,7 @@ import {
 } from "./drive.server";
 import { buildContacts, buildPortfolioCompanies } from "./sheets.server";
 import { fetchLinkPreviews, type LinkPreview } from "./link-preview.server";
-import { appendDigestLinkSignals } from "./signal-store.server";
+import { appendDigestLinkSignals, appendResearchDigestSignals } from "./signal-store.server";
 import {
   isLinkDigest,
   titleFromSlug,
@@ -450,32 +450,43 @@ export async function gatherNetworkEmails(pre?: {
     ];
   });
 
-  // Archive the exploded digest links to the Signals sheet so they outlive the
-  // Gmail search window. Best-effort — a Sheets hiccup never breaks the feed.
-  if (pre?.persistDigest && digestLinks.size > 0) {
-    try {
-      const portcoNames = new Set(portfolio.map((p) => p.name.trim().toLowerCase()));
-      const networkCompanyNames = new Set(
-        contacts.map((c) => (c.company || "").trim().toLowerCase()).filter(Boolean),
-      );
-      let watchNames = new Set<string>();
+  // Archive exploded digest links + NEWS@ research cards to the Signals sheet
+  // so they outlive the Gmail search window. Best-effort — a Sheets hiccup
+  // never breaks the feed.
+  if (pre?.persistDigest) {
+    const hasLinks = digestLinks.size > 0;
+    const hasResearch = emails.some((e) => e.sourceHint === "Industry Reports" && !e.linkUrl);
+    if (hasLinks || hasResearch) {
       try {
-        // Dynamic import avoids a top-level gmail ↔ platform cycle (platform
-        // pulls gemini.server, which gmail also reaches via the scan path).
-        const { buildRadarWatchlist } = await import("./platform.server");
-        watchNames = new Set(
-          (await buildRadarWatchlist()).map((w) => w.company.trim().toLowerCase()),
+        const portcoNames = new Set(portfolio.map((p) => p.name.trim().toLowerCase()));
+        const networkCompanyNames = new Set(
+          contacts.map((c) => (c.company || "").trim().toLowerCase()).filter(Boolean),
         );
-      } catch {
-        /* watchlist unavailable — proxy falls back to portco/network only */
+        let watchNames = new Set<string>();
+        try {
+          // Dynamic import avoids a top-level gmail ↔ platform cycle (platform
+          // pulls gemini.server, which gmail also reaches via the scan path).
+          const { buildRadarWatchlist } = await import("./platform.server");
+          watchNames = new Set(
+            (await buildRadarWatchlist()).map((w) => w.company.trim().toLowerCase()),
+          );
+        } catch {
+          /* watchlist unavailable — proxy falls back to portco/network only */
+        }
+        const archiveOpts = { watchNames, networkCompanyNames };
+        if (hasLinks) {
+          const added = await appendDigestLinkSignals(emails, portcoNames, archiveOpts);
+          if (added > 0)
+            console.log(`[gmail] archived ${added} digest link signal(s) to Signals tab`);
+        }
+        if (hasResearch) {
+          const added = await appendResearchDigestSignals(emails, portcoNames, archiveOpts);
+          if (added > 0)
+            console.log(`[gmail] archived ${added} NEWS@ research signal(s) to Signals tab`);
+        }
+      } catch (e) {
+        console.error("[gmail] signal archiving failed (feed unaffected):", e);
       }
-      const added = await appendDigestLinkSignals(emails, portcoNames, {
-        watchNames,
-        networkCompanyNames,
-      });
-      if (added > 0) console.log(`[gmail] archived ${added} digest link signal(s) to Signals tab`);
-    } catch (e) {
-      console.error("[gmail] digest signal archiving failed (feed unaffected):", e);
     }
   }
 

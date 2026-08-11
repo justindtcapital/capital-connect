@@ -15,7 +15,7 @@
 // Everything degrades gracefully when GOOGLE_DRIVE_SIGNALS_FOLDER_ID is unset
 // (isDriveConfigured() === false), mirroring the LinkedIn connector.
 
-import { createHash } from "node:crypto";
+import { sha256Hex } from "./sha256";
 import { getAccessToken } from "./sheets.server";
 import { driveFileViewUrl } from "@/lib/safe-url";
 

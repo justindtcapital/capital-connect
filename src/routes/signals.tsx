@@ -23,6 +23,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { useAuth } from "@/lib/auth-context";
+import { absoluteHttpUrl } from "@/lib/safe-url";
 import type { Contact, PortfolioCompany } from "@/lib/types";
 import {
   buildFeed,
@@ -1373,9 +1374,9 @@ function SignalsPage() {
                                   <MarkdownMessage text={bodies[card.id]} />
                                 ) : null)}
                               <div className="flex items-center gap-2 flex-wrap">
-                                {card.sourceUrl && (
+                                {absoluteHttpUrl(card.sourceUrl) && (
                                   <a
-                                    href={card.sourceUrl}
+                                    href={absoluteHttpUrl(card.sourceUrl)}
                                     target="_blank"
                                     rel="noopener noreferrer"
                                     onClick={() => logFeedback(card, "clicked_source")}
@@ -1385,9 +1386,10 @@ function SignalsPage() {
                                     <ExternalLink className="h-3.5 w-3.5" />
                                   </a>
                                 )}
-                                {card.docUrl && card.docUrl !== card.sourceUrl && (
+                                {absoluteHttpUrl(card.docUrl) &&
+                                  absoluteHttpUrl(card.docUrl) !== absoluteHttpUrl(card.sourceUrl) && (
                                   <a
-                                    href={card.docUrl}
+                                    href={absoluteHttpUrl(card.docUrl)}
                                     target="_blank"
                                     rel="noopener noreferrer"
                                     className="inline-flex items-center gap-1.5 text-xs font-medium text-primary hover:underline"

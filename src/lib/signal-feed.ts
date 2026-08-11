@@ -8,6 +8,7 @@ import type { DriveDoc } from "@/utils/drive.server";
 import type { GmailSignal } from "@/utils/gmail.functions";
 import type { Contact, PortfolioCompany } from "@/lib/types";
 import { domainFromCompanySourceUrl, resolveCompanyLogoDomain } from "@/lib/domain-utils";
+import { absoluteHttpUrl } from "@/lib/safe-url";
 import { makeScorer, type SignalInsight } from "@/lib/signal-strength";
 
 export type SignalSourceType =
@@ -534,9 +535,9 @@ export function buildFeed(input: BuildFeedInput): FeedCard[] {
       segmentBucket: bucketOf(seg),
       headline: d.name,
       summary: "Shared-drive document — included as context in scans.",
-      body: `Shared-drive PDF.${d.webViewLink ? ` [Open in Drive](${d.webViewLink})` : ""}`,
-      sourceUrl: d.webViewLink,
-      docUrl: d.webViewLink || undefined,
+      body: `Shared-drive PDF.${absoluteHttpUrl(d.webViewLink) ? ` [Open in Drive](${absoluteHttpUrl(d.webViewLink)})` : ""}`,
+      sourceUrl: absoluteHttpUrl(d.webViewLink) || undefined,
+      docUrl: absoluteHttpUrl(d.webViewLink) || undefined,
       initial: initialOf(d.name),
       sortTs: ts,
       timeLabel: relativeTime(ts),
@@ -608,10 +609,12 @@ export function buildFeed(input: BuildFeedInput): FeedCard[] {
       summary: e.snippet || e.body.slice(0, 160),
       body:
         (e.body || e.snippet || "_(no body)_") +
-        (e.docUrl ? `\n\n[Open PDF in Drive](${e.docUrl})` : ""),
+        (absoluteHttpUrl(e.docUrl)
+          ? `\n\n[Open PDF in Drive](${absoluteHttpUrl(e.docUrl)})`
+          : ""),
       sourceUrl: e.permalink, // real Gmail permalink → durable
       sourceIsSearch: false,
-      docUrl: e.docUrl || undefined,
+      docUrl: absoluteHttpUrl(e.docUrl) || undefined,
       logoDomain: logo.domain,
       logoConfident: logo.confident,
       initial: initialOf(company),

@@ -15,13 +15,16 @@
 // Everything degrades gracefully when GOOGLE_DRIVE_SIGNALS_FOLDER_ID is unset
 // (isDriveConfigured() === false), mirroring the LinkedIn connector.
 
+import { createHash } from "node:crypto";
 import { getAccessToken } from "./sheets.server";
+import { driveFileViewUrl } from "@/lib/safe-url";
 
 const DRIVE_API = "https://www.googleapis.com/drive/v3";
 const DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3";
 /** Soft ceiling for archiving email PDFs (Gmail attachments are usually smaller). */
 export const MAX_ARCHIVE_PDF_BYTES = 25_000_000;
-export const GMAIL_ATTACH_PROP = "gmailAttachmentKey";
+/** Short appProperties key — Drive caps key+value at 124 UTF-8 bytes. */
+export const GMAIL_ATTACH_PROP = "gak";
 
 export interface DriveDoc {
   id: string;
@@ -59,19 +62,25 @@ export function emailPdfFolderId(): string {
   );
 }
 
+/** Stable short fingerprint for a Gmail attachment (fits Drive appProperties). */
 export function gmailAttachmentKey(messageId: string, attachmentId: string): string {
-  return `${messageId}:${attachmentId}`;
+  return createHash("sha256")
+    .update(`${messageId}:${attachmentId}`)
+    .digest("hex")
+    .slice(0, 40);
 }
 
 function mapDriveFile(f: Record<string, unknown>): DriveDoc {
+  const id = String(f.id || "");
   const modifiedMs = f.modifiedTime ? Date.parse(String(f.modifiedTime)) || 0 : 0;
+  const webViewLink = String(f.webViewLink || "").trim() || driveFileViewUrl(id);
   return {
-    id: String(f.id || ""),
+    id,
     name: String(f.name || "Untitled"),
     mimeType: String(f.mimeType || ""),
     modifiedTime: modifiedMs,
     modifiedLabel: toLabel(modifiedMs),
-    webViewLink: String(f.webViewLink || ""),
+    webViewLink,
     sizeBytes: Number(f.size) || 0,
   };
 }

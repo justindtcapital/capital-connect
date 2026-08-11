@@ -1,6 +1,7 @@
-import { createElement, type ReactElement } from "react";
+import { createElement, type ReactElement, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { absoluteHttpUrl } from "@/lib/safe-url";
 
 // A markdown renderer tuned for the Query chat bubble. Renders headings, lists,
 // GitHub-flavored tables, code, and links cleanly with the app's muted theme,
@@ -37,9 +38,25 @@ const components = {
   th: tag("th", "text-left font-semibold px-2 py-1 border-b border-border whitespace-nowrap"),
   td: tag("td", "px-2 py-1 align-top"),
   a: (props: MdProps): ReactElement => {
-    const { node: _node, ...rest } = props;
+    const { node: _node, href, children, ...rest } = props;
     void _node;
-    return createElement("a", { target: "_blank", rel: "noopener noreferrer", className: "text-primary underline underline-offset-2", ...rest });
+    const safe = absoluteHttpUrl(typeof href === "string" ? href : "");
+    // Relative junk (e.g. "drive/") must not become <a href="drive/"> — that
+    // resolves to host "drive" and DNSes NXDOMAIN.
+    if (!safe) {
+      return createElement("span", { className: "text-primary" }, children as ReactNode);
+    }
+    return createElement(
+      "a",
+      {
+        ...rest,
+        href: safe,
+        target: "_blank",
+        rel: "noopener noreferrer",
+        className: "text-primary underline underline-offset-2",
+      },
+      children as ReactNode,
+    );
   },
   // Wrap tables so wide ones scroll horizontally inside the bubble.
   table: (props: MdProps): ReactElement => {

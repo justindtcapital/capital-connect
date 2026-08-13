@@ -75,12 +75,22 @@ export interface Counterparty {
   name: string;
   email: string;
   role: "from" | "to" | "cc";
+  /** Our side (team roster / internal domains) — never the relationship contact
+   *  while an external human is on the thread. Absent = external. */
+  internal?: boolean;
 }
 
 /**
  * Pick the real relationship person for a BD/GTM row.
- * Inbound (to alias): prefer From.
- * Outbound (from alias): prefer first non-noise To, then Cc.
+ *
+ * External (non-internal) people always outrank internal teammates — the team
+ * forwards/CCs threads to the tracking alias, so without this the internal
+ * forwarder on the From line wins and every row logs against them. Internal
+ * people are the fallback only when no external human is on the thread.
+ *
+ * Within each pool, role order follows direction:
+ *   outbound (an internal person or the alias sent it): To, then Cc, then From.
+ *   inbound  (an external person sent it): From, then To, then Cc.
  */
 export function pickPrimaryCounterparty(
   people: Counterparty[],
@@ -88,8 +98,14 @@ export function pickPrimaryCounterparty(
 ): Counterparty | undefined {
   const clean = people.filter((p) => p.email && !isNoiseEmail(p.email));
   if (clean.length === 0) return undefined;
-  if (outbound) {
-    return clean.find((p) => p.role === "to") || clean.find((p) => p.role === "cc") || clean[0];
-  }
-  return clean.find((p) => p.role === "from") || clean[0];
+  const order: Counterparty["role"][] = outbound ? ["to", "cc", "from"] : ["from", "to", "cc"];
+  const byRole = (pool: Counterparty[]) => {
+    for (const role of order) {
+      const hit = pool.find((p) => p.role === role);
+      if (hit) return hit;
+    }
+    return pool[0];
+  };
+  const external = clean.filter((p) => !p.internal);
+  return external.length > 0 ? byRole(external) : byRole(clean);
 }

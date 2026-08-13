@@ -2,6 +2,10 @@
 // process.env.GOOGLE_* reads in one module gives one place to validate, one
 // place to log safely (presence + length only — NEVER the value), and no
 // scattered fallback drift between callers. Import ONLY from server modules.
+//
+// IMPORTANT: do NOT import node:fs (or other Node builtins) at module top-level.
+// createServerFn client stubs can still evaluate this file via sheets/gmail
+// import chains; a top-level `node:fs` import whitescreens the SPA.
 
 function present(v: string | undefined): boolean {
   return Boolean(v && v.trim());
@@ -79,11 +83,21 @@ export function getVertexLocation(): string {
   return process.env.GEMINI_LOCATION || "us-central1";
 }
 
-// Inline service-account key JSON for Vertex auth (optional — ADC is the
-// fallback when this is unset).
+/**
+ * Inline service-account key JSON (env only — no filesystem).
+ * File-path reads belong in Vertex callers via
+ * {@link getServiceAccountCredentialsPath} + dynamic `node:fs`.
+ */
 export function getServiceAccountJson(): string | undefined {
   return cleanSecret(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON, [
     "GOOGLE_APPLICATION_CREDENTIALS_JSON",
+  ]);
+}
+
+/** Path to a service-account key file (GOOGLE_APPLICATION_CREDENTIALS). */
+export function getServiceAccountCredentialsPath(): string | undefined {
+  return cleanSecret(process.env.GOOGLE_APPLICATION_CREDENTIALS, [
+    "GOOGLE_APPLICATION_CREDENTIALS",
   ]);
 }
 
@@ -100,6 +114,7 @@ export function debugGoogleConfig(tag = "google"): void {
     refreshTokenLen: (oauth.refreshToken || "").length,
     vertexProject: present(getVertexProject()) ? getVertexProject() : false,
     serviceAccountJson: present(getServiceAccountJson()),
+    serviceAccountFile: present(getServiceAccountCredentialsPath()),
   };
   console.log(`[${tag}] Google config:`, JSON.stringify(summary));
 }

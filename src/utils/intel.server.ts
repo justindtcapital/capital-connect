@@ -24,10 +24,16 @@ import {
   writeSheetRow,
   buildPortfolioCompanies,
   buildTargets,
+  buildContacts,
   logOpsEvent,
   TAB_NAMES,
 } from "./sheets.server";
 import { loadSignalConfig } from "./event-store.server";
+import {
+  autoAliases,
+  parseAliasesCell,
+  serializeAliases,
+} from "@/lib/entity-resolve";
 import { BADGE, promotionCheck } from "@/lib/fusion";
 import { buildRadarWatchlist } from "./platform.server";
 import {
@@ -88,6 +94,8 @@ export const INTEL_ENTITY_HEADERS = [
   //   3 = broad sourcing universe: cheap high-precision collectors only
   //       (config watchTiers.tier3Collectors — ATS + EDGAR Form D); no news.
   "Watch Tier",
+  // Phase 1 — semicolon-separated aliases (suffix variants, former names).
+  "Aliases",
 ];
 // v2 appends columns AFTER the v1 set — existing rows stay valid (shorter).
 export const INTEL_METRIC_LOG_HEADERS = [
@@ -175,6 +183,8 @@ export interface IntelEntity {
   note: string;
   /** WS6 collection depth (1/2/3) — editable in the UI, auto-promotable 3→2. */
   watchTier: number;
+  /** Phase 1 — display aliases (semicolon-separated on the sheet). */
+  aliases: string[];
   /** 1-based sheet row (header = 1). */
   rowNumber: number;
 }
@@ -285,6 +295,7 @@ function entityFromRow(row: string[], rowNumber: number): IntelEntity | null {
     lastScanned: (row[6] || "").trim(),
     note: (row[7] || "").trim(),
     watchTier: wt >= 1 && wt <= 3 ? wt : defaultWatchTier(tier),
+    aliases: parseAliasesCell(row[9] || ""),
     rowNumber,
   };
 }
@@ -300,6 +311,7 @@ function rowFromEntity(e: IntelEntity): string[] {
     e.lastScanned,
     e.note,
     String(e.watchTier || defaultWatchTier(e.tier)),
+    serializeAliases(e.aliases?.length ? e.aliases : autoAliases(e.name)),
   ];
 }
 
@@ -406,6 +418,27 @@ export async function seedIntelEntities(): Promise<{ added: number; total: numbe
   } catch (e) {
     console.error("[intel] seed: targets read failed", e);
   }
+  // Network companies from CRM contacts (corporate email domain when available).
+  try {
+    const byCompany = new Map<string, { name: string; emails: string[] }>();
+    for (const c of await buildContacts()) {
+      const name = (c.company || "").trim();
+      if (!name) continue;
+      const key = name.toLowerCase();
+      const row = byCompany.get(key) || { name, emails: [] };
+      if (c.email) row.emails.push(c.email);
+      byCompany.set(key, row);
+    }
+    for (const row of byCompany.values()) {
+      candidates.push({
+        name: row.name,
+        domain: companyDomainFromEmails(row.emails),
+        tier: "network",
+      });
+    }
+  } catch (e) {
+    console.error("[intel] seed: contacts read failed", e);
+  }
 
   const toAdd: IntelEntity[] = [];
   for (const c of candidates) {
@@ -422,6 +455,7 @@ export async function seedIntelEntities(): Promise<{ added: number; total: numbe
       lastScanned: "",
       note: "",
       watchTier: defaultWatchTier(c.tier),
+      aliases: autoAliases(c.name.trim()),
       rowNumber: 0,
     });
   }

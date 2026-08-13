@@ -20,6 +20,10 @@ import { downloadGmailAttachment } from "./gmail.server";
 import { buildRadarWatchlist } from "./platform.server";
 import { scoreAttribution } from "@/lib/attribution-score";
 import { outreachVerdict } from "@/lib/outreach-gate";
+import {
+  citedDriveIdsFromUrls,
+  storyContentKey,
+} from "@/lib/signal-dedup";
 import type { Contact } from "@/lib/types";
 // Signal persistence (Signals tab row contract) lives in signal-store.server —
 // shared with the Gmail digest pipeline, which archives per-link signals too.
@@ -43,7 +47,25 @@ import {
   SIGNAL_HEADERS,
 } from "./sheets.server";
 import { processCandidatesIntoEvents } from "./event-pipeline.server";
-import { loadSignalConfig } from "./event-store.server";
+import { loadSignalConfig, appendSignalOverflow, type OverflowRow } from "./event-store.server";
+import {
+  applyRetrievalCaps,
+  dedupeRetrievalDocs,
+  retrievalFromArticle,
+  retrievalFromEmailLink,
+  retrievalFromPdf,
+  type RetrievalDocument,
+} from "@/lib/signal-document";
+import { extractDocumentBatch } from "./signal-extract.server";
+import { candidatesFromExtracts } from "./signal-assemble.server";
+import {
+  subjectAgreementRate,
+  stampNewToRadar,
+  movementCandidatesFromExtracts,
+  draftSurvivorOutreach,
+} from "./signal-v3.server";
+import { DEFAULT_THESIS_KEYWORDS } from "@/lib/ecosystem-discovery";
+import type { KnownPerson } from "@/lib/exec-movement";
 
 // Draft an outreach email with Gemini. Runs server-side so the API key stays secret.
 export const draftEmail = createServerFn({ method: "POST" })
@@ -180,15 +202,38 @@ function companyForLink(url: string, m: Map<string, string>): string {
 const MAX_SIGNAL_DOCS = Number(process.env.GOOGLE_SIGNALS_MAX_DOCS) || 4;
 const MAX_SIGNAL_DOC_BYTES = 8_000_000; // ~8 MB per file
 
+/** Drive / archive ids already turned into Signals — never re-feed those PDFs. */
+function citedDriveIdSet(existing: StoredSignal[]): Set<string> {
+  const ids = new Set<string>();
+  for (const s of existing) {
+    for (const id of citedDriveIdsFromUrls(s.sourceUrl, s.docUrl)) ids.add(id);
+  }
+  return ids;
+}
+
+function storyKeyForStored(s: StoredSignal): string {
+  return storyContentKey(s.company, s.signal, s.subject, s.justification);
+}
+
 // Pull recent PDFs from the shared drive and base64-encode them for Gemini.
 // Best-effort: any failure logs and returns whatever loaded, so a scan never
 // fails just because Drive is unreachable or unconfigured.
-async function loadSignalDocuments(): Promise<SignalDocument[]> {
+//
+// Hard rules against story duplication:
+//  - only docs modified within the scan window (stale PDFs stay out)
+//  - skip file ids already cited on a stored signal (sourceUrl / docUrl)
+async function loadSignalDocuments(opts: {
+  windowDays: number;
+  citedDriveIds: Set<string>;
+}): Promise<SignalDocument[]> {
   if (!isDriveConfigured()) return [];
   try {
-    const feed = await listDriveDocs(MAX_SIGNAL_DOCS * 3);
+    const cutoffMs = Date.now() - Math.max(1, opts.windowDays) * 86_400_000;
+    const feed = await listDriveDocs(MAX_SIGNAL_DOCS * 5);
     const picked = feed.docs
       .filter((d) => !d.sizeBytes || d.sizeBytes <= MAX_SIGNAL_DOC_BYTES)
+      .filter((d) => !opts.citedDriveIds.has(d.id))
+      .filter((d) => !d.modifiedTime || d.modifiedTime >= cutoffMs)
       .slice(0, MAX_SIGNAL_DOCS);
     const loaded = await Promise.all(
       picked.map(async (d) => {
@@ -239,6 +284,10 @@ function resultFromStored(
       materiality: s.materiality,
       rankScore: s.rankScore,
       badges: s.badges,
+      entityUrid: s.entityUrid,
+      resolveRung: s.resolveRung,
+      resolveConfidence: s.resolveConfidence,
+      scoreBreakdown: s.scoreBreakdown,
     }));
   const otherSignals: SignalAwarenessItem[] = stored
     .filter((s) => s.type === "awareness")
@@ -258,6 +307,10 @@ function resultFromStored(
       rankScore: s.rankScore,
       badges: s.badges,
       storedId: s.id,
+      entityUrid: s.entityUrid,
+      resolveRung: s.resolveRung,
+      resolveConfidence: s.resolveConfidence,
+      scoreBreakdown: s.scoreBreakdown,
     }));
   return { found: true, recommendations, otherSignals, compliance, newCount };
 }
@@ -453,16 +506,20 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
       companies = [data.companyName.trim()];
     }
 
-    // Internal PDFs from the shared drive (best-effort — empty if unconfigured).
-    // Topic scans skip them: they're universe context, not subject context.
-    const documents = topic ? [] : await loadSignalDocuments();
-
     // Already-stored signals — used both to dedupe new signals AND to skip
-    // articles we've already turned into signals on a prior scan.
+    // articles / Drive PDFs we've already turned into signals on a prior scan.
     const existing = await fetchStoredSignals();
     const seenUrls = new Set(
       existing.map((s) => articleUrlKey(s.sourceUrl)).filter(Boolean),
     );
+    const citedDriveIds = citedDriveIdSet(existing);
+
+    // Internal PDFs from the shared drive (best-effort — empty if unconfigured).
+    // Topic scans skip them: they're universe context, not subject context.
+    // Age + already-cited filters keep month-old Drive stories from resurfacing.
+    const documents = topic
+      ? []
+      : await loadSignalDocuments({ windowDays, citedDriveIds });
 
     // Real articles to ground the scan with durable source URLs (best-effort —
     // empty if unconfigured; then Gemini uses Google Search). Two providers feed
@@ -588,6 +645,10 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
           // (the window rolling off is the retention cutoff).
           const pickedDocs = g.newsDocs
             .filter((d) => !d.sizeBytes || d.sizeBytes <= MAX_SIGNAL_DOC_BYTES)
+            .filter((d) => {
+              const driveId = citedDriveIdsFromUrls(d.driveWebViewLink)[0];
+              return !driveId || !citedDriveIds.has(driveId);
+            })
             .slice(0, MAX_SIGNAL_DOCS);
           for (const d of pickedDocs) {
             const base64 = await downloadGmailAttachment(d.messageId, d.attachmentId);
@@ -606,29 +667,141 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
       }
     }
 
-    // Cap Gemini input so the JSON reply fits under the output-token budget.
-    // Topic articles first (pinned themes), then company news, email links, docs.
+    // Cap Stage A inventory (Phase 3): topic articles first, then company news,
+    // email links, docs. Overflow ledger measures recall cost of caps.
     const topicArts = articles.filter((a) => topicLower.has(a.company.toLowerCase()));
     const companyArts = articles.filter((a) => !topicLower.has(a.company.toLowerCase()));
-    const ARTICLE_CAP = 36;
-    const TOPIC_ART_CAP = 16;
-    const cappedArticles = [
-      ...topicArts.slice(0, TOPIC_ART_CAP),
-      ...companyArts.slice(0, Math.max(0, ARTICLE_CAP - Math.min(topicArts.length, TOPIC_ART_CAP))),
-    ];
-    const cappedEmailLinks = emailLinks.slice(0, 20);
-    const cappedDocuments = documents.slice(0, 8);
+    const retrievalDocs = dedupeRetrievalDocs(
+      [
+        ...topicArts.map((a) =>
+          retrievalFromArticle(a, {
+            kind: topicLower.has(a.company.toLowerCase()) ? "topic_search" : "article",
+          }),
+        ),
+        ...companyArts.map((a) => retrievalFromArticle(a)),
+        ...emailLinks.map((l) => retrievalFromEmailLink(l)),
+        ...documents.map((d) => retrievalFromPdf(d)),
+      ].filter((d): d is RetrievalDocument => Boolean(d)),
+    );
+    const { kept: cappedRetrieval, overflow: retrievalOverflow } = applyRetrievalCaps(
+      retrievalDocs,
+      topicList,
+    );
+    const cappedArticles = articles.filter((a) =>
+      cappedRetrieval.some(
+        (d) =>
+          (d.kind === "article" || d.kind === "topic_search") &&
+          d.urlKey === articleUrlKey(a.url),
+      ),
+    );
+    const cappedEmailLinks = emailLinks.filter((l) =>
+      cappedRetrieval.some(
+        (d) => d.kind === "email_link" && d.urlKey === articleUrlKey(l.url),
+      ),
+    );
+    const cappedDocuments = documents.filter((d) =>
+      cappedRetrieval.some(
+        (r) =>
+          (r.kind === "drive_pdf" || r.kind === "gmail_pdf") &&
+          (r.url === (d.link || "") || r.title === d.name),
+      ),
+    );
 
-    const fresh = await runScanSignals({
-      windowDays,
-      portcos,
-      companies,
-      people,
-      documents: cappedDocuments,
-      articles: cappedArticles,
-      emailLinks: cappedEmailLinks,
-      topics,
-    });
+    const runAt = new Date().toISOString();
+    const overflowRows: OverflowRow[] = retrievalOverflow.map((o) => ({
+      runAt,
+      kind: o.kind,
+      url: o.url,
+      name: o.name,
+      company: o.company,
+      reason: o.reason,
+      cap: o.cap,
+      keptCount: o.keptCount,
+    }));
+    if (overflowRows.length > 0) {
+      void appendSignalOverflow(overflowRows);
+    }
+
+    // Phase 3 Stage B — hardened V3 path.
+    // SIGNALS_PIPELINE_V3=true   → extract-first awareness; mega otherSignals dropped;
+    //                              draft outreach only for ranked survivors with CRM people
+    // SIGNALS_PIPELINE_V3=shadow → extract + subject-agreement vs mega; mega still owns feed
+    const pipelineV3 = (process.env.SIGNALS_PIPELINE_V3 || "").trim().toLowerCase();
+    const v3Hard = pipelineV3 === "true";
+    const v3Shadow = pipelineV3 === "shadow";
+    const runStageB = v3Hard || v3Shadow;
+    let stageBCandidates: StoredSignal[] = [];
+    let stageBExtracts: Awaited<ReturnType<typeof extractDocumentBatch>> = [];
+    let stageBStats = {
+      attempted: 0,
+      validated: 0,
+      error: "",
+      agreementRate: null as number | null,
+      drafts: 0,
+      skippedMega: false,
+    };
+    if (runStageB) {
+      try {
+        const extractable = cappedRetrieval.filter(
+          (d) => d.kind === "article" || d.kind === "topic_search",
+        );
+        stageBExtracts = await extractDocumentBatch(extractable);
+        stageBStats.attempted = stageBExtracts.length;
+        stageBStats.validated = stageBExtracts.filter((e) => e.extract).length;
+        if (v3Hard) {
+          const dateIso = new Date().toISOString().split("T")[0];
+          const roster = new Set([
+            ...[...portcoNames],
+            ...contacts.map((c) => (c.company || "").trim().toLowerCase()).filter(Boolean),
+          ]);
+          const known: KnownPerson[] = contacts.map((c) => ({
+            name: c.name,
+            email: c.email,
+            company: c.company,
+            title: c.title,
+          }));
+          let extracted = candidatesFromExtracts(stageBExtracts, dateIso, portcoNames);
+          extracted = stampNewToRadar(
+            extracted,
+            roster,
+            topics.length ? topics : DEFAULT_THESIS_KEYWORDS,
+          );
+          const movements = movementCandidatesFromExtracts(
+            stageBExtracts,
+            known,
+            dateIso,
+            portcoNames,
+          );
+          stageBCandidates = [...extracted, ...movements];
+        }
+      } catch (e) {
+        stageBStats.error = e instanceof Error ? e.message : String(e);
+        console.error("[gemini] Stage B extract failed (continuing with mega-prompt):", e);
+      }
+    }
+
+    // Hardened V3: skip mega-prompt when extracts produced candidates (extract owns
+    // awareness; survivor drafts run after ranking). Fall back to mega if Stage B empty.
+    const skipMega = v3Hard && stageBCandidates.length > 0 && !stageBStats.error;
+    stageBStats.skippedMega = skipMega;
+
+    const fresh = skipMega
+      ? {
+          found: true as const,
+          recommendations: [] as SignalRecommendation[],
+          otherSignals: [] as SignalAwarenessItem[],
+          compliance: [] as string[],
+        }
+      : await runScanSignals({
+          windowDays,
+          portcos,
+          companies,
+          people,
+          documents: cappedDocuments,
+          articles: cappedArticles,
+          emailLinks: cappedEmailLinks,
+          topics,
+        });
     if (!fresh.found) {
       await logOpsEvent({
         action: "sync",
@@ -642,10 +815,27 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
           articleCount: articles.length,
           cappedArticleCount: cappedArticles.length,
           topicArticleCount: topicArts.length,
+          overflowCount: overflowRows.length,
           geminiError: fresh.error || "",
+          pipelineV3,
+          stageBError: stageBStats.error,
         },
       });
       return fresh;
+    }
+
+    // Shadow mode: measure extract↔mega subject agreement (migration safety).
+    if (v3Shadow && stageBExtracts.length > 0) {
+      const agr = subjectAgreementRate(
+        stageBExtracts,
+        fresh.otherSignals.map((o) => o.company),
+      );
+      stageBStats.agreementRate = agr.rate;
+    }
+
+    // Hardened V3 still running mega (fallback): drop mega otherSignals — Stage B owns them.
+    if (v3Hard && !skipMega) {
+      fresh.otherSignals = [];
     }
 
     // ── Grounded attribution relevance ──────────────────────────
@@ -723,22 +913,34 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
       ...[...fresh.otherSignals, ...demotedToAwareness].map((a) =>
         storedFromAwareness(a, dateFound, portcoNames),
       ),
+      // Phase 3 Stage B awareness (exhaustive extracts) — URL-deduped below.
+      ...stageBCandidates,
     ];
 
-    // Dedup on content key AND source URL so re-scans / Gemini duplicates
-    // don't double-store the same story (even with UTM / trailing-slash variants).
+    // Dedup on content key, source URL, Drive file id, and story fingerprint so
+    // re-scans / Gemini paraphrases / Drive re-feeds never double-store a story.
     const seen = new Set(existing.map(keyForStored));
     const seenSourceUrls = new Set(
       existing.map((s) => articleUrlKey(s.sourceUrl)).filter(Boolean),
     );
+    const seenStories = new Set(
+      existing.map(storyKeyForStored).filter(Boolean),
+    );
+    const seenDriveIds = new Set(citedDriveIds);
     const toAppend: StoredSignal[] = [];
     for (const c of candidates) {
       const k = keyForStored(c);
       if (seen.has(k)) continue;
       const u = articleUrlKey(c.sourceUrl);
       if (u && seenSourceUrls.has(u)) continue;
+      const driveIds = citedDriveIdsFromUrls(c.sourceUrl, c.docUrl);
+      if (driveIds.some((id) => seenDriveIds.has(id))) continue;
+      const story = storyKeyForStored(c);
+      if (story && seenStories.has(story)) continue;
       seen.add(k);
       if (u) seenSourceUrls.add(u);
+      if (story) seenStories.add(story);
+      for (const id of driveIds) seenDriveIds.add(id);
       toAppend.push(c);
     }
 
@@ -751,7 +953,29 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
       // an eventId FK; new sources for known events join the existing event.
       // extraRows = synthetic burst meta-event cards (WS4).
       const { enriched, extraRows } = await processCandidatesIntoEvents(toAppend);
-      await appendSheetRows(TAB_NAMES.signals, [...enriched, ...extraRows].map(rowFromStored));
+
+      // V3 hardened: draft outreach ONLY for ranked survivors with a CRM person.
+      let survivorDrafts: StoredSignal[] = [];
+      if (v3Hard && skipMega) {
+        try {
+          survivorDrafts = await draftSurvivorOutreach(enriched, contacts, {
+            portcoNames,
+            portfolioSectors,
+            minRank: Number(process.env.SIGNALS_V3_DRAFT_MIN_RANK) || 25,
+            maxDrafts: Number(process.env.SIGNALS_V3_MAX_DRAFTS) || 5,
+          });
+          stageBStats.drafts = survivorDrafts.length;
+        } catch (e) {
+          console.error("[gemini] survivor draft failed:", e);
+        }
+      }
+
+      await appendSheetRows(
+        TAB_NAMES.signals,
+        [...enriched, ...extraRows, ...survivorDrafts].map(rowFromStored),
+      );
+      // Count drafts in the "new" total for ops.
+      toAppend.push(...survivorDrafts);
     }
 
     await logOpsEvent({
@@ -778,10 +1002,19 @@ async function executeSignalScan(data: SignalScanInput = {}): Promise<SignalScan
         articles: articles.length,
         emailLinks: emailLinks.length,
         documents: documents.length,
+        overflowCount: overflowRows.length,
         existing: existing.length,
         new: toAppend.length,
         // Outreach suggestions the quality gate demoted to awareness this scan.
         demotedRecs: demotedToAwareness.length,
+        pipelineV3,
+        stageBAttempted: stageBStats.attempted,
+        stageBValidated: stageBStats.validated,
+        stageBMerged: stageBCandidates.length,
+        stageBError: stageBStats.error,
+        stageBAgreementRate: stageBStats.agreementRate,
+        stageBSkippedMega: stageBStats.skippedMega,
+        stageBDrafts: stageBStats.drafts,
       },
       items: toAppend.slice(0, 40).map((s) => {
         const who = s.person || s.company || "—";

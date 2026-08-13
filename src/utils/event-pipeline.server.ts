@@ -17,7 +17,7 @@ import {
   type StoredSignal,
 } from "./signal-store.server";
 import { newsSourceType } from "@/lib/signal-feed";
-import { loadIntelEntities, INTEL_TABS } from "./intel.server";
+import { loadIntelEntities, INTEL_TABS, type IntelEntity } from "./intel.server";
 import {
   buildPortfolioCompanies,
   buildContacts,
@@ -34,6 +34,7 @@ import {
   persistSignalEvents,
   loadSignalConfig,
   newEventId,
+  appendTimeAdvantageRow,
   type SignalEventRow,
   type EventSource,
 } from "./event-store.server";
@@ -47,6 +48,7 @@ import {
   magnitudeKeyOf,
   normCompanyKey,
   hostOfUrl,
+  independentSourceCount,
   type OpenEventLite,
 } from "@/lib/event-cluster";
 import {
@@ -75,6 +77,12 @@ import {
   type IntelEventLite,
 } from "@/lib/fusion";
 import { passesAwarenessQualityGate } from "@/lib/signal-quality";
+import {
+  resolveEntity,
+  type EntityRegistry,
+} from "@/lib/entity-resolve";
+import { classifyNovelty } from "@/lib/novelty";
+import { gateSignal } from "@/lib/signal-gates";
 
 export interface PipelineResult {
   /** Candidates with eventId + scores stamped — append THESE. */
@@ -186,6 +194,14 @@ export async function buildContext(): Promise<PipelineContext> {
       f.urid = e.urid;
       if (e.domain && !f.domain) f.domain = e.domain;
       uridToKey.set(e.urid, normCompanyKey(e.name));
+      // Alias keys also resolve to the same facts / URID.
+      for (const alias of e.aliases || []) {
+        const af = get(alias);
+        af.urid = e.urid;
+        if (e.domain && !af.domain) af.domain = e.domain;
+        if (f.isPortco) af.isPortco = true;
+        if (f.isWatch) af.isWatch = true;
+      }
     }
     // Current ATS open-role counts from the intel series (size proxy for WS2).
     const rows = await fetchSheetTab(INTEL_TABS.series).catch(() => [] as string[][]);
@@ -429,6 +445,11 @@ function rowBreakdown(ev: SignalEventRow, cls: Classification): string {
     sources: ev.sourceCount,
     topTier: ev.topTier,
     magnitude: ev.magnitude || undefined,
+    independence: ev.scoreBreakdown.independence,
+    novelty: ev.scoreBreakdown.novelty,
+    gate: ev.scoreBreakdown.gate,
+    resolve: ev.scoreBreakdown.resolve,
+    disputedFields: ev.scoreBreakdown.disputedFields,
   }).slice(0, 3000);
 }
 
@@ -449,6 +470,8 @@ export async function processCandidatesIntoEvents(
     await ensureSignalV2Tabs();
     const ctx = await buildContext();
     const cfg = ctx.cfg;
+    const intelEntities = await loadIntelEntities().catch(() => [] as IntelEntity[]);
+    const entityRegistry = registryFromIntelEntities(intelEntities);
     const classifications = await classifyCandidates(candidates);
     // ~400d of events: the clustering pool only needs the trailing window, but
     // the WS4 surprise term needs the company's own cadence history.
@@ -468,20 +491,41 @@ export async function processCandidatesIntoEvents(
     const clsByEvent = new Map<string, Classification>();
 
     for (const cand of candidates) {
-      const company = (cand.company || "").trim();
-      if (!company) continue; // person-only signals stay event-less
+      const companyRaw = (cand.company || "").trim();
+      if (!companyRaw) continue; // person-only signals stay event-less
       const cls = classifications.get(cand.id) || fallbackClassification(cand);
       const title = cand.subject || cand.signal || "";
       const text = cand.signal || cand.justification || "";
       const dateIso = cand.dateFound || today();
       const url = (cand.sourceUrl || "").trim();
       const realUrl = /^https?:\/\//i.test(url) ? url : "";
-      const facts = factsFor(ctx, company);
+      const facts = factsFor(ctx, companyRaw);
+      const articleHost = hostOfUrl(realUrl);
+      const resolved = resolveEntity(
+        {
+          name: companyRaw,
+          domain: facts.domain || articleHost || undefined,
+          context: {
+            contactCompanies: facts.networkContactCount > 0 ? [companyRaw] : undefined,
+          },
+        },
+        entityRegistry,
+      );
+      const company = resolved.canonicalName || companyRaw;
+      const entityUrid = resolved.entityId || facts.urid || "";
       const tier = realUrl ? tierForUrl(realUrl, facts.domain, cfg) : "C";
       const source: EventSource = { u: realUrl, t: tier, d: dateIso, ti: title.slice(0, 120) };
 
       const match = matchEvent(
-        { company, eventType: cls.type, title, text, dateIso, sourceUrl: realUrl },
+        {
+          company,
+          entityUrid: entityUrid || undefined,
+          eventType: cls.type,
+          title,
+          text,
+          dateIso,
+          sourceUrl: realUrl,
+        },
         openPool,
         cfg,
       );
@@ -491,6 +535,7 @@ export async function processCandidatesIntoEvents(
         const found = byId.get(match.event.eventId);
         if (!found) continue;
         ev = found;
+        if (!ev.entityUrid && entityUrid) ev.entityUrid = entityUrid;
         const known = new Set(
           ev.sources.map((s) => s.u.trim().toLowerCase().replace(/\/+$/, "")),
         );
@@ -515,6 +560,43 @@ export async function processCandidatesIntoEvents(
           ...sb,
           `${dateIso} +${hostOfUrl(realUrl) || "row"}: ${match.reason}`,
         ].slice(-10);
+        ev.scoreBreakdown.resolve = {
+          rung: resolved.rung,
+          confidence: resolved.confidence,
+          why: resolved.why,
+        };
+        if (resolved.rung === "ambiguous") {
+          ev.badges = mergeBadges(ev.badges, BADGE.ambiguousEntity);
+        }
+        if (match.magnitudeDispute && match.disputedMagnitudeKey) {
+          const claims = (ev.scoreBreakdown.disputedFields as Array<Record<string, unknown>>) || [];
+          const existingMag = ev.magnitude
+            ? {
+                value: ev.magnitude.value,
+                unit: ev.magnitude.unit,
+                verbatim: ev.magnitude.verbatim,
+                key: magnitudeKeyOf(`${ev.magnitude.value} ${ev.magnitude.unit}`),
+              }
+            : { key: (ev.scoreBreakdown as { magKey?: string }).magKey };
+          claims.push({
+            field: "magnitude",
+            claims: [
+              existingMag,
+              {
+                key: match.disputedMagnitudeKey,
+                verbatim: cls.magnitude?.verbatim || match.disputedMagnitudeKey,
+                value: cls.magnitude?.value,
+                unit: cls.magnitude?.unit,
+                sourceUrl: realUrl,
+                tier,
+              },
+            ],
+          });
+          ev.scoreBreakdown.disputedFields = claims.slice(-5);
+          ev.badges = mergeBadges(ev.badges, BADGE.disputed);
+          // Keep the best-tier existing magnitude; never average.
+          if (!ev.magnitude && cls.magnitude) ev.magnitude = cls.magnitude;
+        }
         updated.add(ev);
         const poolIdx = openPool.findIndex((p) => p.eventId === ev.eventId);
         if (poolIdx >= 0) openPool[poolIdx] = toOpenLite(ev);
@@ -522,7 +604,7 @@ export async function processCandidatesIntoEvents(
         ev = {
           eventId: newEventId(),
           company,
-          entityUrid: facts.urid || "",
+          entityUrid,
           eventType: cls.type,
           firstSeen: dateIso,
           lastUpdated: dateIso,
@@ -540,11 +622,16 @@ export async function processCandidatesIntoEvents(
           rankScore: 0,
           magnitude: cls.magnitude,
           intelEventId: "",
-          badges: "",
+          badges: resolved.rung === "ambiguous" ? BADGE.ambiguousEntity : "",
           scoreBreakdown: {
             clusterLog: [`${dateIso} seeded: ${match.reason}`],
             typeSource: cls.typeSource,
             flaggedForReview: cls.flagged || undefined,
+            resolve: {
+              rung: resolved.rung,
+              confidence: resolved.confidence,
+              why: resolved.why,
+            },
           },
           tokens: tokensOf(title, text),
           constituentIds: [cand.id],
@@ -556,6 +643,10 @@ export async function processCandidatesIntoEvents(
       }
 
       cand.eventId = ev.eventId;
+      cand.company = company;
+      cand.entityUrid = entityUrid;
+      cand.resolveRung = resolved.rung;
+      cand.resolveConfidence = resolved.confidence;
       clsByEvent.set(ev.eventId, cls);
       if (cand.type === "recommendation" && cand.relevance > 0) {
         recRelByEvent.set(ev.eventId, [...(recRelByEvent.get(ev.eventId) || []), cand.relevance]);
@@ -594,10 +685,21 @@ export async function processCandidatesIntoEvents(
         if (fuse.intelWasFirst) {
           // The intel event was first — MERGE: it keeps first_seen_at, and the
           // press coverage confirms it.
+          const pressFirstSeen = ev.firstSeen;
           if (fuse.intel.firstDetected && fuse.intel.firstDetected < ev.firstSeen) {
             ev.firstSeen = fuse.intel.firstDetected;
           }
           ev.badges = mergeBadges(ev.badges, BADGE.confirmedByPress);
+          if (fuse.intel.firstDetected && pressFirstSeen) {
+            void appendTimeAdvantageRow({
+              eventId: ev.eventId,
+              entityUrid: ev.entityUrid || fuse.intel.urid,
+              company: ev.company,
+              intelFirstSeen: fuse.intel.firstDetected,
+              pressFirstSeen,
+              intelEvidence: fuse.intel.evidenceLines,
+            });
+          }
           if (fuse.intel.signalId) {
             intelSignalStamps.set(fuse.intel.signalId, {
               eventId: ev.eventId,
@@ -634,6 +736,102 @@ export async function processCandidatesIntoEvents(
       const rels = [...(recRelByEvent.get(ev.eventId) || [])];
       if (ev.relevance > 0) rels.push(ev.relevance);
       scoreEvent(ev, facts, rels, cfg, { corroborationMultiplier, surpriseNorm: sur.surpriseNorm });
+
+      // ── Phase 2: independence → novelty → trust gate → novelty mult ──
+      const indep = independentSourceCount(
+        ev.sources.map((s) => ({
+          url: s.u,
+          tier: s.t,
+          dateIso: s.d,
+          tokens: tokensOf(s.ti || "", ""),
+        })),
+      );
+      // Apply independence into corroboration (Tier A/B families, not syndications).
+      if (indep.abCount > 1 && !fuse) {
+        corroborationMultiplier = Math.max(
+          corroborationMultiplier,
+          1 + Math.min(0.25, (indep.abCount - 1) * 0.08),
+        );
+        if (corroborationMultiplier > 1) {
+          scoreEvent(ev, facts, rels, cfg, {
+            corroborationMultiplier,
+            surpriseNorm: sur.surpriseNorm,
+          });
+        }
+      }
+      ev.scoreBreakdown.independence = indep;
+
+      const resolveMeta = (ev.scoreBreakdown.resolve || {}) as {
+        rung?: string;
+        confidence?: number;
+      };
+      const sourceTitles = ev.sources.map((s) => s.ti || "").filter(Boolean).join(" ");
+      const novelty = classifyNovelty(
+        {
+          company: ev.company,
+          entityUrid: ev.entityUrid || undefined,
+          eventType: ev.eventType,
+          title: sourceTitles || ev.company,
+          text: ev.tokens.join(" "),
+          dateIso: ev.firstSeen,
+          magnitudeKey:
+            ev.magnitude && ev.magnitude.unit === "usd"
+              ? `usd:${Math.round(ev.magnitude.value)}`
+              : magnitudeKeyOf(ev.tokens.join(" ")),
+          hasNewMaterialField: Boolean(ev.scoreBreakdown.disputedFields),
+        },
+        allEvents
+          .filter((p) => p.eventId !== ev.eventId)
+          .map((p) => ({
+            eventId: p.eventId,
+            company: p.company,
+            entityUrid: p.entityUrid || undefined,
+            eventType: p.eventType,
+            firstSeen: p.firstSeen,
+            lastUpdated: p.lastUpdated,
+            tokens: p.tokens,
+            magnitudeKey:
+              p.magnitude && p.magnitude.unit === "usd"
+                ? `usd:${Math.round(p.magnitude.value)}`
+                : undefined,
+            status: p.status,
+          })),
+      );
+      ev.scoreBreakdown.novelty = novelty;
+      if (novelty.class === "update") {
+        ev.badges = mergeBadges(ev.badges, BADGE.updated);
+      }
+      if (novelty.noveltyMult > 0 && novelty.noveltyMult < 1) {
+        ev.rankScore = Math.round(ev.rankScore * novelty.noveltyMult);
+        ev.scoreBreakdown.noveltyMult = {
+          name: "novelty",
+          value: novelty.noveltyMult,
+          why: novelty.why,
+        };
+      }
+
+      // Confirmation/recycled of a *prior* event → no standalone card.
+      const isDupOfPrior =
+        (novelty.class === "confirmation" || novelty.class === "recycled") &&
+        Boolean(novelty.matchedEventId) &&
+        novelty.matchedEventId !== ev.eventId;
+
+      const gate = gateSignal({
+        resolveConfidence: resolveMeta.confidence ?? (ev.entityUrid ? 0.9 : 0),
+        resolveRung: resolveMeta.rung || (ev.entityUrid ? "alias_exact" : "unknown"),
+        independentSources: indep.abCount,
+        hasIntelEvidence: Boolean(ev.intelEventId),
+        noveltyClass: isDupOfPrior ? "recycled" : novelty.class,
+      });
+      ev.scoreBreakdown.gate = gate;
+      if (gate.outcome === "needs_review") {
+        ev.badges = mergeBadges(ev.badges, BADGE.needsReview);
+      } else if (gate.outcome === "hold") {
+        ev.badges = mergeBadges(ev.badges, BADGE.hold);
+      } else if (gate.outcome === "withhold") {
+        ev.badges = mergeBadges(ev.badges, BADGE.withheld);
+        ev.rankScore = 0;
+      }
     }
 
     // ── WS4 — burst detector: quiet company suddenly generating events ──
@@ -760,8 +958,25 @@ export async function processCandidatesIntoEvents(
     // Soft gate: keep all recommendations; awareness only when relevance or
     // materiality clears the configured floor. Drop orphaned newly-created
     // events so the Events tab does not accumulate gated-out noise.
-    const enriched = candidates.filter((c) => passesAwarenessQualityGate(c, cfg));
-    const keptExtra = extraRows.filter((c) => passesAwarenessQualityGate(c, cfg));
+    // Phase 2: also drop withheld (recycled/confirmation-of-prior) cards.
+    const withheldEventIds = new Set(
+      [...touched]
+        .filter((e) => {
+          const g = e.scoreBreakdown.gate as { outcome?: string } | undefined;
+          return g?.outcome === "withhold";
+        })
+        .map((e) => e.eventId),
+    );
+    const enriched = candidates.filter(
+      (c) =>
+        passesAwarenessQualityGate(c, cfg) &&
+        !(c.eventId && withheldEventIds.has(c.eventId)),
+    );
+    const keptExtra = extraRows.filter(
+      (c) =>
+        passesAwarenessQualityGate(c, cfg) &&
+        !(c.eventId && withheldEventIds.has(c.eventId)),
+    );
     const keptSignalIds = new Set([...enriched, ...keptExtra].map((s) => s.id));
     const keptEventIds = new Set(
       [...enriched, ...keptExtra].map((s) => s.eventId).filter(Boolean) as string[],
@@ -887,10 +1102,23 @@ async function stampIntelSignalRows(
   }
 }
 
+function registryFromIntelEntities(entities: IntelEntity[]): EntityRegistry {
+  return {
+    entities: entities.map((e) => ({
+      entityId: e.urid,
+      canonicalName: e.name,
+      primaryDomain: e.domain || undefined,
+      aliases: e.aliases?.length ? e.aliases : undefined,
+      xref: e.xref,
+    })),
+  };
+}
+
 function toOpenLite(e: SignalEventRow): OpenEventLite {
   return {
     eventId: e.eventId,
     company: e.company,
+    entityUrid: e.entityUrid || undefined,
     eventType: e.eventType,
     firstSeen: e.firstSeen,
     lastUpdated: e.lastUpdated,

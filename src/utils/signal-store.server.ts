@@ -20,6 +20,10 @@ import {
 import { fetchSheetTab, appendSheetRows, updateSheetCells, colLetters, TAB_NAMES } from "./sheets.server";
 import { articleUrlKey } from "./news.server";
 import { isWeakResearchSnippet } from "@/lib/email-body-clean";
+import {
+  citedDriveIdsFromUrls,
+  storyContentKey,
+} from "@/lib/signal-dedup";
 
 export interface StoredSignal {
   id: string;
@@ -55,6 +59,12 @@ export interface StoredSignal {
   badges?: string;
   /** JSON component breakdown — every stored score reconstructible from this. */
   scoreBreakdown?: string;
+  /** Phase 1 — resolved Intel Entities URID (when known). */
+  entityUrid?: string;
+  /** Phase 1 — resolve ladder rung (domain | alias_exact | ambiguous | …). */
+  resolveRung?: string;
+  /** Phase 1 — 0–1 confidence from resolveEntity. */
+  resolveConfidence?: number | null;
 }
 
 // Write-time size caps that keep the hot read path light. The Summary is the
@@ -198,6 +208,9 @@ export function rowFromStored(s: StoredSignal): string[] {
     s.rankScore == null ? "" : String(s.rankScore),
     s.badges || "",
     (s.scoreBreakdown || "").slice(0, 4000),
+    s.entityUrid || "",
+    s.resolveRung || "",
+    s.resolveConfidence == null ? "" : String(s.resolveConfidence),
   ];
 }
 
@@ -251,6 +264,9 @@ export async function fetchStoredSignals(
         rankScore: g(row, 20) ? Number(g(row, 20)) : null,
         badges: g(row, 21),
         scoreBreakdown: g(row, 22),
+        entityUrid: g(row, 23),
+        resolveRung: g(row, 24),
+        resolveConfidence: g(row, 25) ? Number(g(row, 25)) : null,
       }))
       // Keep only rows that are real signals (valid type + some content).
       .filter(
@@ -382,6 +398,15 @@ export async function appendDigestLinkSignals(
   const existing = await fetchStoredSignals();
   const seenUrls = new Set(existing.map((s) => urlKey(s.sourceUrl)).filter(Boolean));
   const seenKeys = new Set(existing.map(keyForStored));
+  const seenStories = new Set(
+    existing
+      .map((s) => storyContentKey(s.company, s.signal, s.subject, s.justification))
+      .filter(Boolean),
+  );
+  const seenDriveIds = new Set<string>();
+  for (const s of existing) {
+    for (const id of citedDriveIdsFromUrls(s.sourceUrl, s.docUrl)) seenDriveIds.add(id);
+  }
 
   const toAppend: StoredSignal[] = [];
   for (const s of links) {
@@ -391,8 +416,19 @@ export async function appendDigestLinkSignals(
     if (!passesAwarenessQualityGate(stored, cfg)) continue;
     const k = keyForStored(stored);
     if (seenKeys.has(k)) continue;
+    const driveIds = citedDriveIdsFromUrls(stored.sourceUrl, stored.docUrl);
+    if (driveIds.some((id) => seenDriveIds.has(id))) continue;
+    const story = storyContentKey(
+      stored.company,
+      stored.signal,
+      stored.subject,
+      stored.justification,
+    );
+    if (story && seenStories.has(story)) continue;
     seenUrls.add(u);
     seenKeys.add(k);
+    if (story) seenStories.add(story);
+    for (const id of driveIds) seenDriveIds.add(id);
     toAppend.push(stored);
   }
   if (toAppend.length > 0) {
@@ -424,6 +460,15 @@ export async function appendResearchDigestSignals(
 
   const existing = await fetchStoredSignals();
   const seenKeys = new Set(existing.map(keyForStored));
+  const seenStories = new Set(
+    existing
+      .map((s) => storyContentKey(s.company, s.signal, s.subject, s.justification))
+      .filter(Boolean),
+  );
+  const seenDriveIds = new Set<string>();
+  for (const s of existing) {
+    for (const id of citedDriveIdsFromUrls(s.sourceUrl, s.docUrl)) seenDriveIds.add(id);
+  }
 
   const toAppend: StoredSignal[] = [];
   for (const s of research) {
@@ -431,7 +476,18 @@ export async function appendResearchDigestSignals(
     if (!passesAwarenessQualityGate(stored, cfg)) continue;
     const k = keyForStored(stored);
     if (seenKeys.has(k)) continue;
+    const driveIds = citedDriveIdsFromUrls(stored.sourceUrl, stored.docUrl, s.driveWebViewLink);
+    if (driveIds.some((id) => seenDriveIds.has(id))) continue;
+    const story = storyContentKey(
+      stored.company,
+      stored.signal,
+      stored.subject,
+      stored.justification,
+    );
+    if (story && seenStories.has(story)) continue;
     seenKeys.add(k);
+    if (story) seenStories.add(story);
+    for (const id of driveIds) seenDriveIds.add(id);
     toAppend.push(stored);
   }
   if (toAppend.length > 0) {

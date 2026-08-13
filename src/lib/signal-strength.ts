@@ -14,6 +14,7 @@
 // Pure functions — safe to run client-side.
 
 import type { Contact, PortfolioCompany } from "@/lib/types";
+import { textAlreadyCovered } from "@/lib/signal-dedup";
 
 export type ConfidenceLevel = "High" | "Medium" | "Low";
 export type ImpactLevel = "High" | "Medium" | "Low" | "None";
@@ -57,6 +58,9 @@ export interface ScoreInput {
   summary?: string;
   headline?: string;
   person?: string;
+  /** Phase 2 — independent Tier A/B families (when known from scoreBreakdown). */
+  independentSources?: number;
+  syndicatedSources?: number;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -199,6 +203,16 @@ export function makeScorer(
       confLevel = "High";
       confReason += " High attribution relevance.";
     }
+    const indep = card.independentSources;
+    const synd = card.syndicatedSources ?? 0;
+    if (indep != null && indep > 0) {
+      confReason +=
+        synd > 0
+          ? ` ${indep} independent source${indep === 1 ? "" : "s"} (${synd} syndication${synd === 1 ? "" : "s"} excluded).`
+          : indep > 1
+            ? ` ${indep} independent sources.`
+            : "";
+    }
 
     // Opportunity (transparent weighted blend) ---------------------
     const relScore = Math.min(Math.max(card.relevance ?? 4, 0), 10) / 10;
@@ -234,10 +248,20 @@ export function makeScorer(
       confidence: { level: confLevel, reason: confReason },
     };
 
-    // Why it matters (assembled from facts, seeded by the stored justification) -
+    // Why it matters (portfolio / network context — not a rehash of the story).
+    // Long summaries already appear in the reading pane; repeating them here
+    // made Drive / news cards look duplicated.
     const parts: string[] = [];
     const seed = (card.summary || "").trim();
-    if (seed) parts.push(seed.endsWith(".") ? seed : `${seed}.`);
+    const headline = (card.headline || "").trim();
+    if (
+      seed &&
+      seed.length <= 160 &&
+      !textAlreadyCovered(headline, seed) &&
+      seed.toLowerCase() !== headline.toLowerCase()
+    ) {
+      parts.push(seed.endsWith(".") ? seed : `${seed}.`);
+    }
     if (selfIsPortco) {
       parts.push("This is one of your portfolio companies.");
     } else if (suggestedPortcos.length > 0) {

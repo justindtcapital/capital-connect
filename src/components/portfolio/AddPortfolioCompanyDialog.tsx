@@ -64,7 +64,12 @@ export function AddPortfolioCompanyDialog({
       onOpenChange(false);
     } catch (e) {
       console.error("addPortfolioCompany failed", e);
-      toast.error("Couldn't add the company — see console.");
+      const msg = e instanceof Error ? e.message : "";
+      toast.error(
+        msg.includes("already exists")
+          ? msg
+          : "Couldn't add the company — see console.",
+      );
     } finally {
       setBusy(false);
     }

@@ -319,7 +319,8 @@ export interface TargetLead {
 export interface TargetingFilters {
   search: string;
   stage: string;
-  sector: string;
+  /** Multi-select sectors (empty = no sector filter). */
+  sector: string[];
   city: string;
   origin: string;
   /** Title contains (free text). */
@@ -458,6 +459,9 @@ export interface AsanaActivity {
   company?: string;
   /** Person/contact the activity references (custom field), when present. */
   person?: string;
+  /** Exact email of the primary counterparty (Gmail-sourced activities) —
+   *  the key the CRM canonicalization pass joins on. */
+  personEmail?: string;
   /** Task notes/description (trimmed). */
   notes?: string;
   /** Permalink to the task in Asana. */

@@ -32,7 +32,6 @@ type SortKey =
   | "temperature"
   | "engagement"
   | "followUp"
-  | "contactType"
   | "source"
   | "dateAdded";
 
@@ -47,7 +46,6 @@ const COLUMNS: { key: SortKey; label: string }[] = [
   { key: "temperature", label: "Status" },
   { key: "engagement", label: "Engagement" },
   { key: "followUp", label: "Follow-up" },
-  { key: "contactType", label: "Type" },
   { key: "source", label: "Source" },
   { key: "dateAdded", label: "Added" },
 ];
@@ -84,8 +82,6 @@ function sortValue(c: Contact, key: SortKey): string | number {
       return effectiveScore(c);
     case "followUp":
       return followUpRank(c);
-    case "contactType":
-      return (c.contactType ?? "").toLowerCase();
     case "source":
       return (c.source || "Manual Entry").toLowerCase();
     case "dateAdded":
@@ -196,16 +192,16 @@ export function ContactTable({ contacts, onSelect }: ContactTableProps) {
                   <div className="max-w-[170px] truncate" title={contact.title}>{contact.title || "—"}</div>
                 </TableCell>
                 <TableCell className="text-sm text-muted-foreground" onClick={() => onSelect(contact)}>
-                  <div className="max-w-[150px] truncate" title={contact.company}>{contact.company || "—"}</div>
+                  <div className="max-w-[170px] truncate" title={contact.company}>{contact.company || "—"}</div>
                 </TableCell>
                 <TableCell className="text-sm text-muted-foreground" onClick={() => onSelect(contact)}>
-                  <div className="max-w-[150px] truncate" title={contact.location || ""}>{contact.location || "—"}</div>
+                  <div className="max-w-[160px] truncate" title={contact.location || ""}>{contact.location || "—"}</div>
                 </TableCell>
                 <TableCell className="text-sm text-muted-foreground" onClick={() => onSelect(contact)}>
-                  <div className="max-w-[130px] truncate" title={contact.sector}>{contact.sector || "—"}</div>
+                  <div className="max-w-[140px] truncate" title={contact.sector}>{contact.sector || "—"}</div>
                 </TableCell>
                 <TableCell className="text-sm text-muted-foreground" onClick={() => onSelect(contact)}>
-                  <div className="max-w-[170px] truncate" title={contact.areasOfInterest.join(", ")}>
+                  <div className="max-w-[180px] truncate" title={contact.areasOfInterest.join(", ")}>
                     {contact.areasOfInterest.join(", ") || "—"}
                   </div>
                 </TableCell>
@@ -239,9 +235,6 @@ export function ContactTable({ contacts, onSelect }: ContactTableProps) {
                       <span className="text-xs font-medium">Done</span>
                     </div>
                   )}
-                </TableCell>
-                <TableCell className="text-sm text-muted-foreground whitespace-nowrap" onClick={() => onSelect(contact)}>
-                  {contact.contactType || "—"}
                 </TableCell>
                 <TableCell className="text-sm text-muted-foreground whitespace-nowrap" onClick={() => onSelect(contact)}>
                   {contact.source || "Manual Entry"}

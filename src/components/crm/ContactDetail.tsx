@@ -5,6 +5,8 @@ import {
   addPortcoIntro,
   setPortcoIntroSource,
   resolveFollowUp,
+  updateInteraction,
+  deleteInteraction,
   mergeContactFields,
   storeApolloRaw,
   setContactRating,
@@ -54,6 +56,7 @@ import {
   Save,
   X,
   Plus,
+  Trash2,
   CheckCircle2,
   AlertCircle,
   PhoneCall,
@@ -264,7 +267,10 @@ export function ContactDetail({
   const [editInteractionData, setEditInteractionData] = useState({
     type: "" as InteractionType,
     summary: "",
+    isFollowUp: false,
+    followUpComplete: false,
   });
+  const [savingInteraction, setSavingInteraction] = useState(false);
   const [addPortCoOpen, setAddPortCoOpen] = useState(false);
   const [newPortCo, setNewPortCo] = useState("");
   const [newPortCoSource, setNewPortCoSource] = useState<EngagementSource>("direct introduction");
@@ -700,21 +706,86 @@ export function ContactDetail({
 
   const startEditingInteraction = (interaction: Interaction) => {
     setEditingInteractionId(interaction.id);
-    setEditInteractionData({ type: interaction.type, summary: interaction.summary });
+    setEditInteractionData({
+      type: interaction.type,
+      summary: interaction.summary,
+      isFollowUp: Boolean(interaction.isFollowUp),
+      followUpComplete: Boolean(interaction.followUpComplete),
+    });
   };
 
-  const saveInteractionEdit = () => {
-    if (!editingInteractionId) return;
+  const saveInteractionEdit = async () => {
+    if (!editingInteractionId || savingInteraction) return;
+    const original = contact.interactions.find((i) => i.id === editingInteractionId);
+    if (!original) return;
+
+    const next: Interaction = {
+      ...original,
+      type: editInteractionData.type,
+      summary: editInteractionData.summary,
+      isFollowUp: editInteractionData.isFollowUp,
+      followUpComplete: editInteractionData.isFollowUp
+        ? editInteractionData.followUpComplete
+        : false,
+    };
     const updated = {
       ...contact,
       interactions: contact.interactions.map((i) =>
-        i.id === editingInteractionId
-          ? { ...i, type: editInteractionData.type, summary: editInteractionData.summary }
-          : i,
+        i.id === editingInteractionId ? next : i,
       ),
     };
+    updated.followUpPending = updated.interactions.some((i) => i.isFollowUp && !i.followUpComplete);
     if (onContactUpdate) onContactUpdate(updated);
     setEditingInteractionId(null);
+
+    setSavingInteraction(true);
+    try {
+      const res = await updateInteraction({
+        data: {
+          contactEmail: contact.email,
+          originalNoteContent: original.summary,
+          originalTimestamp: original.date,
+          summary: next.summary,
+          type: next.type,
+          requiresFollowUp: Boolean(next.isFollowUp),
+          resolved: Boolean(next.followUpComplete),
+        },
+      });
+      if (!res.success) toast.error("Couldn't save interaction to the sheet.");
+    } catch (e) {
+      console.error("updateInteraction failed", e);
+      toast.error("Couldn't save interaction — see console.");
+    } finally {
+      setSavingInteraction(false);
+    }
+  };
+
+  const deleteInteractionEntry = async (interactionId: string) => {
+    const original = contact.interactions.find((i) => i.id === interactionId);
+    if (!original || original.sourceRef) return;
+
+    const updated = {
+      ...contact,
+      interactions: contact.interactions.filter((i) => i.id !== interactionId),
+    };
+    updated.followUpPending = updated.interactions.some((i) => i.isFollowUp && !i.followUpComplete);
+    if (onContactUpdate) onContactUpdate(updated);
+    if (editingInteractionId === interactionId) setEditingInteractionId(null);
+
+    try {
+      const res = await deleteInteraction({
+        data: {
+          contactEmail: contact.email,
+          noteContent: original.summary,
+          timestamp: original.date,
+        },
+      });
+      if (!res.success) toast.error("Couldn't delete interaction from the sheet.");
+      else toast.success("Interaction deleted.");
+    } catch (e) {
+      console.error("deleteInteraction failed", e);
+      toast.error("Couldn't delete interaction — see console.");
+    }
   };
 
   const toggleFollowUpComplete = async (interactionId: string) => {
@@ -1542,7 +1613,7 @@ export function ContactDetail({
                           </div>
                           <div className="flex-1 min-w-0">
                             {isEditingThis ? (
-                              <div className="space-y-2">
+                              <div className="space-y-2 rounded-md border border-border bg-muted/20 p-2">
                                 <Select
                                   value={editInteractionData.type}
                                   onValueChange={(v) =>
@@ -1552,7 +1623,7 @@ export function ContactDetail({
                                     })
                                   }
                                 >
-                                  <SelectTrigger className="h-7 text-xs w-32">
+                                  <SelectTrigger className="h-7 text-xs w-36">
                                     <SelectValue />
                                   </SelectTrigger>
                                   <SelectContent>
@@ -1565,8 +1636,8 @@ export function ContactDetail({
                                     <SelectItem value="follow-up">Follow-up</SelectItem>
                                   </SelectContent>
                                 </Select>
-                                <Input
-                                  className="h-7 text-xs"
+                                <Textarea
+                                  className="min-h-[64px] text-xs"
                                   value={editInteractionData.summary}
                                   onChange={(e) =>
                                     setEditInteractionData({
@@ -1575,11 +1646,40 @@ export function ContactDetail({
                                     })
                                   }
                                 />
-                                <div className="flex gap-1">
+                                <label className="flex items-center gap-2 text-[11px] text-muted-foreground cursor-pointer">
+                                  <Checkbox
+                                    checked={editInteractionData.isFollowUp}
+                                    onCheckedChange={(v) =>
+                                      setEditInteractionData({
+                                        ...editInteractionData,
+                                        isFollowUp: v === true,
+                                        followUpComplete:
+                                          v === true ? editInteractionData.followUpComplete : false,
+                                      })
+                                    }
+                                  />
+                                  Needs follow-up
+                                </label>
+                                {editInteractionData.isFollowUp && (
+                                  <label className="flex items-center gap-2 text-[11px] text-muted-foreground cursor-pointer">
+                                    <Checkbox
+                                      checked={editInteractionData.followUpComplete}
+                                      onCheckedChange={(v) =>
+                                        setEditInteractionData({
+                                          ...editInteractionData,
+                                          followUpComplete: v === true,
+                                        })
+                                      }
+                                    />
+                                    Resolved
+                                  </label>
+                                )}
+                                <div className="flex flex-wrap gap-1">
                                   <Button
                                     size="sm"
                                     className="h-6 text-[10px] px-2"
-                                    onClick={saveInteractionEdit}
+                                    onClick={() => void saveInteractionEdit()}
+                                    disabled={savingInteraction}
                                   >
                                     Save
                                   </Button>
@@ -1590,6 +1690,15 @@ export function ContactDetail({
                                     onClick={() => setEditingInteractionId(null)}
                                   >
                                     Cancel
+                                  </Button>
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="h-6 text-[10px] px-2 text-destructive hover:text-destructive ml-auto"
+                                    onClick={() => void deleteInteractionEntry(interaction.id)}
+                                  >
+                                    <Trash2 className="h-3 w-3 mr-1" />
+                                    Delete
                                   </Button>
                                 </div>
                               </div>

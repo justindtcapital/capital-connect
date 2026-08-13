@@ -129,6 +129,8 @@ export interface SignalConfig {
     /** Cold-start default when the company has little monitoring history. */
     coldStartDefault: number;
     quietDays: number;
+    /** When false, skip synthetic "unusual_activity" burst meta-events entirely. */
+    burstEnabled: boolean;
     /** Burst detector: ≥ burstMinEvents within burstWindowDays after a quiet
      *  priorQuietDays ⇒ synthetic "unusual_activity" meta-event. */
     burstMinEvents: number;
@@ -309,6 +311,7 @@ export const DEFAULT_SIGNAL_CONFIG: SignalConfig = {
     quietDefault: 0.9,
     coldStartDefault: 0.7,
     quietDays: 90,
+    burstEnabled: false,
     burstMinEvents: 3,
     burstWindowDays: 7,
     priorQuietDays: 90,

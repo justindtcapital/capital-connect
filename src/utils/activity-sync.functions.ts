@@ -16,7 +16,12 @@ import {
   type ActivityTrackSyncResult,
 } from "./sheets.server";
 import { isGmailCrmSyncConfigured } from "./gmail.server";
-import { matchActivitiesToContact, resolvePortcosMentioned } from "@/lib/activity-match";
+import {
+  canonicalizeGmailActivities,
+  dropCrossSourceDupes,
+  matchActivitiesToContact,
+  resolvePortcosMentioned,
+} from "@/lib/activity-match";
 import type { AsanaActivity, Contact, InteractionType } from "@/lib/types";
 
 // Classify a BD/GTM activity into the CRM interaction taxonomy from its
@@ -25,7 +30,8 @@ function activityInteractionType(a: AsanaActivity): InteractionType {
   if (a.gid.startsWith("gmail-") || (a.type || "").toLowerCase() === "email") return "email";
   const hay = `${a.type || ""} ${a.name || ""}`.toLowerCase();
   if (/\bintro(duction|s|ed|ing)?\b/.test(hay)) return "intro";
-  if (/meeting|met with|met w\/|onsite|on-site|dinner|lunch|coffee|visit|qbr|demo\b/.test(hay)) return "meeting";
+  if (/meeting|met with|met w\/|onsite|on-site|dinner|lunch|coffee|visit|qbr|demo\b/.test(hay))
+    return "meeting";
   if (/\bcall\b|phone|zoom|webex|dial|spoke with/.test(hay)) return "call";
   if (/conference|webinar|summit|event|booth|expo/.test(hay)) return "event";
   if (/email|e-mail|outreach|reached out|follow[- ]?up email|sent/.test(hay)) return "email";
@@ -120,9 +126,28 @@ async function existingPortcoEngagementKeys(): Promise<Set<string>> {
   return keys;
 }
 
-async function loadAllTrackActivities(): Promise<AsanaActivity[]> {
-  const [asana, gmail] = await Promise.all([fetchActivities(), fetchAliasActivities()]);
-  return [...asana, ...gmail];
+interface LoadedTrackActivities {
+  activities: AsanaActivity[];
+  contacts: Contact[];
+  portfolioNames: string[];
+}
+
+// Load Asana + Gmail activities, drop Gmail twins of Asana tasks (most tracked
+// threads also hit the x+…@mail.asana.com intake, so the same touch arrives
+// from both sources), then canonicalize Gmail Person/Company against the CRM
+// so every sheet write uses the contact's exact name and a content-derived
+// company (portco mention > CRM company > domain guess).
+async function loadAllTrackActivities(): Promise<LoadedTrackActivities> {
+  const [asana, gmail, contacts, companies] = await Promise.all([
+    fetchActivities(),
+    fetchAliasActivities(),
+    buildContacts(),
+    buildPortfolioCompanies().catch(() => [] as { name: string }[]),
+  ]);
+  const portfolioNames = companies.map((c) => c.name).filter(Boolean);
+  const gmailKept = dropCrossSourceDupes(asana, gmail);
+  const gmailCanonical = canonicalizeGmailActivities(gmailKept, contacts, portfolioNames);
+  return { activities: [...asana, ...gmailCanonical], contacts, portfolioNames };
 }
 
 // Pull every BD/GTM activity from Asana + Gmail aliases and log each one as a
@@ -132,7 +157,7 @@ async function loadAllTrackActivities(): Promise<AsanaActivity[]> {
 export const syncAsanaActivities = createServerFn({ method: "POST" }).handler(
   async (): Promise<SyncActivitiesResult> => {
     try {
-      const activities = await loadAllTrackActivities();
+      const { activities, contacts, portfolioNames } = await loadAllTrackActivities();
       if (activities.length === 0) {
         await logOpsEvent({
           action: "sync",
@@ -144,13 +169,10 @@ export const syncAsanaActivities = createServerFn({ method: "POST" }).handler(
         return EMPTY;
       }
 
-      const [contacts, already, portcoKeys, companies] = await Promise.all([
-        buildContacts(),
+      const [already, portcoKeys] = await Promise.all([
         existingSyncKeys(),
         existingPortcoEngagementKeys(),
-        buildPortfolioCompanies().catch(() => [] as { name: string }[]),
       ]);
-      const portfolioNames = companies.map((c) => c.name).filter(Boolean);
 
       const today = new Date().toISOString().slice(0, 10);
       const queued = new Set<string>();
@@ -188,10 +210,7 @@ export const syncAsanaActivities = createServerFn({ method: "POST" }).handler(
           if (queued.has(key)) continue; // same pair reached via two match rules
           queued.add(key);
 
-          const summary =
-            portcos.length > 0
-              ? `${a.name} · PortCo: ${portcos.join(", ")}`
-              : a.name;
+          const summary = portcos.length > 0 ? `${a.name} · PortCo: ${portcos.join(", ")}` : a.name;
 
           rows.push({
             email: contactEmail,
@@ -296,7 +315,7 @@ const EMPTY_TRACK: ActivityTrackResult = {
 export const syncActivityTracks = createServerFn({ method: "POST" }).handler(
   async (): Promise<ActivityTrackResult> => {
     try {
-      const activities = await loadAllTrackActivities();
+      const { activities } = await loadAllTrackActivities();
       if (activities.length === 0) {
         await logOpsEvent({
           action: "sync",

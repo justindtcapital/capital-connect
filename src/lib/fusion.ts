@@ -12,6 +12,7 @@
 
 import type { SignalConfig, SignalEventType } from "@/lib/signal-config";
 import { normCompanyKey } from "@/lib/event-cluster";
+import { GATE_BADGE } from "@/lib/signal-gates";
 
 /** Minimal Intel Events row shape (subset of intel.server's EventRow). */
 export interface IntelEventLite {
@@ -146,6 +147,19 @@ export const BADGE = {
   confirmedByPress: "CONFIRMED_BY_PRESS",
   intelCorroborated: "INTEL_CORROBORATED",
   promoted: "PROMOTED_TO_WATCHLIST",
+  ambiguousEntity: "AMBIGUOUS_ENTITY",
+  needsReview: GATE_BADGE.needsReview,
+  hold: GATE_BADGE.hold,
+  withheld: GATE_BADGE.withheld,
+  updated: GATE_BADGE.updated,
+  disputed: GATE_BADGE.disputed,
+  /** Phase 4 */
+  composite: "COMPOSITE_SIGNAL",
+  newToRadar: "NEW_TO_RADAR",
+  founderMovement: "FOUNDER_MOVEMENT",
+  execMovement: "EXEC_MOVEMENT",
+  trajectoryReversal: "TRAJECTORY_REVERSAL",
+  composedInto: "COMPOSED_INTO",
 } as const;
 
 /** Set-union badge merge, order-stable, semicolon-serialized on rows. */

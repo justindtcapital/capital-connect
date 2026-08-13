@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { scanSignals, fetchSignals, fetchSignalBody } from "@/utils/gemini.functions";
 import {
   logSignalFeedback,
+  submitSignalVerdict,
   fetchSignalQualityMetrics,
 } from "@/utils/signal-feedback.functions";
 import { fetchLinkedInFeed } from "@/utils/linkedin.functions";
@@ -10,7 +11,6 @@ import { fetchDriveDocs } from "@/utils/drive.functions";
 import { fetchGmailFeed } from "@/utils/gmail.functions";
 import { fetchPortfolioCompanies, fetchContacts } from "@/utils/sheets.functions";
 import {
-  recordVerdict,
   fetchWatchUniverse,
   setWatchTier,
   type WatchEntity,
@@ -21,7 +21,14 @@ import {
   DialogContent,
   DialogHeader,
   DialogTitle,
+  DialogFooter,
 } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { useAuth } from "@/lib/auth-context";
 import { absoluteHttpUrl } from "@/lib/safe-url";
 import type { Contact, PortfolioCompany } from "@/lib/types";
@@ -33,6 +40,14 @@ import {
   INDUSTRIES,
   type FeedCard,
 } from "@/lib/signal-feed";
+import { textAlreadyCovered } from "@/lib/signal-dedup";
+import {
+  PRIMARY_VERDICTS,
+  MORE_VERDICTS,
+  verdictNeedsCorrection,
+  sourceHostFromUrl,
+  type FeedbackVerdict,
+} from "@/lib/feedback";
 import { companyLogoSources } from "@/lib/domain-utils";
 import type { ScoredTarget } from "@/utils/broadcast.functions";
 import { Button } from "@/components/ui/button";
@@ -261,7 +276,142 @@ function EventBadges({ card }: { card: FeedCard }) {
       </span>,
     );
   }
-  if ((card.sourceCount ?? 1) > 1) {
+  if (badges.includes("COMPOSITE_SIGNAL")) {
+    chips.push(
+      <span
+        key="cmp"
+        title="Multi-family weak-signal stack — hiring + commercial/engineering/funding evidence fused. Registry alerts cannot produce this."
+        className="inline-flex items-center gap-1 rounded-md border border-teal-300 bg-teal-50 px-1.5 py-0.5 text-[10px] font-semibold text-teal-800"
+      >
+        <Layers className="h-3 w-3" /> Composite signal
+      </span>,
+    );
+  }
+  if (badges.includes("NEW_TO_RADAR")) {
+    chips.push(
+      <span
+        key="ntr"
+        title="Company not on the roster — thesis-keyword match. Use Follow more / Not useful to tune discovery."
+        className="inline-flex items-center gap-1 rounded-md border border-cyan-300 bg-cyan-50 px-1.5 py-0.5 text-[10px] font-semibold text-cyan-800"
+      >
+        <Radar className="h-3 w-3" /> New to radar
+      </span>,
+    );
+  }
+  if (badges.includes("FOUNDER_MOVEMENT")) {
+    chips.push(
+      <span
+        key="fm"
+        title="A founder in the network changed roles or companies."
+        className="inline-flex items-center gap-1 rounded-md border border-fuchsia-300 bg-fuchsia-50 px-1.5 py-0.5 text-[10px] font-semibold text-fuchsia-800"
+      >
+        <Zap className="h-3 w-3" /> Founder movement
+      </span>,
+    );
+  } else if (badges.includes("EXEC_MOVEMENT")) {
+    chips.push(
+      <span
+        key="em"
+        title="Executive role change detected from press extract or CRM drift."
+        className="inline-flex items-center gap-1 rounded-md border border-fuchsia-200 bg-fuchsia-50/70 px-1.5 py-0.5 text-[10px] font-semibold text-fuchsia-700"
+      >
+        <Zap className="h-3 w-3" /> Exec movement
+      </span>,
+    );
+  }
+  if (badges.includes("TRAJECTORY_REVERSAL")) {
+    chips.push(
+      <span
+        key="tr"
+        title="Metric slope flipped sign after sustained trend — portfolio-risk deceleration/acceleration."
+        className="inline-flex items-center gap-1 rounded-md border border-amber-400 bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold text-amber-900"
+      >
+        <AlertTriangle className="h-3 w-3" /> Trajectory reversal
+      </span>,
+    );
+  }
+  if (badges.includes("NEEDS_REVIEW")) {
+    chips.push(
+      <span
+        key="nr"
+        title="Trust gate: low-confidence or ambiguous attribution — confirm the subject before acting."
+        className="inline-flex items-center gap-1 rounded-md border border-orange-300 bg-orange-50 px-1.5 py-0.5 text-[10px] font-semibold text-orange-800"
+      >
+        <AlertTriangle className="h-3 w-3" /> Needs review
+      </span>,
+    );
+  }
+  if (badges.includes("HOLD_CORROBORATION")) {
+    chips.push(
+      <span
+        key="hold"
+        title="Thin evidence — held pending an independent Tier A/B source or intel corroboration."
+        className="inline-flex items-center gap-1 rounded-md border border-slate-300 bg-slate-100 px-1.5 py-0.5 text-[10px] font-semibold text-slate-700"
+      >
+        <AlertTriangle className="h-3 w-3" /> Hold — awaiting corroboration
+      </span>,
+    );
+  }
+  if (badges.includes("UPDATED")) {
+    chips.push(
+      <span
+        key="upd"
+        title="Material update to a prior event (new magnitude or validated field)."
+        className="inline-flex items-center gap-1 rounded-md border border-indigo-300 bg-indigo-50 px-1.5 py-0.5 text-[10px] font-semibold text-indigo-700"
+      >
+        <Layers className="h-3 w-3" /> Updated
+      </span>,
+    );
+  }
+  if (badges.includes("SOURCES_DISAGREE")) {
+    chips.push(
+      <span
+        key="dis"
+        title="Independent sources disagree on a material field (e.g. funding magnitude). Claims are preserved — not averaged."
+        className="inline-flex items-center gap-1 rounded-md border border-rose-300 bg-rose-50 px-1.5 py-0.5 text-[10px] font-semibold text-rose-800"
+      >
+        <AlertTriangle className="h-3 w-3" /> Sources disagree
+      </span>,
+    );
+  }
+  if (badges.includes("AMBIGUOUS_ENTITY")) {
+    chips.push(
+      <span
+        key="amb"
+        title="Company attribution is unverified — multiple registry matches. Pick the right company in feedback (wrong company) to seed an alias."
+        className="inline-flex items-center gap-1 rounded-md border border-amber-300 bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800"
+      >
+        <AlertTriangle className="h-3 w-3" /> Attribution unverified
+      </span>,
+    );
+  }
+  const indep = card.independentSources;
+  const synd = card.syndicatedSources ?? 0;
+  if (indep != null && (indep > 0 || synd > 0 || (card.sourceCount ?? 0) > 1)) {
+    const label =
+      synd > 0
+        ? `${indep} independent · ${synd} syndication${synd === 1 ? "" : "s"}`
+        : indep > 1
+          ? `${indep} independent`
+          : (card.sourceCount ?? 1) > 1
+            ? `×${card.sourceCount} sources`
+            : null;
+    if (label) {
+      chips.push(
+        <span
+          key="src"
+          title={
+            synd > 0
+              ? `${indep} independent Tier A/B source families; ${synd} same-day syndication${synd === 1 ? "" : "s"} not counted as corroboration`
+              : `${indep} independent Tier A/B source families`
+          }
+          className="inline-flex items-center gap-1 rounded-md border border-border bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
+        >
+          <Layers className="h-3 w-3" /> {label}
+        </span>,
+      );
+    }
+  } else if ((card.sourceCount ?? 1) > 1) {
     chips.push(
       <span
         key="src"
@@ -511,6 +661,7 @@ function SignalsPage() {
   const [invSel, setInvSel] = useState<string[]>([]);
   const [indSel, setIndSel] = useState<string[]>([]);
   const [keyCompaniesOnly, setKeyCompaniesOnly] = useState(false);
+  const [needsReviewOnly, setNeedsReviewOnly] = useState(false);
 
   const [expanded, setExpanded] = useState<string | null>(null);
 
@@ -518,30 +669,70 @@ function SignalsPage() {
   // keyed by card id, plus in-flight tracking.
   const [bodies, setBodies] = useState<Record<string, string>>({});
   const [bodyBusy, setBodyBusy] = useState<Record<string, boolean>>({});
-  // Partner feedback per card — labels for the intel learning loop.
+  // Partner feedback per card — labels for the learning loop.
   const [verdicts, setVerdicts] = useState<Record<string, string>>({});
+  const [correctionOpen, setCorrectionOpen] = useState<{
+    card: FeedCard;
+    verdict: FeedbackVerdict;
+  } | null>(null);
+  const [correctionText, setCorrectionText] = useState("");
   const { email: authEmail } = useAuth();
   const submitVerdict = async (
     card: FeedCard,
-    verdict: "useful" | "not_useful" | "already_knew",
+    verdict: FeedbackVerdict,
+    correction?: string,
   ) => {
     if (!card.storedId) return;
+    if (verdictNeedsCorrection(verdict) && !(correction || "").trim()) {
+      setCorrectionOpen({ card, verdict });
+      setCorrectionText("");
+      return;
+    }
     setVerdicts((prev) => ({ ...prev, [card.id]: verdict }));
     // "Not useful" is the feed's dismissal — it also lands in the WS5
     // interaction log so the nightly job never counts the card as ignored.
     if (verdict === "not_useful") logFeedback(card, "dismissed");
     try {
-      await recordVerdict({
+      const res = await submitSignalVerdict({
         data: {
           signalId: card.storedId,
-          company: card.company,
+          eventId: card.eventId,
           verdict,
           user: authEmail || undefined,
+          company: card.company,
+          sourceType: card.sourceType,
+          rankScore: card.rankScore,
+          sourceHost: sourceHostFromUrl(card.sourceUrl) || undefined,
+          rankPosition: rankPositionOf(card),
+          correction: correction?.trim() || undefined,
+          features: {
+            opportunity: card.insight?.scores.opportunity,
+            badges: card.badges?.join(";") || undefined,
+            headline: card.headline,
+          },
         },
       });
+      if (!res.ok) toast.error(res.error || "Could not save feedback");
     } catch (e) {
-      console.error("recordVerdict failed", e);
+      console.error("submitSignalVerdict failed", e);
+      toast.error("Could not save feedback");
     }
+  };
+
+  const confirmCorrection = async () => {
+    if (!correctionOpen) return;
+    const text = correctionText.trim();
+    if (!text) {
+      toast.error(
+        correctionOpen.verdict === "wrong_company"
+          ? "Which company is correct?"
+          : "Which person is correct?",
+      );
+      return;
+    }
+    const { card, verdict } = correctionOpen;
+    setCorrectionOpen(null);
+    await submitVerdict(card, verdict, text);
   };
 
   const loadBody = async (card: FeedCard) => {
@@ -666,12 +857,41 @@ function SignalsPage() {
     return [...set].sort((a, b) => a.localeCompare(b));
   }, [portfolio]);
 
+  const needsReviewCount = useMemo(
+    () =>
+      feed.filter((c) => {
+        const b = c.badges ?? [];
+        return (
+          b.includes("NEEDS_REVIEW") ||
+          b.includes("HOLD_CORROBORATION") ||
+          b.includes("AMBIGUOUS_ENTITY") ||
+          b.includes("SOURCES_DISAGREE")
+        );
+      }).length,
+    [feed],
+  );
+
   const filtered = useMemo(() => {
     // Keyword search is token-AND: every term must appear somewhere in the
     // card text, so "agentic security" matches "agentic identity security".
     const terms = search.trim().toLowerCase().split(/\s+/).filter(Boolean);
     const minTs = dateRange in DATE_RANGES ? Date.now() - DATE_RANGES[dateRange] * 86_400_000 : 0;
     const out = feed.filter((c) => {
+      const badges = c.badges ?? [];
+      const isReview =
+        badges.includes("NEEDS_REVIEW") ||
+        badges.includes("HOLD_CORROBORATION") ||
+        badges.includes("AMBIGUOUS_ENTITY") ||
+        badges.includes("SOURCES_DISAGREE");
+      // Default feed hides thin holds / recycled withhold; Needs review surfaces them.
+      if (needsReviewOnly) {
+        if (!isReview) return false;
+      } else if (
+        badges.includes("HOLD_CORROBORATION") ||
+        badges.includes("WITHHELD_RECYCLED")
+      ) {
+        return false;
+      }
       if (terms.length > 0) {
         const hay = `${c.headline} ${c.summary} ${c.company} ${c.category || ""}`.toLowerCase();
         if (!terms.every((t: string) => hay.includes(t))) return false;
@@ -701,7 +921,19 @@ function SignalsPage() {
       );
     }
     return out;
-  }, [feed, search, dateRange, sourceSel, segSel, coSel, invSel, indSel, keyCompaniesOnly, sortBy]);
+  }, [
+    feed,
+    search,
+    dateRange,
+    sourceSel,
+    segSel,
+    coSel,
+    invSel,
+    indSel,
+    keyCompaniesOnly,
+    needsReviewOnly,
+    sortBy,
+  ]);
 
   const activeFilterCount =
     sourceSel.length +
@@ -711,7 +943,8 @@ function SignalsPage() {
     indSel.length +
     (search ? 1 : 0) +
     (dateRange !== "120" ? 1 : 0) +
-    (keyCompaniesOnly ? 1 : 0);
+    (keyCompaniesOnly ? 1 : 0) +
+    (needsReviewOnly ? 1 : 0);
 
   // ── WS5 feed budget & abstention (presentation-layer only) ──────
   // In rank mode with no filters active, the morning view shows at most
@@ -798,6 +1031,7 @@ function SignalsPage() {
     setInvSel([]);
     setIndSel([]);
     setKeyCompaniesOnly(false);
+    setNeedsReviewOnly(false);
   };
   const toggle = (arr: string[], set: (v: string[]) => void, val: string) =>
     set(arr.includes(val) ? arr.filter((x) => x !== val) : [...arr, val]);
@@ -1173,6 +1407,18 @@ function SignalsPage() {
             ))}
           </FilterGroup>
 
+          <FilterGroup title="Trust">
+            <CheckRow
+              checked={needsReviewOnly}
+              onChange={setNeedsReviewOnly}
+              label={
+                needsReviewCount > 0
+                  ? `Needs review (${needsReviewCount})`
+                  : "Needs review"
+              }
+            />
+          </FilterGroup>
+
           <FilterGroup title="Key companies">
             <CheckRow
               checked={keyCompaniesOnly}
@@ -1368,10 +1614,23 @@ function SignalsPage() {
                           <div className="border-t border-border/60">
                             {/* Reading pane — the AI summary + link to the original, kept clean. */}
                             <div className="px-4 pt-3 pb-4 space-y-3">
-                              {card.summary && (
-                                <p className="text-xs text-muted-foreground">{card.summary}</p>
-                              )}
-                              <MarkdownMessage text={card.body || card.summary || "_No detail._"} />
+                              {(() => {
+                                const bodyText =
+                                  bodies[card.id] || card.body || card.summary || "";
+                                const showSummary =
+                                  Boolean(card.summary) &&
+                                  !textAlreadyCovered(bodyText, card.summary || "");
+                                return (
+                                  <>
+                                    {showSummary && (
+                                      <p className="text-xs text-muted-foreground">{card.summary}</p>
+                                    )}
+                                    <MarkdownMessage
+                                      text={card.body || card.summary || "_No detail._"}
+                                    />
+                                  </>
+                                );
+                              })()}
                               {card.bodyElided &&
                                 (bodyBusy[card.id] ? (
                                   <div className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -1419,7 +1678,7 @@ function SignalsPage() {
                                 </Button>
                               </div>
                               {card.storedId && (
-                                <div className="flex items-center gap-1.5 pt-1">
+                                <div className="flex items-center gap-1.5 pt-1 flex-wrap">
                                   {verdicts[card.id] ? (
                                     <span className="text-[10px] text-muted-foreground">
                                       Feedback recorded — thanks.
@@ -1429,21 +1688,38 @@ function SignalsPage() {
                                       <span className="text-[10px] text-muted-foreground mr-1">
                                         Was this useful?
                                       </span>
-                                      {(
-                                        [
-                                          ["useful", "Useful"],
-                                          ["not_useful", "Not useful"],
-                                          ["already_knew", "Already knew"],
-                                        ] as const
-                                      ).map(([v, label]) => (
+                                      {PRIMARY_VERDICTS.map(({ value, label }) => (
                                         <button
-                                          key={v}
-                                          onClick={() => submitVerdict(card, v)}
+                                          key={value}
+                                          type="button"
+                                          onClick={() => submitVerdict(card, value)}
                                           className="text-[10px] px-1.5 py-0.5 rounded border border-border hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"
                                         >
                                           {label}
                                         </button>
                                       ))}
+                                      <DropdownMenu>
+                                        <DropdownMenuTrigger asChild>
+                                          <button
+                                            type="button"
+                                            className="text-[10px] px-1.5 py-0.5 rounded border border-border hover:bg-accent text-muted-foreground hover:text-foreground transition-colors inline-flex items-center gap-0.5"
+                                          >
+                                            More
+                                            <ChevronDown className="h-3 w-3" />
+                                          </button>
+                                        </DropdownMenuTrigger>
+                                        <DropdownMenuContent align="start" className="w-48">
+                                          {MORE_VERDICTS.map(({ value, label }) => (
+                                            <DropdownMenuItem
+                                              key={value}
+                                              className="text-xs"
+                                              onSelect={() => submitVerdict(card, value)}
+                                            >
+                                              {label}
+                                            </DropdownMenuItem>
+                                          ))}
+                                        </DropdownMenuContent>
+                                      </DropdownMenu>
                                     </>
                                   )}
                                 </div>
@@ -1563,6 +1839,52 @@ function SignalsPage() {
         initialPurpose={draftSeed.purpose}
         initialNotes={draftSeed.notes}
       />
+      <Dialog
+        open={!!correctionOpen}
+        onOpenChange={(o) => {
+          if (!o) setCorrectionOpen(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>
+              {correctionOpen?.verdict === "wrong_company"
+                ? "Which company is correct?"
+                : "Which person is correct?"}
+            </DialogTitle>
+          </DialogHeader>
+          <p className="text-xs text-muted-foreground">
+            Card showed{" "}
+            <span className="font-medium text-foreground">
+              {correctionOpen?.verdict === "wrong_person"
+                ? correctionOpen.card.person || "someone"
+                : correctionOpen?.card.company}
+            </span>
+            . Your correction seeds the alias table later.
+          </p>
+          <Input
+            autoFocus
+            value={correctionText}
+            onChange={(e) => setCorrectionText(e.target.value)}
+            placeholder={
+              correctionOpen?.verdict === "wrong_company"
+                ? "Correct company name"
+                : "Correct person name"
+            }
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void confirmCorrection();
+            }}
+          />
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => setCorrectionOpen(null)}>
+              Cancel
+            </Button>
+            <Button size="sm" onClick={() => void confirmCorrection()}>
+              Save feedback
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

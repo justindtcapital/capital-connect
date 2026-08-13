@@ -27,6 +27,9 @@ const TEAM: Record<string, { displayName: string; firstName: string; aliases?: s
   },
 };
 
+/** Roster emails — always counted as internal by the Gmail alias activity sync. */
+export const TEAM_MEMBER_EMAILS: string[] = Object.keys(TEAM);
+
 function titleCaseLocal(local: string): string {
   return local
     .replace(/[._+]+/g, " ")
@@ -65,17 +68,16 @@ export function teamProfile(email: string | null | undefined): TeamProfile | nul
 }
 
 /** True when an Owner field value refers to this teammate. */
-export function ownerMatches(
-  ownerField: string | undefined | null,
-  profile: TeamProfile,
-): boolean {
+export function ownerMatches(ownerField: string | undefined | null, profile: TeamProfile): boolean {
   const raw = (ownerField || "").trim().toLowerCase();
   if (!raw) return false;
   // Exact email / token hit, or the Owner string contains the full display name / email.
   if (profile.nameTokens.some((t) => t.length >= 3 && (raw === t || raw.includes(t)))) {
     // Guard: single common first names ("chris") alone are too weak unless Owner is short
     // or clearly pairs with the surname / email.
-    const weakOnly = profile.nameTokens.filter((t) => !t.includes("@") && !t.includes(" ") && t.length < 6);
+    const weakOnly = profile.nameTokens.filter(
+      (t) => !t.includes("@") && !t.includes(" ") && t.length < 6,
+    );
     const strong = profile.nameTokens.filter(
       (t) => t.includes("@") || t.includes(" ") || t.includes(".") || t.length >= 6,
     );
@@ -106,10 +108,7 @@ export function normalizeSourceRefToGid(ref?: string | null): string {
  * From BD + GTM sheet rows (header + data), collect Activity GIDs whose Owner
  * matches the signed-in teammate.
  */
-export function buildOwnedGidSet(
-  sheetTabs: string[][][],
-  profile: TeamProfile,
-): Set<string> {
+export function buildOwnedGidSet(sheetTabs: string[][][], profile: TeamProfile): Set<string> {
   const owned = new Set<string>();
   for (const rows of sheetTabs) {
     if (!rows.length) continue;

@@ -4,6 +4,7 @@ import {
   isGmailConfigured,
   getActivityAliases,
   getNewsAliases,
+  isActivityTrackingMessage,
   downloadGmailAttachment,
   type GmailMessage,
   type GmailAttachment,
@@ -11,10 +12,14 @@ import {
 import {
   emailPdfFolderId,
   findDriveFileByGmailAttachment,
+  findDriveFileByNameAndSize,
+  findDriveFileByContentHash,
   uploadDriveFile,
   downloadDriveFile,
   gmailAttachmentKey,
+  gmailPdfContentKey,
   GMAIL_ATTACH_PROP,
+  GMAIL_CONTENT_PROP,
   MAX_ARCHIVE_PDF_BYTES,
   type DriveDoc,
 } from "./drive.server";
@@ -59,6 +64,8 @@ export interface GmailSignal {
   digestSubject?: string;
   /** Durable Drive copy of an attached PDF (when archived). */
   docUrl?: string;
+  /** Drive webViewLink of the archived source PDF (citation-grade provenance). */
+  driveWebViewLink?: string;
   /** Preferred feed source-type when subject names a research publisher. */
   sourceHint?: "Industry Reports" | "Industry News" | "PortCo Blogs";
 }
@@ -81,9 +88,15 @@ export interface NewsAliasDoc extends GmailAttachment {
 }
 
 /**
- * Archive one Gmail PDF into Drive (deduped by appProperties). Best-effort —
- * failures return null and never block the feed or scan.
+ * Archive one Gmail PDF into Drive (deduped). Best-effort — failures return
+ * null and never block the feed or scan.
+ *
+ * Gmail regenerates attachmentId on every messages.get, so identity is
+ * messageId + filename + size (+ content hash after download). Concurrent
+ * refreshes share one in-flight promise so they can't race two uploads.
  */
+const archiveInflight = new Map<string, Promise<DriveDoc | null>>();
+
 async function archiveGmailPdfToDrive(opts: {
   messageId: string;
   attachmentId: string;
@@ -100,26 +113,50 @@ async function archiveGmailPdfToDrive(opts: {
     return null;
   }
 
-  try {
-    const existing = await findDriveFileByGmailAttachment(opts.messageId, opts.attachmentId);
-    if (existing?.webViewLink) return existing;
+  const safeName = (opts.filename || "attachment.pdf").replace(/[\\/:*?"<>|]+/g, "_");
+  const sizeBytes = opts.sizeBytes || 0;
+  const stableKey = gmailAttachmentKey(opts.messageId, safeName, sizeBytes);
+  const existingJob = archiveInflight.get(stableKey);
+  if (existingJob) return existingJob;
 
-    const base64 = await downloadGmailAttachment(opts.messageId, opts.attachmentId);
-    if (!base64) return null;
+  const job = (async (): Promise<DriveDoc | null> => {
+    try {
+      // 1) Stable identity (survives attachmentId churn).
+      const byKey = await findDriveFileByGmailAttachment(opts.messageId, safeName, sizeBytes);
+      if (byKey?.webViewLink) return byKey;
 
-    const safeName = (opts.filename || "attachment.pdf").replace(/[\\/:*?"<>|]+/g, "_");
-    return await uploadDriveFile({
-      name: safeName,
-      mimeType: opts.mimeType || "application/pdf",
-      base64,
-      appProperties: {
-        [GMAIL_ATTACH_PROP]: gmailAttachmentKey(opts.messageId, opts.attachmentId),
-      },
-    });
-  } catch (e) {
-    console.error(`[gmail→drive] archive failed for ${opts.filename}:`, e);
-    return null;
-  }
+      // 2) Legacy uploads: same name + size already in the folder.
+      if (sizeBytes > 0) {
+        const byName = await findDriveFileByNameAndSize(safeName, sizeBytes);
+        if (byName?.webViewLink) return byName;
+      }
+
+      const base64 = await downloadGmailAttachment(opts.messageId, opts.attachmentId);
+      if (!base64) return null;
+
+      // 3) Exact byte match (re-forwards / legacy keys).
+      const byContent = await findDriveFileByContentHash(base64);
+      if (byContent?.webViewLink) return byContent;
+
+      return await uploadDriveFile({
+        name: safeName,
+        mimeType: opts.mimeType || "application/pdf",
+        base64,
+        appProperties: {
+          [GMAIL_ATTACH_PROP]: stableKey,
+          [GMAIL_CONTENT_PROP]: gmailPdfContentKey(base64),
+        },
+      });
+    } catch (e) {
+      console.error(`[gmail→drive] archive failed for ${opts.filename}:`, e);
+      return null;
+    } finally {
+      archiveInflight.delete(stableKey);
+    }
+  })();
+
+  archiveInflight.set(stableKey, job);
+  return job;
 }
 
 const FREE_EMAIL = new Set([
@@ -230,7 +267,7 @@ export async function gatherNetworkEmails(pre?: {
 
   // Keep BD/GTM activity-tracking aliases OUT of Signals — those emails belong to
   // the activity-sync pipeline (BD & GTM sheets), not the news feed. Exclude at the
-  // query level (from/to/cc) and again defensively after fetch.
+  // query level (from/to/cc/deliveredto) and again defensively after fetch.
   const aliases = getActivityAliases();
   const aliasSet = new Set(aliases);
   // deliveredto: also catches mail auto-forwarded INTO an alias inbox, where the
@@ -243,9 +280,10 @@ export async function gatherNetworkEmails(pre?: {
   const res = await searchGmail(q, max);
   if (!res.ok) return { configured: true, ok: false, emails: [], newsDocs: [], error: res.error };
 
-  const involvesAlias = (m: (typeof res.messages)[number]): boolean =>
-    [m.fromEmail, ...m.toEmails, ...m.ccEmails].some((e) => aliasSet.has((e || "").toLowerCase()));
-  const kept = res.messages.filter((m) => !involvesAlias(m));
+  // Post-filter: Delivered-To, DTC:/GTM Discussion subjects, Zoom/GTM meeting
+  // invites — Gmail -deliveredto: is imperfect and many threads never hit the
+  // alias header but are still Activity (not Industry News).
+  const kept = res.messages.filter((m) => !isActivityTrackingMessage(m, aliasSet));
 
   // PDF attachments on NEWS@-alias messages become scan grounding documents —
   // the diagram's "scraper needs to handle PDFs" lane. Refs only; the scan
@@ -278,7 +316,7 @@ export async function gatherNetworkEmails(pre?: {
       sizeBytes: number;
     }> = [];
     const pushAttach = (m: GmailMessage, a: GmailAttachment) => {
-      const k = `${m.id}:${a.attachmentId}`;
+      const k = gmailAttachmentKey(m.id, a.filename, a.sizeBytes);
       if (seenAttach.has(k)) return;
       seenAttach.add(k);
       toArchive.push({
@@ -454,23 +492,11 @@ export async function gatherNetworkEmails(pre?: {
       }
     }
 
-    return [
-      {
-        id: m.id,
-        subject: m.subject,
-        fromName: m.fromName,
-        fromEmail: m.fromEmail,
-        company: contact?.company || dom || m.fromName || "Email",
-        contactName: contact?.name,
-        snippet: m.snippet,
-        body: m.body,
-        date: m.date,
-        dateLabel: m.dateLabel,
-        permalink: m.permalink,
-        logoDomain: emailDomain(partyEmail) || undefined,
-        docUrl: driveByMessage.get(m.id),
-      },
-    ];
+    // Do NOT turn ordinary network 1:1 / meeting emails into Signals cards.
+    // Domain matching (e.g. dell.com contacts) used to surface BD/GTM Zoom
+    // invites as "Industry News". Those belong on Activity / GTM-Tracking.
+    // Signals Gmail lane is NEWS@ research + link digests only.
+    return [];
   });
 
   // When a NEWS@ forward has a PDF, ask Gemini to read it and write a concrete

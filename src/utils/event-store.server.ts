@@ -24,12 +24,16 @@ import {
   type SourceTier,
   type CorroborationRule,
 } from "@/lib/signal-config";
+import type { FeedbackAction } from "@/lib/feedback";
+export type { FeedbackAction } from "@/lib/feedback";
 
 export const SIGNAL_V2_TABS = {
   events: "Signal Events",
   feedback: "Signal Feedback",
   config: "Signal Config",
   metrics: "Signal Metrics",
+  timeAdvantage: "Time Advantage",
+  overflow: "Signal Overflow",
 } as const;
 
 export const SIGNAL_EVENT_SCHEMA_VERSION = 1;
@@ -74,6 +78,28 @@ export const SIGNAL_FEEDBACK_HEADERS = [
 
 export const SIGNAL_CONFIG_HEADERS = ["Section", "Key", "Value", "Notes"];
 export const SIGNAL_METRIC_HEADERS = ["Date", "Metric", "Value", "Details JSON"];
+
+export const TIME_ADVANTAGE_HEADERS = [
+  "Event ID",
+  "Entity",
+  "Company",
+  "Intel First Seen",
+  "Press First Seen",
+  "Advantage Days",
+  "Intel Evidence",
+  "Logged At",
+];
+
+export const SIGNAL_OVERFLOW_HEADERS = [
+  "Run At",
+  "Kind",
+  "Url",
+  "Name",
+  "Company",
+  "Reason",
+  "Cap",
+  "Kept Count",
+];
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -224,6 +250,8 @@ export async function ensureSignalV2Tabs(): Promise<void> {
   await ensureTab(SIGNAL_V2_TABS.events, SIGNAL_EVENT_HEADERS);
   await ensureTab(SIGNAL_V2_TABS.feedback, SIGNAL_FEEDBACK_HEADERS);
   await ensureTab(SIGNAL_V2_TABS.metrics, SIGNAL_METRIC_HEADERS);
+  await ensureTab(SIGNAL_V2_TABS.timeAdvantage, TIME_ADVANTAGE_HEADERS);
+  await ensureTab(SIGNAL_V2_TABS.overflow, SIGNAL_OVERFLOW_HEADERS);
   await ensureConfigSeeded();
 }
 
@@ -276,14 +304,6 @@ export function newEventId(): string {
 }
 
 // ── Feedback + metrics (WS5) ─────────────────────────────────────
-
-export type FeedbackAction =
-  | "rendered"
-  | "expanded"
-  | "clicked_source"
-  | "actioned"
-  | "dismissed"
-  | "ignored";
 
 export interface FeedbackRow {
   dateIso: string;
@@ -384,6 +404,173 @@ export async function loadSignalMetrics(
     const date = (r[0] || "").trim();
     if (cutoff && date < cutoff) continue;
     out.push({ date, value: num(r[2] || ""), details: parseJson(r[3] || "", {}) });
+  }
+  return out;
+}
+
+// ── Time Advantage ledger (Phase 0) ──────────────────────────────
+
+export interface TimeAdvantageRow {
+  eventId: string;
+  entityUrid: string;
+  company: string;
+  intelFirstSeen: string;
+  pressFirstSeen: string;
+  advantageDays: number;
+  intelEvidence: string;
+  loggedAt: string;
+}
+
+function advantageDaysBetween(pressIso: string, intelIso: string): number {
+  const press = Date.parse(pressIso);
+  const intel = Date.parse(intelIso);
+  if (!Number.isFinite(press) || !Number.isFinite(intel)) return 0;
+  return Math.round((press - intel) / 86_400_000);
+}
+
+/** One row per CONFIRMED_BY_PRESS match (intel preceded press). Best-effort. */
+export async function appendTimeAdvantageRow(input: {
+  eventId: string;
+  entityUrid?: string;
+  company: string;
+  intelFirstSeen: string;
+  pressFirstSeen: string;
+  intelEvidence?: string[] | string;
+}): Promise<void> {
+  const intel = (input.intelFirstSeen || "").trim();
+  const press = (input.pressFirstSeen || "").trim();
+  if (!input.eventId || !intel || !press) return;
+  const evidence = Array.isArray(input.intelEvidence)
+    ? input.intelEvidence.filter(Boolean).join("; ")
+    : (input.intelEvidence || "").trim();
+  const row: TimeAdvantageRow = {
+    eventId: input.eventId,
+    entityUrid: (input.entityUrid || "").trim(),
+    company: (input.company || "").trim(),
+    intelFirstSeen: intel,
+    pressFirstSeen: press,
+    advantageDays: advantageDaysBetween(press, intel),
+    intelEvidence: evidence.slice(0, 2000),
+    loggedAt: new Date().toISOString(),
+  };
+  try {
+    await ensureTab(SIGNAL_V2_TABS.timeAdvantage, TIME_ADVANTAGE_HEADERS);
+    await serialized(() =>
+      appendSheetRows(SIGNAL_V2_TABS.timeAdvantage, [
+        [
+          row.eventId,
+          row.entityUrid,
+          row.company,
+          row.intelFirstSeen,
+          row.pressFirstSeen,
+          String(row.advantageDays),
+          row.intelEvidence,
+          row.loggedAt,
+        ],
+      ]),
+    );
+  } catch (e) {
+    console.error("[time-advantage] append failed:", e);
+  }
+}
+
+export async function loadTimeAdvantage(opts: { sinceDays?: number } = {}): Promise<
+  TimeAdvantageRow[]
+> {
+  let rows: string[][] = [];
+  try {
+    rows = await fetchSheetTab(SIGNAL_V2_TABS.timeAdvantage);
+  } catch {
+    return [];
+  }
+  const cutoff =
+    opts.sinceDays && opts.sinceDays > 0
+      ? new Date(Date.now() - opts.sinceDays * 86_400_000).toISOString()
+      : "";
+  const out: TimeAdvantageRow[] = [];
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const loggedAt = (r[7] || "").trim();
+    if (!loggedAt || (cutoff && loggedAt < cutoff)) continue;
+    out.push({
+      eventId: (r[0] || "").trim(),
+      entityUrid: (r[1] || "").trim(),
+      company: (r[2] || "").trim(),
+      intelFirstSeen: (r[3] || "").trim(),
+      pressFirstSeen: (r[4] || "").trim(),
+      advantageDays: num(r[5] || ""),
+      intelEvidence: (r[6] || "").trim(),
+      loggedAt,
+    });
+  }
+  return out;
+}
+
+// ── Scan overflow ledger (Phase 0) ───────────────────────────────
+
+export interface OverflowRow {
+  runAt: string;
+  kind: string;
+  url: string;
+  name: string;
+  company: string;
+  reason: string;
+  cap: number;
+  keptCount: number;
+}
+
+export async function appendSignalOverflow(rows: OverflowRow[]): Promise<void> {
+  if (rows.length === 0) return;
+  try {
+    await ensureTab(SIGNAL_V2_TABS.overflow, SIGNAL_OVERFLOW_HEADERS);
+    await serialized(() =>
+      appendSheetRows(
+        SIGNAL_V2_TABS.overflow,
+        rows.map((r) => [
+          r.runAt,
+          r.kind,
+          (r.url || "").slice(0, 500),
+          (r.name || "").slice(0, 200),
+          (r.company || "").slice(0, 120),
+          r.reason || "capped",
+          String(r.cap),
+          String(r.keptCount),
+        ]),
+      ),
+    );
+  } catch (e) {
+    console.error("[signal-overflow] append failed:", e);
+  }
+}
+
+export async function loadSignalOverflow(opts: { sinceDays?: number } = {}): Promise<
+  OverflowRow[]
+> {
+  let rows: string[][] = [];
+  try {
+    rows = await fetchSheetTab(SIGNAL_V2_TABS.overflow);
+  } catch {
+    return [];
+  }
+  const cutoff =
+    opts.sinceDays && opts.sinceDays > 0
+      ? new Date(Date.now() - opts.sinceDays * 86_400_000).toISOString()
+      : "";
+  const out: OverflowRow[] = [];
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const runAt = (r[0] || "").trim();
+    if (!runAt || (cutoff && runAt < cutoff)) continue;
+    out.push({
+      runAt,
+      kind: (r[1] || "").trim(),
+      url: (r[2] || "").trim(),
+      name: (r[3] || "").trim(),
+      company: (r[4] || "").trim(),
+      reason: (r[5] || "").trim(),
+      cap: num(r[6] || ""),
+      keptCount: num(r[7] || ""),
+    });
   }
   return out;
 }

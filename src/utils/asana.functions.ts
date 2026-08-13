@@ -1,5 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
 import { fetchPortcoFields, fetchPortfolioEvents, discoverFields, fetchAllAsanaEvents, fetchActivities } from "./asana.server";
+import { fetchAliasActivities } from "./gmail.server";
 import type { PortfolioEvent, AsanaEvent, AsanaActivity } from "@/lib/types";
 
 export interface AsanaPortcoData {
@@ -65,11 +66,26 @@ export const fetchAsanaEvents = createServerFn({ method: "GET" }).handler(
   }
 );
 
-// BD + GTM activities, matched client-side to Contacts / PortCos for display.
+// BD + GTM activities (Asana tasks) merged with Gmail BD/GTM alias emails —
+// one stream for the activity feed and client-side matching.
 export const fetchAsanaActivities = createServerFn({ method: "GET" }).handler(
   async (): Promise<AsanaActivity[]> => {
     try {
-      return await fetchActivities();
+      const [asana, gmail] = await Promise.all([
+        fetchActivities().catch((err) => {
+          console.error("[asana] fetchActivities failed:", err);
+          return [] as AsanaActivity[];
+        }),
+        fetchAliasActivities().catch((err) => {
+          console.error("[asana] fetchAliasActivities failed:", err);
+          return [] as AsanaActivity[];
+        }),
+      ]);
+      return [...asana, ...gmail].sort((a, b) => {
+        const ad = Date.parse(a.date || "") || 0;
+        const bd = Date.parse(b.date || "") || 0;
+        return bd - ad;
+      });
     } catch (err) {
       console.error("[asana] fetchAsanaActivities failed:", err);
       return [];

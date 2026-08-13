@@ -23,8 +23,12 @@ const DRIVE_API = "https://www.googleapis.com/drive/v3";
 const DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3";
 /** Soft ceiling for archiving email PDFs (Gmail attachments are usually smaller). */
 export const MAX_ARCHIVE_PDF_BYTES = 25_000_000;
-/** Short appProperties key — Drive caps key+value at 124 UTF-8 bytes. */
+/** Short appProperties key — Drive caps key+value at 124 UTF-8 bytes.
+ *  `gak` = stable identity (message + filename + size). Gmail attachmentIds
+ *  change on every API fetch, so they must NOT be part of this key. */
 export const GMAIL_ATTACH_PROP = "gak";
+/** Content fingerprint of the PDF bytes (also appProperties). */
+export const GMAIL_CONTENT_PROP = "gch";
 
 export interface DriveDoc {
   id: string;
@@ -62,11 +66,22 @@ export function emailPdfFolderId(): string {
   );
 }
 
-/** Stable short fingerprint for a Gmail attachment (fits Drive appProperties).
- *  Uses pure-JS sha256 (not node:crypto) so this module is safe if pulled into
- *  the client bundle via route imports. */
-export function gmailAttachmentKey(messageId: string, attachmentId: string): string {
-  return sha256Hex(`${messageId}:${attachmentId}`).slice(0, 40);
+/** Stable short fingerprint for a Gmail PDF (fits Drive appProperties).
+ *  Uses messageId + filename + size — NOT Gmail's attachmentId, which is
+ *  regenerated on every messages.get and was causing endless Drive dupes.
+ *  Pure-JS sha256 so this module is safe if pulled into the client bundle. */
+export function gmailAttachmentKey(
+  messageId: string,
+  filename: string,
+  sizeBytes = 0,
+): string {
+  const name = (filename || "attachment.pdf").trim().toLowerCase();
+  return sha256Hex(`${messageId}|${name}|${Number(sizeBytes) || 0}`).slice(0, 40);
+}
+
+/** Fingerprint of PDF payload (base64 string is a stable proxy for the bytes). */
+export function gmailPdfContentKey(base64: string): string {
+  return sha256Hex(base64 || "").slice(0, 40);
 }
 
 function mapDriveFile(f: Record<string, unknown>): DriveDoc {
@@ -163,19 +178,20 @@ export async function listDriveDocs(limit = 25): Promise<DriveFeedResult> {
   return { configured: true, found: true, docs };
 }
 
-/** Find a previously archived Gmail attachment by its stable appProperties key. */
-export async function findDriveFileByGmailAttachment(
-  messageId: string,
-  attachmentId: string,
+/** Find a file in the email-PDF folder by a single appProperties key/value. */
+async function findDriveFileByAppProperty(
+  propKey: string,
+  propValue: string,
 ): Promise<DriveDoc | null> {
   const folderId = emailPdfFolderId();
-  if (!folderId || !messageId || !attachmentId) return null;
+  if (!folderId || !propKey || !propValue) return null;
 
-  const key = gmailAttachmentKey(messageId, attachmentId).replace(/'/g, "\\'");
+  const key = propValue.replace(/'/g, "\\'");
+  const safeProp = propKey.replace(/'/g, "\\'");
   const safeFolder = folderId.replace(/'/g, "\\'");
   const driveId = process.env.GOOGLE_SHARED_DRIVE_ID;
   const params = new URLSearchParams({
-    q: `'${safeFolder}' in parents and trashed=false and appProperties has { key='${GMAIL_ATTACH_PROP}' and value='${key}' }`,
+    q: `'${safeFolder}' in parents and trashed=false and appProperties has { key='${safeProp}' and value='${key}' }`,
     fields: "files(id,name,mimeType,modifiedTime,webViewLink,size)",
     pageSize: "1",
     supportsAllDrives: "true",
@@ -208,6 +224,72 @@ export async function findDriveFileByGmailAttachment(
     return f ? mapDriveFile(f) : null;
   } catch (e) {
     console.error("[drive] find network error:", e);
+    return null;
+  }
+}
+
+/** Find a previously archived Gmail PDF by stable message+filename+size key. */
+export async function findDriveFileByGmailAttachment(
+  messageId: string,
+  filename: string,
+  sizeBytes = 0,
+): Promise<DriveDoc | null> {
+  return findDriveFileByAppProperty(
+    GMAIL_ATTACH_PROP,
+    gmailAttachmentKey(messageId, filename, sizeBytes),
+  );
+}
+
+/** Find by PDF content hash (survives legacy keys / re-forwards of same bytes). */
+export async function findDriveFileByContentHash(base64: string): Promise<DriveDoc | null> {
+  if (!base64) return null;
+  return findDriveFileByAppProperty(GMAIL_CONTENT_PROP, gmailPdfContentKey(base64));
+}
+
+/**
+ * Fallback for files uploaded before the stable-key fix: match exact filename
+ * + size in the archive folder (keeps the oldest copy).
+ */
+export async function findDriveFileByNameAndSize(
+  filename: string,
+  sizeBytes: number,
+): Promise<DriveDoc | null> {
+  const folderId = emailPdfFolderId();
+  const name = (filename || "").trim();
+  if (!folderId || !name || !sizeBytes) return null;
+
+  const safeFolder = folderId.replace(/'/g, "\\'");
+  const safeName = name.replace(/'/g, "\\'");
+  const driveId = process.env.GOOGLE_SHARED_DRIVE_ID;
+  const params = new URLSearchParams({
+    q: `'${safeFolder}' in parents and trashed=false and name='${safeName}'`,
+    fields: "files(id,name,mimeType,modifiedTime,webViewLink,size,createdTime)",
+    orderBy: "createdTime asc",
+    pageSize: "10",
+    supportsAllDrives: "true",
+    includeItemsFromAllDrives: "true",
+  });
+  if (driveId) {
+    params.set("corpora", "drive");
+    params.set("driveId", driveId);
+  }
+
+  let token: string;
+  try {
+    token = await getAccessToken();
+  } catch {
+    return null;
+  }
+
+  try {
+    const res = await fetch(`${DRIVE_API}/files?${params.toString()}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { files?: Array<Record<string, unknown>> };
+    const match = (data.files || []).find((f) => Number(f.size) === sizeBytes);
+    return match ? mapDriveFile(match) : null;
+  } catch {
     return null;
   }
 }

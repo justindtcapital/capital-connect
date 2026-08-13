@@ -72,10 +72,11 @@ interface ImportHistoryRow {
 type FieldKey = keyof Omit<ParsedRow, "headline" | "employmentHistory">;
 type Mapping = Record<FieldKey, number>;
 
-// The importable fields, in display order. Name + email are required.
+// Importable fields. Name is always required. Email is required only when
+// Company is not mapped (a company-only identity is enough to create the row).
 const FIELDS: { key: FieldKey; label: string; required?: boolean }[] = [
   { key: "name", label: "Name", required: true },
-  { key: "email", label: "Email", required: true },
+  { key: "email", label: "Email" },
   { key: "title", label: "Title" },
   { key: "company", label: "Company" },
   { key: "phone", label: "Phone" },
@@ -84,6 +85,13 @@ const FIELDS: { key: FieldKey; label: string; required?: boolean }[] = [
   { key: "sector", label: "Sector" },
   { key: "linkedin", label: "LinkedIn" },
 ];
+
+/** Stable dedupe key: prefer email; otherwise name + company. */
+function contactDedupeKey(r: { name: string; email: string; company: string }): string {
+  const email = firstEmail(r.email).toLowerCase();
+  if (email) return `e:${email}`;
+  return `nc:${r.name.trim().toLowerCase()}|${r.company.trim().toLowerCase()}`;
+}
 
 const NO_COLUMN = -1;
 
@@ -267,6 +275,8 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
   const [source, setSource] = useState("");
   // Hands-off by default: imported contacts are auto-enriched unless unchecked.
   const [enrichOnImport, setEnrichOnImport] = useState(true);
+  /** Stamp Contacts "Follow Up Flag" = TRUE for every imported row. */
+  const [flagFollowUp, setFlagFollowUp] = useState(false);
   const [busy, setBusy] = useState(false);
   const [history, setHistory] = useState<ImportHistoryRow[]>([]);
   const [showHistory, setShowHistory] = useState(false);
@@ -280,7 +290,11 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
   }, [open]);
 
   const headers = grid?.[0] ?? [];
-  const missingRequired = mapping.name === NO_COLUMN || mapping.email === NO_COLUMN;
+  // Name always; email OR company column must be mapped.
+  const missingRequired =
+    mapping.name === NO_COLUMN ||
+    (mapping.email === NO_COLUMN && mapping.company === NO_COLUMN);
+  const emailRequiredByMapping = mapping.company === NO_COLUMN;
 
   const handleFile = async (file: File) => {
     setFileName(file.name);
@@ -299,8 +313,8 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
     setMapping((m) => ({ ...m, [field]: idx }));
 
   // Build importable rows from the current column mapping, then run the pre-flight
-  // checks: drop rows missing name/email, flag malformed emails, and dedupe
-  // (within-file + against existing contacts). Recomputes as you remap.
+  // checks: drop rows missing name (and email-or-company), flag malformed emails,
+  // and dedupe (within-file + against existing emails). Recomputes as you remap.
   const report = useMemo(() => {
     if (!grid || grid.length < 2) {
       return { rows: [] as ParsedRow[], skipped: 0, invalid: 0, missingRequired: 0, dataRows: 0 };
@@ -325,10 +339,23 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
     const unique: ParsedRow[] = [];
     let dupes = 0, invalid = 0, missingRequired = 0;
     for (const r of all) {
-      if (!r.name || !r.email) { missingRequired++; continue; }
-      if (!EMAIL_RE.test(firstEmail(r.email))) { invalid++; continue; }
-      const key = r.email.toLowerCase();
-      if (existing.has(key) || seen.has(key)) { dupes++; continue; }
+      const hasEmail = Boolean(firstEmail(r.email));
+      const hasCompany = Boolean(r.company.trim());
+      // Name + (email or company). Company alone is enough when email is blank.
+      if (!r.name || (!hasEmail && !hasCompany)) {
+        missingRequired++;
+        continue;
+      }
+      if (hasEmail && !EMAIL_RE.test(firstEmail(r.email))) {
+        invalid++;
+        continue;
+      }
+      const key = contactDedupeKey(r);
+      const emailKey = firstEmail(r.email).toLowerCase();
+      if ((emailKey && existing.has(emailKey)) || seen.has(key)) {
+        dupes++;
+        continue;
+      }
       seen.add(key);
       unique.push(r);
     }
@@ -346,6 +373,7 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
     setPortcoSource("direct introduction");
     setSource("");
     setEnrichOnImport(true);
+    setFlagFollowUp(false);
     setBusy(false);
   };
 
@@ -365,7 +393,12 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
     let commitDupes = 0;
     try {
       const fresh = new Set((await fetchContactEmails()).map((e) => e.toLowerCase()));
-      const filtered = rows.filter((r) => !fresh.has(r.email.toLowerCase()));
+      const filtered = rows.filter((r) => {
+        const emailKey = firstEmail(r.email).toLowerCase();
+        // No-email rows can't be matched by the email index — keep them.
+        if (!emailKey) return true;
+        return !fresh.has(emailKey);
+      });
       commitDupes = rows.length - filtered.length;
       toImport = filtered;
     } catch (e) {
@@ -400,39 +433,48 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
             employmentHistory: r.employmentHistory,
             temperature: "Warm",
             source: "CSV Import",
+            followUp: flagFollowUp,
           },
         });
         added++;
         // Each tag is best-effort and independent — a failure on one doesn't
         // block the others or the import as a whole.
-        if (evt) {
-          try {
-            await addEventToSheet({ data: { contactEmail: r.email, eventName: evt, type: "attended" } });
-            taggedEvent++;
-          } catch (e) {
-            console.error("event tag failed", r.email, e);
-          }
-        }
-        if (portcos.length > 0) {
-          // Tag the contact with each selected portfolio company (independent,
-          // best-effort). Count the contact once if any tag lands.
-          let taggedAny = false;
-          for (const portco of portcos) {
+        // Event / PortCo / source tags join on email — skip when still blank
+        // after enrich (contact was created by name + company only).
+        if (r.email) {
+          if (evt) {
             try {
-              await addPortcoIntro({ data: { contactEmail: r.email, portcoName: portco, source: portcoSource } });
-              taggedAny = true;
+              await addEventToSheet({ data: { contactEmail: r.email, eventName: evt, type: "attended" } });
+              taggedEvent++;
             } catch (e) {
-              console.error("portco tag failed", r.email, portco, e);
+              console.error("event tag failed", r.email, e);
             }
           }
-          if (taggedAny) taggedPortco++;
-        }
-        if (src) {
-          try {
-            await addNote({ data: { contactEmail: r.email, noteContent: `Source: ${src}`, requiresFollowUp: false } });
-            taggedSource++;
-          } catch (e) {
-            console.error("source tag failed", r.email, e);
+          if (portcos.length > 0) {
+            // Tag the contact with each selected portfolio company (independent,
+            // best-effort). Count the contact once if any tag lands.
+            let taggedAny = false;
+            for (const portco of portcos) {
+              try {
+                await addPortcoIntro({
+                  data: { contactEmail: r.email, portcoName: portco, source: portcoSource },
+                });
+                taggedAny = true;
+              } catch (e) {
+                console.error("portco tag failed", r.email, portco, e);
+              }
+            }
+            if (taggedAny) taggedPortco++;
+          }
+          if (src) {
+            try {
+              await addNote({
+                data: { contactEmail: r.email, noteContent: `Source: ${src}`, requiresFollowUp: false },
+              });
+              taggedSource++;
+            } catch (e) {
+              console.error("source tag failed", r.email, e);
+            }
           }
         }
       } catch (e) {
@@ -493,7 +535,8 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
           <DialogTitle>Bulk import contacts</DialogTitle>
           <DialogDescription className="text-xs">
             Upload a CSV. Columns are auto-matched by header — adjust the mapping below if anything is off.
-            Name and email are required. Optionally tag everyone by event, portfolio company, and/or source.
+            Name is required; map Email <em>or</em> Company (both is fine). Optionally tag everyone by
+            event, portfolio company, and/or source (tags need an email).
           </DialogDescription>
         </DialogHeader>
 
@@ -521,13 +564,17 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
                 </Label>
                 <div className="grid grid-cols-2 gap-x-3 gap-y-2">
                   {FIELDS.map((field) => {
-                    const unsetRequired = field.required && mapping[field.key] === NO_COLUMN;
+                    const fieldRequired =
+                      field.required ||
+                      (field.key === "email" && emailRequiredByMapping) ||
+                      (field.key === "company" && mapping.email === NO_COLUMN);
+                    const unsetRequired = fieldRequired && mapping[field.key] === NO_COLUMN;
                     return (
                       <div key={field.key} className="flex items-center gap-2">
                         <span
                           className={`text-[11px] w-20 shrink-0 ${unsetRequired ? "text-destructive font-medium" : "text-muted-foreground"}`}
                         >
-                          {field.label}{field.required ? " *" : ""}
+                          {field.label}{fieldRequired ? " *" : ""}
                         </span>
                         <Select
                           value={String(mapping[field.key])}
@@ -551,7 +598,7 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
                 </div>
                 {missingRequired && (
                   <p className="text-[11px] text-destructive mt-1.5">
-                    Map both Name and Email to enable import.
+                    Map Name, plus Email or Company, to enable import.
                   </p>
                 )}
               </div>
@@ -619,6 +666,18 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
                     </span>
                   </label>
 
+                  <label className="flex items-start gap-2 text-xs text-muted-foreground cursor-pointer">
+                    <Checkbox
+                      checked={flagFollowUp}
+                      onCheckedChange={(v) => setFlagFollowUp(v === true)}
+                      className="mt-0.5"
+                    />
+                    <span>
+                      Flag these people for follow-up
+                      <span className="text-muted-foreground/70"> — writes TRUE to the Contacts Follow Up Flag column.</span>
+                    </span>
+                  </label>
+
                   {/* Pre-flight validation report */}
                   <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-[11px]">
                     <div className="font-semibold text-foreground mb-1">Validation report</div>
@@ -627,7 +686,7 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
                       <span className="text-emerald-600 font-medium">Ready to import</span><span className="text-right tabular-nums text-emerald-600 font-medium">{rows.length}</span>
                       {skipped > 0 && (<><span>Duplicates skipped</span><span className="text-right tabular-nums">{skipped}</span></>)}
                       {report.invalid > 0 && (<><span className="text-amber-600">Invalid emails skipped</span><span className="text-right tabular-nums text-amber-600">{report.invalid}</span></>)}
-                      {report.missingRequired > 0 && (<><span className="text-amber-600">Missing name/email</span><span className="text-right tabular-nums text-amber-600">{report.missingRequired}</span></>)}
+                      {report.missingRequired > 0 && (<><span className="text-amber-600">Missing name or email/company</span><span className="text-right tabular-nums text-amber-600">{report.missingRequired}</span></>)}
                     </div>
                   </div>
 

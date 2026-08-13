@@ -26,6 +26,9 @@ import { normalizeEmails } from "@/lib/email";
 import { normalizeLinkedinUrl } from "@/lib/linkedin";
 import { normalizeSource, targetKeyOf, normalizeInteractionType } from "@/lib/types";
 import { buildPortCoCanonicalMap, canonicalizePortCo } from "@/lib/portco-canonical";
+import { extractDomain } from "@/lib/domain-utils";
+import { normalizePortcoName } from "@/lib/portco-names";
+import { findSectorColumnIndex, looksLikeJobTitle, normalizeSector } from "@/lib/sectors";
 import { getGoogleOAuthCreds, requireSpreadsheetId } from "./google.server";
 
 // ── Cache ────────────────────────────────────────────────────
@@ -112,7 +115,10 @@ export async function appendSheetRow(tabName: string, values: string[]): Promise
   const spreadsheetId = requireSpreadsheetId();
 
   const token = await getAccessToken();
-  const url = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(tabName)}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
+  // Pin the search range to A1 so Sheets finds the main table starting at
+  // column A (blank cells / trailing ensureColumn headers otherwise shift
+  // appends into the wrong columns).
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(`${tabName}!A1`)}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
 
   const res = await fetch(url, {
     method: "POST",
@@ -138,7 +144,7 @@ export async function appendSheetRows(tabName: string, rows: string[][]): Promis
   const spreadsheetId = requireSpreadsheetId();
 
   const token = await getAccessToken();
-  const url = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(tabName)}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(`${tabName}!A1`)}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
 
   const res = await fetch(url, {
     method: "POST",
@@ -298,11 +304,38 @@ export async function ensureHeaderRow(tabName: string, headers: string[]): Promi
 // Returns the 0-based column index. If the header is missing, it's appended as
 // a new rightmost column (the header cell is written). Used to add the
 // "Engagement Source" column to the existing PortCos Introduced tab in place.
+//
+// CRITICAL: never treat a failed/empty fetch as "blank sheet and write A1".
+// That used to overwrite Contacts!A1 (Name) with "LinkedIn" / "Source" / "urid"
+// during bulk import, leaving names under the wrong header.
 export async function ensureColumn(tabName: string, header: string): Promise<number> {
-  const rows = await fetchSheetTab(tabName).catch(() => [] as string[][]);
-  const headerRow = rows[0] || [];
-  const idx = headerRow.findIndex((h) => h.trim().toLowerCase() === header.trim().toLowerCase());
+  const want = header.trim().toLowerCase();
+
+  const locate = (rows: string[][]): number => {
+    const headerRow = rows[0] || [];
+    return headerRow.findIndex((h) => h.trim().toLowerCase() === want);
+  };
+
+  let rows = await fetchSheetTab(tabName);
+  let idx = locate(rows);
   if (idx !== -1) return idx;
+
+  // Stale/empty cache can look like a blank header row. Re-fetch once uncached
+  // before deciding where to append — writing at index 0 would clobber A1.
+  if ((rows[0] || []).length === 0) {
+    cache.delete(tabName);
+    rows = await fetchSheetTab(tabName);
+    idx = locate(rows);
+    if (idx !== -1) return idx;
+  }
+
+  const headerRow = rows[0] || [];
+  if (headerRow.length === 0 && rows.length > 1) {
+    throw new Error(
+      `Cannot ensure column "${header}" on "${tabName}": header row is empty but the tab has data. Refusing to overwrite A1.`,
+    );
+  }
+
   const newIdx = headerRow.length;
   await updateSheetCell(tabName, `${colLetters(newIdx)}1`, header);
   return newIdx;
@@ -1023,6 +1056,8 @@ export interface AddContactInput {
    *  Used by the CRM "Add Contact" dialog so individual network adds stay on
    *  the Network page instead of disappearing into Portfolio-only. */
   skipPortfolioSector?: boolean;
+  /** When true, write Follow Up Flag = TRUE on the Contacts row. */
+  followUp?: boolean;
 }
 
 // Portfolio-company match: returns "Portfolio" when the given company (or any
@@ -1046,6 +1081,53 @@ export async function resolvePortfolioSector(company: string): Promise<string> {
   return "";
 }
 
+/** Headers that may have overwritten Contacts!A1 via the old ensureColumn bug. */
+const CLOBBERED_NAME_HEADERS = new Set([
+  "linkedin",
+  "source",
+  "lead source",
+  "origin",
+  "urid",
+  "source context",
+  "headline",
+  "employment history",
+]);
+
+/**
+ * If Contacts has no Name column but A1 was overwritten with LinkedIn/Source/etc.
+ * while column A still holds person names, restore A1 to "Name". Idempotent.
+ */
+async function repairContactsNameHeader(): Promise<void> {
+  const rows = await fetchSheetTab(TAB_NAMES.contacts).catch(() => [] as string[][]);
+  if (rows.length === 0) return;
+  const headers = rows[0] || [];
+  const hasName = headers.some((h) => {
+    const k = h.trim().toLowerCase();
+    return k === "name" || k === "full name";
+  });
+  if (hasName) return;
+
+  const a1 = (headers[0] || "").trim().toLowerCase();
+  if (!CLOBBERED_NAME_HEADERS.has(a1)) return;
+
+  const sample = rows
+    .slice(1, 31)
+    .map((r) => (r[0] || "").trim())
+    .filter(Boolean);
+  if (sample.length === 0) return;
+
+  const looksLikeLinkedInOrMeta = (s: string) =>
+    /linkedin\.com/i.test(s) ||
+    /^https?:\/\//i.test(s) ||
+    /^(csv import|manual entry|apollo|smart paste)$/i.test(s);
+
+  const metaHits = sample.filter(looksLikeLinkedInOrMeta).length;
+  // Majority of A values are names (not URLs / import labels) → restore header.
+  if (metaHits * 2 >= sample.length) return;
+
+  await updateSheetCell(TAB_NAMES.contacts, "A1", "Name");
+}
+
 // Header-aware append to the Contacts tab: place each value in the column whose
 // header matches, so the row aligns with WHATEVER order the columns are in.
 // Shared by the addContact server fn and the prospect-importer.
@@ -1054,6 +1136,8 @@ export async function addContactRow(data: AddContactInput): Promise<void> {
   // Unify multi-email separators (| , whitespace) to "; " so the rest of the app
   // (primaryEmail, dedup, mailto) treats the cell consistently.
   const email = normalizeEmails(data.email);
+  // Undo accidental A1 clobbers from older ensureColumn before we write.
+  await repairContactsNameHeader();
   // Stamp a stable surrogate key on every new contact. Ensure the column exists
   // first so the header-aware append below has a slot to write it into.
   await ensureColumn(TAB_NAMES.contacts, "urid");
@@ -1090,7 +1174,7 @@ export async function addContactRow(data: AddContactInput): Promise<void> {
     "industry category": sector,
     sector: sector,
     "relationship status": data.temperature,
-    "follow up flag": "FALSE",
+    "follow up flag": data.followUp ? "TRUE" : "FALSE",
     "date added": now,
     // Canonical source — filled only when one of these columns exists.
     source: data.source ?? "",
@@ -1121,6 +1205,12 @@ export async function addContactRow(data: AddContactInput): Promise<void> {
       now,
     ]);
   } else {
+    // Guard: never append if Name was lost (would drop identity into LinkedIn/Source).
+    if (!headers.includes("name") && !headers.includes("full name")) {
+      throw new Error(
+        'Contacts tab is missing a "Name" column. Restore A1 to "Name" (or add a Name header) before importing.',
+      );
+    }
     await appendSheetRow(
       TAB_NAMES.contacts,
       headers.map((h) => valueByHeader[h] ?? ""),
@@ -1202,6 +1292,10 @@ export const SIGNAL_HEADERS = [
   "Rank Score",
   "Badges",
   "Score Breakdown",
+  // Phase 1 identity
+  "Entity URID",
+  "Resolve Rung",
+  "Resolve Confidence",
 ];
 
 const CONTACT_COLS: Record<string, string> = {
@@ -1330,6 +1424,105 @@ export async function appendInteractionRows(rows: InteractionRowInput[]): Promis
   await appendSheetRows(TAB_NAMES.interactions, rows.map(toValues));
 }
 
+/** Locate a Notes row by contact email + note text (+ optional timestamp). */
+function findInteractionRowIndex(
+  rows: string[][],
+  headers: string[],
+  contactEmail: string,
+  noteContent: string,
+  timestamp?: string,
+): number {
+  const emailIdx = headers.indexOf("contact email");
+  const noteIdx = headers.indexOf("note content");
+  const tsIdx = headers.indexOf("timestamp");
+  if (emailIdx === -1 || noteIdx === -1) return -1;
+  const emailLower = contactEmail.trim().toLowerCase();
+  const note = noteContent.trim();
+  const ts = (timestamp || "").trim();
+  for (let i = 1; i < rows.length; i++) {
+    const rowEmail = (rows[i][emailIdx] || "").trim().toLowerCase();
+    const rowNote = (rows[i][noteIdx] || "").trim();
+    if (rowEmail !== emailLower || rowNote !== note) continue;
+    if (ts && tsIdx !== -1) {
+      const rowTs = (rows[i][tsIdx] || "").trim();
+      if (rowTs && rowTs !== ts) continue;
+    }
+    return i;
+  }
+  return -1;
+}
+
+export interface UpdateInteractionInput {
+  contactEmail: string;
+  /** Original note text used to locate the row. */
+  originalNoteContent: string;
+  /** Original timestamp (optional; tightens the match when present). */
+  originalTimestamp?: string;
+  summary?: string;
+  type?: InteractionType;
+  requiresFollowUp?: boolean;
+  resolved?: boolean;
+}
+
+/** Patch an existing Notes-tab interaction (manual rows only — caller should skip synced). */
+export async function updateInteractionRow(
+  input: UpdateInteractionInput,
+): Promise<{ success: boolean }> {
+  const rows = await fetchSheetTab(TAB_NAMES.interactions);
+  if (rows.length < 2) return { success: false };
+  const headers = rows[0].map((h) => h.trim().toLowerCase());
+  const i = findInteractionRowIndex(
+    rows,
+    headers,
+    input.contactEmail,
+    input.originalNoteContent,
+    input.originalTimestamp,
+  );
+  if (i === -1) return { success: false };
+
+  const sheetRow = i + 1;
+  const updates: { range: string; value: string }[] = [];
+  const put = (header: string, value: string) => {
+    const idx = headers.indexOf(header);
+    if (idx === -1) return;
+    updates.push({ range: `${colLetters(idx)}${sheetRow}`, value });
+  };
+
+  if (input.summary !== undefined) put("note content", input.summary);
+  if (input.type !== undefined) put("type", input.type);
+  if (input.requiresFollowUp !== undefined) {
+    put("requires follow up", input.requiresFollowUp ? "TRUE" : "FALSE");
+  }
+  if (input.resolved !== undefined) {
+    put("follow up resolved", input.resolved ? "TRUE" : "FALSE");
+  }
+
+  if (updates.length === 0) return { success: true };
+  await updateSheetCells(TAB_NAMES.interactions, updates);
+  return { success: true };
+}
+
+/** Hard-delete a Notes-tab interaction row matched by email + note (+ optional timestamp). */
+export async function deleteInteractionRow(input: {
+  contactEmail: string;
+  noteContent: string;
+  timestamp?: string;
+}): Promise<{ success: boolean }> {
+  const rows = await fetchSheetTab(TAB_NAMES.interactions);
+  if (rows.length < 2) return { success: false };
+  const headers = rows[0].map((h) => h.trim().toLowerCase());
+  const i = findInteractionRowIndex(
+    rows,
+    headers,
+    input.contactEmail,
+    input.noteContent,
+    input.timestamp,
+  );
+  if (i === -1) return { success: false };
+  await deleteSheetRows(TAB_NAMES.interactions, [i + 1]);
+  return { success: true };
+}
+
 const TARGET_COLS: Record<string, string> = {
   urid: "urid",
   "first name": "firstName",
@@ -1340,7 +1533,13 @@ const TARGET_COLS: Record<string, string> = {
   email: "email",
   phone: "phone",
   location: "location",
+  // Sector Focus / Industry aliases → same field (header-aware; any one works).
   sector: "sector",
+  "sector focus": "sector",
+  "focus area": "sector",
+  "focus areas": "sector",
+  "focus area(s)": "sector",
+  industry: "sector",
   stage: "stage",
   source: "originSource",
   "research purpose": "researchPurpose",
@@ -1406,6 +1605,7 @@ export async function appendTargetRows(inputs: TargetRowInput[]): Promise<void> 
   const today = new Date().toISOString().split("T")[0];
 
   const built = inputs.map((t) => {
+    const sector = normalizeSector(t.sector);
     const valueByHeader: Record<string, string> = {
       urid: crypto.randomUUID(),
       "first name": t.firstName,
@@ -1416,7 +1616,13 @@ export async function appendTargetRows(inputs: TargetRowInput[]): Promise<void> 
       email: t.email,
       phone: t.phone || "",
       location: t.location,
-      sector: t.sector,
+      // Write under every sector-header alias so whichever column exists is filled.
+      sector,
+      "sector focus": sector,
+      "focus area": sector,
+      "focus areas": sector,
+      "focus area(s)": sector,
+      industry: sector,
       stage: t.stage,
       source: t.source,
       "research purpose": t.researchPurpose,
@@ -1428,6 +1634,58 @@ export async function appendTargetRows(inputs: TargetRowInput[]): Promise<void> 
   });
 
   await appendSheetRows(TAB_NAMES.targets, built);
+}
+
+/**
+ * Relocate job-title values that landed in the Sector / Sector Focus column into
+ * Role, then normalize remaining sector cells to the canonical vocabulary.
+ * Header-aware (Sector, Sector Focus, Focus Area(s), Industry). Idempotent.
+ */
+export async function repairTargetSectors(): Promise<{
+  total: number;
+  movedToRole: number;
+  normalized: number;
+}> {
+  await ensureTab(TAB_NAMES.targets, TARGET_HEADERS);
+
+  const rows = await fetchSheetTab(TAB_NAMES.targets);
+  if (rows.length < 2) return { total: 0, movedToRole: 0, normalized: 0 };
+
+  const headers = rows[0].map((h) => h.trim().toLowerCase());
+  const sectorIdx = findSectorColumnIndex(headers);
+  const roleIdx = headers.indexOf("role");
+  if (sectorIdx === -1) return { total: rows.length - 1, movedToRole: 0, normalized: 0 };
+
+  const updates: { range: string; value: string }[] = [];
+  let movedToRole = 0;
+  let normalized = 0;
+
+  for (let i = 1; i < rows.length; i++) {
+    const rawSector = (rows[i][sectorIdx] || "").trim();
+    if (!rawSector) continue;
+    const sheetRow = i + 1;
+
+    if (looksLikeJobTitle(rawSector)) {
+      if (roleIdx !== -1) {
+        const curRole = (rows[i][roleIdx] || "").trim();
+        if (!curRole) {
+          updates.push({ range: `${colLetters(roleIdx)}${sheetRow}`, value: rawSector });
+        }
+      }
+      updates.push({ range: `${colLetters(sectorIdx)}${sheetRow}`, value: "" });
+      movedToRole++;
+      continue;
+    }
+
+    const next = normalizeSector(rawSector);
+    if (next && next !== rawSector) {
+      updates.push({ range: `${colLetters(sectorIdx)}${sheetRow}`, value: next });
+      normalized++;
+    }
+  }
+
+  if (updates.length > 0) await updateSheetCells(TAB_NAMES.targets, updates);
+  return { total: rows.length - 1, movedToRole, normalized };
 }
 
 // Repair the Targets tab's stable-key column: create URID if the tab predates it,
@@ -1622,6 +1880,10 @@ export async function buildFieldProvenance(): Promise<
 }
 
 export async function buildContacts(): Promise<Contact[]> {
+  // Restore Contacts!A1 → Name when an older ensureColumn clobber left names
+  // under a LinkedIn/Source header (idempotent; no-op when healthy).
+  await repairContactsNameHeader();
+
   const [
     contactRows,
     eventRows,
@@ -1990,7 +2252,7 @@ const MERGE_FIELD_HEADERS: Record<string, string> = {
   email: "email",
   phone: "phone number",
   location: "location",
-  linkedinUrl: "linkedin",
+  linkedinUrl: "LinkedIn",
   prime: "relationship prime",
   sector: "industry category",
   contactType: "contact type",
@@ -2101,7 +2363,7 @@ export async function mergeContactFields(
     for (const [field, rawValue] of Object.entries(fields)) {
       if (rawValue === undefined) continue;
       const header = MERGE_FIELD_HEADERS[field];
-      const colIdx = header ? headers.indexOf(header) : -1;
+      const colIdx = header ? headers.indexOf(header.toLowerCase()) : -1;
       if (colIdx === -1) {
         skipped.push(field);
         continue;
@@ -2235,7 +2497,7 @@ export async function bulkMergeContactFields(
     for (const [field, rawValue] of Object.entries(fields)) {
       if (rawValue === undefined) continue;
       const header = MERGE_FIELD_HEADERS[field];
-      const colIdx = header ? headers.indexOf(header) : -1;
+      const colIdx = header ? headers.indexOf(header.toLowerCase()) : -1;
       if (colIdx === -1) continue;
       const value = rawValue;
       const current = (rows[i][colIdx] || "").trim();
@@ -2694,9 +2956,20 @@ export async function updateTargetFields(
     if (lastIdx !== -1) updates.push({ range: `${colLetters(lastIdx)}${rowNum}`, value: last });
   }
 
+  // Prefer writing sector to whichever sector-header alias exists on the sheet.
+  if (fields.sector !== undefined) {
+    fields = { ...fields, sector: normalizeSector(fields.sector) };
+  }
+
   for (const [field, header] of Object.entries(TARGET_UPDATE_HEADERS)) {
-    const val = fields[field];
+    let val = fields[field];
     if (val === undefined) continue;
+    if (field === "sector") {
+      const sectorIdx = findSectorColumnIndex(headers);
+      if (sectorIdx === -1) continue;
+      updates.push({ range: `${colLetters(sectorIdx)}${rowNum}`, value: val });
+      continue;
+    }
     const idx = headers.indexOf(header);
     if (idx === -1) continue;
     updates.push({ range: `${colLetters(idx)}${rowNum}`, value: val });
@@ -2796,7 +3069,9 @@ export async function bulkUpdateTargetFields(
       let val = entry.fields[field];
       if (val === undefined) continue;
       if (field === "linkedinUrl") val = normalizeLinkedinUrl(val);
-      const idx = headers.indexOf(header);
+      if (field === "sector") val = normalizeSector(val);
+      const idx =
+        field === "sector" ? findSectorColumnIndex(headers) : headers.indexOf(header);
       if (idx === -1) continue;
       if (opts.fillOnly && cell(idx)) continue; // don't overwrite curated data
       updates.push({ range: `${colLetters(idx)}${rowNum}`, value: val });
@@ -2924,6 +3199,7 @@ export interface PortfolioCompanyInput {
 // Add a portfolio company as a new row in the Portfolio Companies tab. Stamps a
 // stable URID (so it can later be edited/deleted by key), and writes fields
 // header-aware so it works whatever column order the sheet actually uses.
+// Rejects when a row already exists with the same normalized name or website domain.
 export async function addPortfolioCompany(data: PortfolioCompanyInput): Promise<{ urid: string }> {
   const name = data.name.trim();
   if (!name) throw new Error("Company name is required");
@@ -2931,19 +3207,44 @@ export async function addPortfolioCompany(data: PortfolioCompanyInput): Promise<
   await ensureTab(TAB_NAMES.portfolio, PORTFOLIO_HEADERS);
   await ensureColumn(TAB_NAMES.portfolio, "URID");
 
+  const website = (data.website || "").trim();
+  const nameKey = normalizePortcoName(name);
+  const domainKey = extractDomain(website);
+
+  const rows = await fetchSheetTab(TAB_NAMES.portfolio);
+  const headers = (rows[0] || []).map((h) => h.trim().toLowerCase());
+  const nameIdx = headers.indexOf("company name");
+  const websiteIdx = headers.indexOf("website");
+
+  if (nameIdx !== -1 || websiteIdx !== -1) {
+    for (let i = 1; i < rows.length; i++) {
+      const rowName = nameIdx !== -1 ? (rows[i][nameIdx] || "").trim() : "";
+      const rowWebsite = websiteIdx !== -1 ? (rows[i][websiteIdx] || "").trim() : "";
+      if (!rowName && !rowWebsite) continue;
+
+      const sameName = nameKey && normalizePortcoName(rowName) === nameKey;
+      const rowDomain = extractDomain(rowWebsite);
+      const sameDomain = Boolean(domainKey && rowDomain && domainKey === rowDomain);
+      if (sameName || sameDomain) {
+        const existing = rowName || rowWebsite || "an existing company";
+        throw new Error(
+          `A portfolio company already exists for ${existing}. Update that row instead of adding a duplicate.`,
+        );
+      }
+    }
+  }
+
   const urid = crypto.randomUUID();
   // Keys are the lowercased sheet headers (see PORTFOLIO_COLS).
   const valueByHeader: Record<string, string> = {
     urid,
     "company name": name,
-    website: (data.website || "").trim(),
+    website,
     "focus area(s)": (data.focusArea || "").trim(),
     hq: (data.location || "").trim(),
     summary: (data.description || "").trim(),
   };
 
-  const rows = await fetchSheetTab(TAB_NAMES.portfolio);
-  const headers = (rows[0] || []).map((h) => h.trim().toLowerCase());
   if (headers.length === 0) {
     // Brand-new tab — write in PORTFOLIO_HEADERS order.
     await appendSheetRow(TAB_NAMES.portfolio, [
@@ -3273,51 +3574,54 @@ export async function buildPortfolioCompanies(): Promise<PortfolioCompany[]> {
   const companyRows = await fetchSheetTab(TAB_NAMES.portfolio);
   const rawCompanies = mapRows<Record<string, string>>(companyRows, PORTFOLIO_COLS);
 
-  return rawCompanies.map((c, idx) => {
-    const name = c.name || "";
+  // Skip blank / junk rows so empty Company Name cells don't become cards.
+  return rawCompanies
+    .filter((c) => (c.name || "").trim())
+    .map((c, idx) => {
+      const name = (c.name || "").trim();
 
-    // Parse Focus Area(s) as domain — map to closest PortfolioDomain
-    const rawDomain = (c.domain || "").trim();
-    const domainMap: Record<string, PortfolioDomain> = {
-      security: "Security",
-      ai: "AI",
-      "artificial intelligence": "AI",
-      data: "Data",
-      cloud: "Cloud",
-      infrastructure: "Cloud",
-      logistics: "Logistics",
-      "supply chain": "Supply Chain",
-      silicon: "Silicon",
-      "developer tools": "Cloud",
-    };
-    // Check each focus area keyword
-    const domainLower = rawDomain.toLowerCase();
-    let domain: PortfolioDomain = "Cloud";
-    for (const [keyword, mapped] of Object.entries(domainMap)) {
-      if (domainLower.includes(keyword)) {
-        domain = mapped;
-        break;
+      // Parse Focus Area(s) as domain — map to closest PortfolioDomain
+      const rawDomain = (c.domain || "").trim();
+      const domainMap: Record<string, PortfolioDomain> = {
+        security: "Security",
+        ai: "AI",
+        "artificial intelligence": "AI",
+        data: "Data",
+        cloud: "Cloud",
+        infrastructure: "Cloud",
+        logistics: "Logistics",
+        "supply chain": "Supply Chain",
+        silicon: "Silicon",
+        "developer tools": "Cloud",
+      };
+      // Check each focus area keyword
+      const domainLower = rawDomain.toLowerCase();
+      let domain: PortfolioDomain = "Cloud";
+      for (const [keyword, mapped] of Object.entries(domainMap)) {
+        if (domainLower.includes(keyword)) {
+          domain = mapped;
+          break;
+        }
       }
-    }
 
-    return {
-      id: c.urid || `pc-${idx}`,
-      urid: c.urid || undefined,
-      name,
-      sector: rawDomain,
-      domain,
-      website: c.website || "",
-      linkedinUrl: "",
-      location: c.location || "",
-      description: c.description || "",
-      contactName: "",
-      contactEmail: "",
-      contactPhone: "",
-      employees: [],
-      events: [],
-      introductions: [],
-    };
-  });
+      return {
+        id: c.urid || `pc-${idx}`,
+        urid: c.urid || undefined,
+        name,
+        sector: rawDomain,
+        domain,
+        website: c.website || "",
+        linkedinUrl: "",
+        location: c.location || "",
+        description: c.description || "",
+        contactName: "",
+        contactEmail: "",
+        contactPhone: "",
+        employees: [],
+        events: [],
+        introductions: [],
+      };
+    });
 }
 
 // ── App-added events (stored in the Sheet, NEVER written to Asana) ──

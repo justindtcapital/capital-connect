@@ -21,6 +21,7 @@ import {
   appendSignalFeedback,
   appendSignalMetric,
   loadSignalMetrics,
+  appendTimeAdvantageRow,
   type SignalEventRow,
   type FeedbackRow,
 } from "./event-store.server";
@@ -33,8 +34,8 @@ import {
   processCandidatesIntoEvents,
   type SignalRowStamp,
 } from "./event-pipeline.server";
-import { fetchStoredSignals, rowFromStored } from "./signal-store.server";
-import { logOpsEvent, appendSheetRows, TAB_NAMES } from "./sheets.server";
+import { fetchStoredSignals, rowFromStored, keyForStored, type StoredSignal } from "./signal-store.server";
+import { logOpsEvent, appendSheetRows, TAB_NAMES, fetchSheetTab } from "./sheets.server";
 import {
   matchIntelCorroboration,
   newsTypesForIntelState,
@@ -52,7 +53,18 @@ import {
   eventActionability,
   rankScore,
 } from "@/lib/materiality";
-
+import {
+  detectComposites,
+  eventTypeForComposite,
+  type EvidenceChange,
+  type EvidenceFamily,
+} from "@/lib/composite-events";
+import { computeTrajectory, trajectorySurpriseMult } from "@/lib/trajectory";
+import { policyFor } from "@/utils/intel-detect.server";
+import { INTEL_TABS } from "./intel.server";
+import { newsSourceType } from "@/lib/signal-feed";
+import { categoryFromEventType } from "@/lib/signal-extract";
+import type { SignalEventType } from "@/lib/signal-config";
 export interface ReconcileResult {
   ok: boolean;
   error?: string;
@@ -63,6 +75,8 @@ export interface ReconcileResult {
   precisionAt10: number | null;
   /** Rows removed by the retention pass (null = pass disabled or failed). */
   pruned: number | null;
+  compositesEmitted: number;
+  trajectoryReversals: number;
 }
 
 const today = () => new Date().toISOString().split("T")[0];
@@ -101,6 +115,7 @@ export async function runSignalsReconcile(): Promise<ReconcileResult> {
         observations: fuse.intel.evidenceLines,
         reconciled: today(),
       };
+      const pressFirstSeen = ev.firstSeen;
       if (fuse.intelWasFirst && fuse.intel.firstDetected && fuse.intel.firstDetected < ev.firstSeen) {
         ev.firstSeen = fuse.intel.firstDetected;
       }
@@ -108,6 +123,16 @@ export async function runSignalsReconcile(): Promise<ReconcileResult> {
         ev.badges,
         fuse.intelWasFirst ? BADGE.confirmedByPress : BADGE.intelCorroborated,
       );
+      if (fuse.intelWasFirst && fuse.intel.firstDetected && pressFirstSeen) {
+        void appendTimeAdvantageRow({
+          eventId: ev.eventId,
+          entityUrid: ev.entityUrid || fuse.intel.urid,
+          company: ev.company,
+          intelFirstSeen: fuse.intel.firstDetected,
+          pressFirstSeen,
+          intelEvidence: fuse.intel.evidenceLines,
+        });
+      }
       const facts = factsFor(ctx, ev.company);
       const rels = ev.relevance > 0 ? [ev.relevance] : [];
       scoreEvent(ev, facts, rels, cfg, {
@@ -299,6 +324,156 @@ export async function runSignalsReconcile(): Promise<ReconcileResult> {
       }
     }
 
+    // ── Pass G (Phase 4.1): composite weak-signal cards from intel evidence ──
+    let compositesEmitted = 0;
+    try {
+      const intelRows = await fetchSheetTab(INTEL_TABS.events).catch(() => [] as string[][]);
+      const changes: EvidenceChange[] = [];
+      for (let i = 1; i < intelRows.length; i++) {
+        const r = intelRows[i] || [];
+        const eventId = (r[0] || "").trim();
+        const urid = (r[1] || "").trim();
+        const entity = (r[2] || "").trim();
+        if (!eventId || !entity) continue;
+        let items: Array<{
+          date?: string;
+          metric?: string;
+          prev?: number;
+          next?: number;
+          reason?: string;
+        }> = [];
+        try {
+          items = JSON.parse(r[9] || "[]");
+        } catch {
+          continue;
+        }
+        for (const ev of items) {
+          const metric = (ev.metric || "").trim();
+          if (!metric) continue;
+          const fam = policyFor(metric).family as EvidenceFamily;
+          const delta =
+            Number.isFinite(ev.next) && Number.isFinite(ev.prev)
+              ? Number(ev.next) - Number(ev.prev)
+              : 0;
+          const sign = delta >= 0 ? "+" : "";
+          changes.push({
+            id: `${eventId}:${metric}:${ev.date || ""}`,
+            entityId: urid,
+            company: entity,
+            family: fam,
+            metric,
+            dateIso: (ev.date || "").slice(0, 10),
+            label: `${sign}${Math.abs(Math.round(delta)) || 1} ${policyFor(metric).label}`,
+            reason: ev.reason || "",
+          });
+        }
+      }
+      const todayIso = today();
+      const { hits } = detectComposites(changes, todayIso);
+      const existingCompositeKeys = new Set(
+        stored
+          .filter((s) => (s.badges || "").includes(BADGE.composite))
+          .map((s) => `${normCompanyKey(s.company)}:${(s.signal || "").slice(0, 40)}`),
+      );
+      const compositeRows: StoredSignal[] = [];
+      for (const hit of hits) {
+        const key = `${normCompanyKey(hit.company)}:${hit.why.slice(0, 40)}`;
+        if (existingCompositeKeys.has(key)) continue;
+        const eventType = eventTypeForComposite(hit.rule) as SignalEventType;
+        const category = categoryFromEventType(eventType);
+        const row: StoredSignal = {
+          id: "",
+          dateFound: todayIso,
+          type: "awareness",
+          status: "New",
+          person: "",
+          company: hit.company,
+          email: "",
+          category,
+          signal: hit.why,
+          sourceUrl: "",
+          subject: `${hit.ruleLabel}: ${hit.company}`,
+          body: hit.evidence.map((e) => `• ${e.label} (${e.dateIso}) — ${e.metric}`).join("\n"),
+          relevance: hit.prior,
+          justification: `Composite ${hit.rule} · ${hit.evidence.length} independent family changes`,
+          urgency: "High",
+          timing: todayIso,
+          sourceType: newsSourceType(category, false, ""),
+          docUrl: "",
+          hasBody: true,
+          badges: BADGE.composite,
+          entityUrid: hit.entityId || undefined,
+          scoreBreakdown: JSON.stringify({
+            pipeline: "phase4_composite",
+            rule: hit.rule,
+            compositeId: hit.compositeId,
+            evidence: hit.evidence.map((e) => ({
+              family: e.family,
+              metric: e.metric,
+              date: e.dateIso,
+              label: e.label,
+            })),
+            parts: [{ name: "composite_prior", value: hit.prior, why: hit.why }],
+          }).slice(0, 4000),
+        };
+        row.id = keyForStored(row);
+        compositeRows.push(row);
+      }
+      if (compositeRows.length > 0) {
+        const { enriched, extraRows } = await processCandidatesIntoEvents(compositeRows);
+        await appendSheetRows(TAB_NAMES.signals, [...enriched, ...extraRows].map(rowFromStored));
+        compositesEmitted = enriched.length + extraRows.length;
+      }
+    } catch (err) {
+      console.error("[signals-reconcile] composite pass failed:", err);
+    }
+
+    // ── Pass H (Phase 4.2): trajectory reversal badges on open events ──
+    let trajectoryReversals = 0;
+    try {
+      const seriesRows = await fetchSheetTab(INTEL_TABS.series).catch(() => [] as string[][]);
+      // series: urid, entity, metric, current, baseline, slopeWk, z, history JSON, updated
+      const byCompanyMetric = new Map<string, Array<{ dateIso: string; value: number }>>();
+      for (let i = 1; i < seriesRows.length; i++) {
+        const r = seriesRows[i] || [];
+        const entity = (r[1] || "").trim();
+        const metric = (r[2] || "").trim();
+        if (!entity || !metric) continue;
+        let history: Array<[string, number]> = [];
+        try {
+          history = JSON.parse(r[7] || "[]");
+        } catch {
+          continue;
+        }
+        const points = history.map(([d, v]) => ({ dateIso: String(d).slice(0, 10), value: Number(v) }));
+        byCompanyMetric.set(`${normCompanyKey(entity)}::${metric}`, points);
+      }
+      for (const ev of newsEvents) {
+        if (ev.status === "closed") continue;
+        const key = `${normCompanyKey(ev.company)}::ats_open_roles`;
+        const pts = byCompanyMetric.get(key);
+        if (!pts || pts.length < 4) continue;
+        const traj = computeTrajectory(pts);
+        if (!traj.reversal) continue;
+        const before = ev.badges;
+        ev.badges = mergeBadges(ev.badges, BADGE.trajectoryReversal);
+        const mult = trajectorySurpriseMult(traj);
+        if (mult.value !== 1) {
+          ev.rankScore = Math.round(ev.rankScore * mult.value);
+          ev.scoreBreakdown.trajectory = {
+            ...traj,
+            surpriseMult: mult,
+          };
+        }
+        if (ev.badges !== before) {
+          updatedEvents.add(ev);
+          trajectoryReversals++;
+        }
+      }
+    } catch (err) {
+      console.error("[signals-reconcile] trajectory pass failed:", err);
+    }
+
     await persistSignalEvents({ created: [], updated: [...updatedEvents] });
     const stamped = await stampSignalRowsById(stamps);
 
@@ -320,7 +495,7 @@ export async function runSignalsReconcile(): Promise<ReconcileResult> {
       action: "sync",
       source: "signals_reconcile",
       status: "ok",
-      summary: `Signals reconcile · ${lateMerges} late merge${lateMerges === 1 ? "" : "s"} · ${dbp} detected-before-press · ${lateClustered} late-clustered · ${ignoredRows.length} ignored · ${stamped} rows restamped${precisionAt10 != null ? ` · p@10 ${precisionAt10}` : ""}${pruned != null ? ` · ${pruned} pruned` : ""}`,
+      summary: `Signals reconcile · ${lateMerges} late merge${lateMerges === 1 ? "" : "s"} · ${dbp} detected-before-press · ${lateClustered} late-clustered · ${ignoredRows.length} ignored · ${compositesEmitted} composites · ${trajectoryReversals} traj reversals · ${stamped} rows restamped${precisionAt10 != null ? ` · p@10 ${precisionAt10}` : ""}${pruned != null ? ` · ${pruned} pruned` : ""}`,
       records: stamped,
       details: {
         lateMerges,
@@ -331,6 +506,8 @@ export async function runSignalsReconcile(): Promise<ReconcileResult> {
         ignoredComputed: ignoredRows.length,
         precisionAt10,
         pruned,
+        compositesEmitted,
+        trajectoryReversals,
       },
     });
 
@@ -342,6 +519,8 @@ export async function runSignalsReconcile(): Promise<ReconcileResult> {
       ignoredComputed: ignoredRows.length,
       precisionAt10,
       pruned,
+      compositesEmitted,
+      trajectoryReversals,
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : "Signals reconcile failed";
@@ -362,6 +541,8 @@ export async function runSignalsReconcile(): Promise<ReconcileResult> {
       ignoredComputed: 0,
       precisionAt10: null,
       pruned: null,
+      compositesEmitted: 0,
+      trajectoryReversals: 0,
     };
   }
 }

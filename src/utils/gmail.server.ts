@@ -15,13 +15,21 @@
 import { getAccessToken } from "./sheets.server";
 import { sanitizeEmailText } from "@/lib/email-body-clean";
 import { extractArticleLinks } from "@/lib/link-digest";
+import { isBulkOrAutomatedMail } from "@/lib/email-noise";
 import {
-  isBulkOrAutomatedMail,
-  isNoiseEmail,
-  pickPrimaryCounterparty,
-  type Counterparty,
-} from "@/lib/email-noise";
+  parseAddressList,
+  isPlausibleEmail,
+  type EmailAddr,
+  type InternalMailConfig,
+} from "@/lib/email-participants";
+import {
+  isFreeEmailDomain,
+  threadToActivity,
+  threadsToActivities,
+} from "@/lib/email-activity-build";
+import { TEAM_MEMBER_EMAILS } from "@/lib/user-ownership";
 import type { AsanaActivity } from "@/lib/types";
+import { isActivityTrackingMessage as isActivityTrackingMessageLib } from "@/lib/email-activity";
 
 const GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me";
 
@@ -42,6 +50,10 @@ export interface GmailMessage {
   fromEmail: string;
   toEmails: string[];
   ccEmails: string[];
+  /** To/Cc recipients WITH display names (proper address-list parse — quoted
+   *  "Last, First" names survive; naive comma-splitting destroyed them). */
+  toAddrs: EmailAddr[];
+  ccAddrs: EmailAddr[];
   /** Delivered-To header values (lowercased) — how alias-forwarded mail is
    *  recognized even when the alias never appears in From/To/Cc. */
   deliveredTo: string[];
@@ -92,6 +104,26 @@ export function getActivityAliases(): string[] {
     ...parseAliasList(process.env.GMAIL_BD_ALIAS),
     ...parseAliasList(process.env.GMAIL_GTM_ALIAS),
   ];
+}
+
+/**
+ * True when a Gmail message is BD/GTM activity-tracking mail — not a news signal.
+ * Catches alias delivery (To/Cc/Delivered-To), DTC tracking subjects, and
+ * meeting invites that belong on the Activity / GTM-Tracking pipeline.
+ */
+export function isActivityTrackingMessage(
+  m: {
+    fromEmail?: string;
+    toEmails?: string[];
+    ccEmails?: string[];
+    deliveredTo?: string[];
+    subject?: string;
+    body?: string;
+    snippet?: string;
+  },
+  aliasSet?: Set<string>,
+): boolean {
+  return isActivityTrackingMessageLib(m, aliasSet ?? new Set(getActivityAliases()));
 }
 
 /** NEWS@ ingestion alias addresses (lowercased) — the diagram's "forward it for
@@ -164,7 +196,11 @@ function header(headers: any[], name: string): string {
 function headerAll(headers: any[], name: string): string[] {
   return (headers || [])
     .filter((x) => (x.name || "").toLowerCase() === name.toLowerCase())
-    .map((x) => String(x.value || "").trim().toLowerCase())
+    .map((x) =>
+      String(x.value || "")
+        .trim()
+        .toLowerCase(),
+    )
     .filter(Boolean);
 }
 
@@ -175,10 +211,7 @@ function collectPdfAttachments(part: any, out: GmailAttachment[]): void {
   if (!part) return;
   const filename = String(part.filename || "");
   const mime = String(part.mimeType || "");
-  if (
-    part.body?.attachmentId &&
-    (mime === "application/pdf" || /\.pdf$/i.test(filename))
-  ) {
+  if (part.body?.attachmentId && (mime === "application/pdf" || /\.pdf$/i.test(filename))) {
     out.push({
       filename: filename || "attachment.pdf",
       mimeType: "application/pdf",
@@ -217,14 +250,13 @@ async function getMessage(token: string, id: string): Promise<GmailMessage | nul
   const m = (await res.json()) as any;
   const headers = m.payload?.headers || [];
   const from = parseAddr(header(headers, "From"));
-  const parseList = (raw: string) =>
-    raw
-      .split(",")
-      .map((s: string) => parseAddr(s).email)
-      .filter(Boolean);
-  const to = parseList(header(headers, "To"));
-  const cc = parseList(header(headers, "Cc"));
-  const deliveredTo = headerAll(headers, "Delivered-To").map((v) => parseAddr(v).email);
+  // RFC 5322 address-list parse: respects quotes/angle brackets, keeps display
+  // names, and drops any token without a plausible local@domain shape.
+  const toAddrs = parseAddressList(header(headers, "To"));
+  const ccAddrs = parseAddressList(header(headers, "Cc"));
+  const deliveredTo = headerAll(headers, "Delivered-To")
+    .map((v) => parseAddr(v).email)
+    .filter((e) => isPlausibleEmail(e));
   const date = Number(m.internalDate) || 0;
   const parts = extractParts(m.payload);
   const attachments: GmailAttachment[] = [];
@@ -242,8 +274,10 @@ async function getMessage(token: string, id: string): Promise<GmailMessage | nul
     subject: header(headers, "Subject") || "(no subject)",
     fromName: from.name,
     fromEmail: from.email,
-    toEmails: to,
-    ccEmails: cc,
+    toEmails: toAddrs.map((a) => a.email),
+    ccEmails: ccAddrs.map((a) => a.email),
+    toAddrs,
+    ccAddrs,
     deliveredTo,
     date,
     dateLabel: toLabel(date),
@@ -349,108 +383,50 @@ export async function searchGmail(query: string, max = 25): Promise<GmailResult>
   return searchGmailRaw(query, max);
 }
 
-const FREE_EMAIL = new Set([
-  "gmail.com",
-  "googlemail.com",
-  "outlook.com",
-  "hotmail.com",
-  "live.com",
-  "yahoo.com",
-  "icloud.com",
-  "me.com",
-  "aol.com",
-  "proton.me",
-  "protonmail.com",
-  "msn.com",
-]);
-
-function companyFromEmail(email: string): string {
-  const domain = (email.split("@")[1] || "").toLowerCase();
-  if (!domain || FREE_EMAIL.has(domain)) return "";
-  const sld = domain.split(".")[0] || "";
-  if (!sld) return "";
-  return sld.charAt(0).toUpperCase() + sld.slice(1);
+/** Comma/semicolon list env var → lowercased entries (no @ requirement — domains). */
+function parseDomainList(raw?: string): string[] {
+  if (!raw?.trim()) return [];
+  return raw
+    .split(/[;,]/)
+    .map((s) => s.trim().toLowerCase().replace(/^@/, ""))
+    .filter(Boolean);
 }
 
-function titleCaseLocal(local: string): string {
-  return local
-    .replace(/[._+]+/g, " ")
-    .replace(/\d+/g, " ")
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean)
-    .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
-    .join(" ")
-    .slice(0, 80);
+/**
+ * Which addresses/domains count as "our side" for activity attribution:
+ *   GMAIL_INTERNAL_DOMAINS    — whole domains (e.g. dt-capital.net). The
+ *                               non-free domains of the tracking aliases are
+ *                               always included automatically.
+ *   GMAIL_INTERNAL_ADDRESSES  — specific internal people. The team roster in
+ *                               user-ownership.ts is always included, so the
+ *                               Dell teammates who forward threads are covered
+ *                               without blanket-excluding all of dell.com
+ *                               (Dell BUs are legitimate GTM counterparties).
+ */
+export function getInternalMailConfig(): InternalMailConfig {
+  const domains = new Set(parseDomainList(process.env.GMAIL_INTERNAL_DOMAINS));
+  for (const alias of getActivityAliases()) {
+    const domain = alias.split("@")[1] || "";
+    if (domain && !isFreeEmailDomain(domain)) domains.add(domain);
+  }
+  const addresses = new Set([
+    ...parseAliasList(process.env.GMAIL_INTERNAL_ADDRESSES),
+    ...TEAM_MEMBER_EMAILS.map((e) => e.toLowerCase()),
+  ]);
+  return { domains, addresses };
 }
 
-// Counterparties = real people on the thread who are NOT our BD/GTM aliases and
-// not newsletter/system mailboxes. Emails land in notes for exact contact join.
-function counterparties(
-  m: GmailMessage,
-  aliases: Set<string>,
-): Counterparty[] {
-  const out = new Map<string, Counterparty>();
-  const consider = (name: string, email: string, role: Counterparty["role"]) => {
-    const e = (email || "").trim().toLowerCase();
-    if (!e || aliases.has(e) || out.has(e) || isNoiseEmail(e)) return;
-    out.set(e, { name: name || titleCaseLocal(e.split("@")[0] || ""), email: e, role });
-  };
-  consider(m.fromName, m.fromEmail, "from");
-  for (const e of m.toEmails) consider("", e, "to");
-  for (const e of m.ccEmails) consider("", e, "cc");
-  return [...out.values()];
-}
-
-/** Convert a Gmail message into a BD/GTM activity, or null when it is noise. */
+/** Convert a Gmail message into a BD/GTM activity, or null when it is noise.
+ *  Thin wrapper over the pure builder (lib/email-activity-build) — kept for the
+ *  diagnostic script and single-message callers; the sync itself groups by
+ *  thread via threadsToActivities. */
 export function messageToActivity(
   m: GmailMessage,
   track: "BD" | "GTM",
   aliases: Set<string>,
+  internal: InternalMailConfig = getInternalMailConfig(),
 ): AsanaActivity | null {
-  if (m.isBulk) return null;
-  // Inbound blast from a noise mailbox (newsletter/noreply) — skip entirely.
-  const fromLower = (m.fromEmail || "").toLowerCase();
-  if (fromLower && isNoiseEmail(fromLower) && !aliases.has(fromLower)) return null;
-
-  const others = counterparties(m, aliases);
-  const fromEmail = (m.fromEmail || "").toLowerCase();
-  const outbound = aliases.has(fromEmail);
-  const primary = pickPrimaryCounterparty(others, outbound);
-  // No human counterparty left after noise filter → do not create a Person row.
-  if (!primary) return null;
-
-  // Attribute ownership to the human on the From line when they mailed the
-  // tracking alias (the usual BD/GTM workflow). When the alias itself sends,
-  // Owner stays the alias address.
-  const owner =
-    fromEmail && !isNoiseEmail(fromEmail) ? m.fromEmail : undefined;
-  // People line lists the primary first, then other clean counterparties — email
-  // join in matchActivitiesToContact (gmail path is email-only).
-  const peopleOrdered = [
-    primary,
-    ...others.filter((p) => p.email !== primary.email),
-  ];
-  const notesParts = [
-    outbound ? "Outbound email" : "Inbound email",
-    `People: ${peopleOrdered.map((p) => `${p.name} <${p.email}>`).join("; ")}`,
-    m.snippet || m.body.slice(0, 400),
-  ].filter(Boolean);
-
-  return {
-    gid: `gmail-${m.id}`,
-    track,
-    name: m.subject,
-    date: m.dateLabel || undefined,
-    completed: true,
-    status: outbound ? "Sent" : "Received",
-    owner,
-    type: "Email",
-    company: companyFromEmail(primary.email) || undefined,
-    person: primary.name || undefined,
-    notes: notesParts.join("\n").slice(0, 1000),
-    url: m.permalink,
-  };
+  return threadToActivity([m], track, aliases, internal);
 }
 async function fetchTrackFromAliases(
   track: "BD" | "GTM",
@@ -467,13 +443,9 @@ async function fetchTrackFromAliases(
     console.error(`[gmail] ${track} alias sync failed:`, res.error);
     return [];
   }
-  const aliasSet = new Set(aliases);
-  const out: AsanaActivity[] = [];
-  for (const m of res.messages) {
-    const act = messageToActivity(m, track, aliasSet);
-    if (act) out.push(act);
-  }
-  return out;
+  // One activity per THREAD — reply chains collapse instead of producing a row
+  // per message (counterparties are unioned across the thread's messages).
+  return threadsToActivities(res.messages, track, new Set(aliases), getInternalMailConfig());
 }
 
 // Pull BD/GTM emails from the configured Gmail aliases into AsanaActivity-shaped

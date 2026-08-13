@@ -153,7 +153,11 @@ console.log("— clustering: guards —");
     [ev],
     cfg,
   );
-  check("conflicting magnitude blocks the merge ($20M vs $50M)", m.event === null, m.reason);
+  check(
+    "conflicting magnitude → dispute merge (Phase 2.4), not a second event",
+    Boolean(m.magnitudeDispute && m.event),
+    m.reason,
+  );
 }
 {
   const ev = openEvent({});

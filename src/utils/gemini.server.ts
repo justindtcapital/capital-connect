@@ -13,7 +13,7 @@
 // it all and the answer comes back empty. We therefore cap thinkingBudget and size
 // maxOutputTokens = answerTokens + thinkingBudget on every call (see genConfig).
 
-import { getVertexProject, getVertexLocation, getServiceAccountJson } from "./google.server";
+import { getVertexProject, getVertexLocation, getServiceAccountJson, getServiceAccountCredentialsPath } from "./google.server";
 import { articleUrlKey } from "./news.server";
 import { companiesMatch } from "@/lib/attribution-score";
 
@@ -176,15 +176,38 @@ async function mintServiceAccountAccessToken(creds: ServiceAccountCredentials): 
   return data.access_token;
 }
 
+async function resolveServiceAccountJson(): Promise<string | undefined> {
+  const inline = getServiceAccountJson();
+  if (inline) return inline;
+
+  const filePath = getServiceAccountCredentialsPath();
+  if (!filePath) return undefined;
+
+  try {
+    // Dynamic import keeps node:fs out of any accidental client evaluation of
+    // google.server (sheets/gmail createServerFn import chains).
+    const { existsSync, readFileSync } = await import("node:fs");
+    if (!existsSync(filePath)) {
+      console.error(`[gemini] GOOGLE_APPLICATION_CREDENTIALS file not found: ${filePath}`);
+      return undefined;
+    }
+    const raw = readFileSync(filePath, "utf8").trim().replace(/^\uFEFF/, "");
+    return raw || undefined;
+  } catch (e) {
+    console.error("[gemini] failed to read GOOGLE_APPLICATION_CREDENTIALS:", e);
+    return undefined;
+  }
+}
+
 async function getVertexToken(): Promise<string> {
   if (cachedVertexToken && Date.now() < cachedVertexToken.expiresAt - 60_000) {
     return cachedVertexToken.token;
   }
 
-  const credsJson = getServiceAccountJson();
+  const credsJson = await resolveServiceAccountJson();
   if (!credsJson) {
     throw new Error(
-      "Could not obtain a Google Cloud access token — set GOOGLE_APPLICATION_CREDENTIALS_JSON to a service-account key JSON",
+      "Could not obtain a Google Cloud access token — set GOOGLE_APPLICATION_CREDENTIALS to a service-account key file path, or GOOGLE_APPLICATION_CREDENTIALS_JSON to the key JSON",
     );
   }
 
@@ -193,7 +216,9 @@ async function getVertexToken(): Promise<string> {
     return await mintServiceAccountAccessToken(creds);
   } catch (e) {
     if (e instanceof SyntaxError) {
-      throw new Error(`GOOGLE_APPLICATION_CREDENTIALS_JSON is not valid JSON: ${e.message}`);
+      throw new Error(
+        `Service-account credentials are not valid JSON: ${e.message}. Check GOOGLE_APPLICATION_CREDENTIALS / GOOGLE_APPLICATION_CREDENTIALS_JSON.`,
+      );
     }
     throw e;
   }
@@ -681,6 +706,12 @@ export interface SignalRecommendation {
   rankScore?: number | null;
   /** Signals v2: semicolon-separated badge slugs. */
   badges?: string;
+  /** Phase 1 — resolved entity URID. */
+  entityUrid?: string;
+  resolveRung?: string;
+  resolveConfidence?: number | null;
+  /** Phase 2 — JSON score breakdown (independence / gate / novelty). */
+  scoreBreakdown?: string;
 }
 
 export interface SignalAwarenessItem {
@@ -708,6 +739,12 @@ export interface SignalAwarenessItem {
   badges?: string;
   /** Signals v2: stored-signal ID (recommendations carry storedId already). */
   storedId?: string;
+  /** Phase 1 — resolved entity URID. */
+  entityUrid?: string;
+  resolveRung?: string;
+  resolveConfidence?: number | null;
+  /** Phase 2 — JSON score breakdown (independence / gate / novelty). */
+  scoreBreakdown?: string;
 }
 
 export interface SignalScanResult {

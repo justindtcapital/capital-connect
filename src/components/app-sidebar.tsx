@@ -934,22 +934,12 @@ export function AppSidebar({
                     <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
                       Sector Focus
                     </label>
-                    <Select
+                    <MultiSelect
+                      options={targetSectors}
                       value={targetingFilters.sector}
-                      onValueChange={(v) => updateTarget({ sector: v })}
-                    >
-                      <SelectTrigger className="h-8 text-xs">
-                        <SelectValue placeholder="All Sectors" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="all">All Sectors</SelectItem>
-                        {targetSectors.map((s) => (
-                          <SelectItem key={s} value={s}>
-                            {s}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
+                      onChange={(v) => updateTarget({ sector: v })}
+                      placeholder="All Sectors"
+                    />
                   </div>
 
                   <div>

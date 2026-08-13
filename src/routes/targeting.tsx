@@ -104,6 +104,7 @@ import {
   bulkResearchTargets,
   bulkDeleteTargets,
   repairTargetUrids,
+  repairTargetSectors,
   addTarget,
 } from "@/utils/sheets.functions";
 import { promoteTargetsToCrm } from "@/utils/target-crm.functions";
@@ -527,7 +528,7 @@ function TargetingPage() {
       )
         return false;
       if (filters.stage !== "all" && t.stage !== filters.stage) return false;
-      if (filters.sector !== "all" && t.sector !== filters.sector) return false;
+      if (filters.sector.length && !filters.sector.includes(t.sector)) return false;
       if (filters.city !== "all" && t.location !== filters.city) return false;
       if (filters.origin !== "all" && t.originSource !== filters.origin) return false;
       if (filters.title && !t.title.toLowerCase().includes(filters.title.toLowerCase()))
@@ -569,6 +570,7 @@ function TargetingPage() {
   }, []);
 
   const [repairing, setRepairing] = useState(false);
+  const [cleaningSectors, setCleaningSectors] = useState(false);
 
   // Backfill missing / de-duplicate stable URIDs on the Targets sheet, then re-pull
   // so every row is uniquely keyable (fixes selection/edit/delete on legacy rows).
@@ -594,6 +596,33 @@ function TargetingPage() {
       setRepairing(false);
     }
   }, [repairing, refreshTargets]);
+
+  // Move job titles out of Sector → Role and normalize remaining sector values.
+  const handleCleanSectors = useCallback(async () => {
+    if (cleaningSectors) return;
+    setCleaningSectors(true);
+    try {
+      const res = await repairTargetSectors();
+      if (res.movedToRole === 0 && res.normalized === 0) {
+        toast.success(`Sectors look clean — nothing to fix across ${res.total} targets.`);
+      } else {
+        const parts: string[] = [];
+        if (res.movedToRole)
+          parts.push(
+            `${res.movedToRole} title${res.movedToRole !== 1 ? "s" : ""} moved to Role`,
+          );
+        if (res.normalized)
+          parts.push(`${res.normalized} sector${res.normalized !== 1 ? "s" : ""} normalized`);
+        toast.success(`Cleaned sectors — ${parts.join(", ")} (of ${res.total}).`);
+        await refreshTargets();
+      }
+    } catch (e) {
+      console.error("repairTargetSectors failed", e);
+      toast.error("Couldn't clean sectors — see console.");
+    } finally {
+      setCleaningSectors(false);
+    }
+  }, [cleaningSectors, refreshTargets]);
 
   const handleBulkTargetUpdate = useCallback((updatedTargets: TargetLead[]) => {
     setTargets((prev) => {
@@ -1303,6 +1332,17 @@ function TargetingPage() {
                     <Wrench className="h-3.5 w-3.5 mr-2" />
                   )}
                   Repair IDs
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => void handleCleanSectors()}
+                  disabled={cleaningSectors}
+                >
+                  {cleaningSectors ? (
+                    <Loader2 className="h-3.5 w-3.5 mr-2 animate-spin" />
+                  ) : (
+                    <Wrench className="h-3.5 w-3.5 mr-2" />
+                  )}
+                  Clean sectors
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>

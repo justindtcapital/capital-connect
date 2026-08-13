@@ -10,6 +10,12 @@ import type { Contact, PortfolioCompany } from "@/lib/types";
 import { domainFromCompanySourceUrl, resolveCompanyLogoDomain } from "@/lib/domain-utils";
 import { absoluteHttpUrl } from "@/lib/safe-url";
 import { makeScorer, type SignalInsight } from "@/lib/signal-strength";
+import {
+  citedDriveIdsFromUrls,
+  storyContentKey,
+  textAlreadyCovered,
+} from "@/lib/signal-dedup";
+import { isActivityTrackingHeadline, isActivityTrackingMessage } from "@/lib/email-activity";
 
 export type SignalSourceType =
   | "PortCo Blogs"
@@ -166,9 +172,38 @@ export interface FeedCard {
   badges?: string[];
   /** Corroborating sources collapsed into this card (≥1). */
   sourceCount?: number;
+  /** Phase 2 — independent Tier A/B source families (syndications excluded). */
+  independentSources?: number;
+  /** Phase 2 — same-day Tier B/C reprints of a Tier A primary. */
+  syndicatedSources?: number;
+  /** Phase 1 — resolved Intel Entities URID. */
+  entityUrid?: string;
+  resolveRung?: string;
+  resolveConfidence?: number | null;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
+
+/** Parse Phase 2 independence fields from a stored scoreBreakdown JSON blob. */
+function independenceFromBreakdown(raw?: string): {
+  independentSources?: number;
+  syndicatedSources?: number;
+} {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as {
+      independence?: { abCount?: number; count?: number; syndicated?: number };
+    };
+    const indep = parsed.independence;
+    if (!indep) return {};
+    return {
+      independentSources: indep.abCount ?? indep.count,
+      syndicatedSources: indep.syndicated,
+    };
+  } catch {
+    return {};
+  }
+}
 
 // Free/personal email providers — their domain is NOT a company logo domain.
 const FREE_EMAIL_DOMAINS = new Set([
@@ -298,21 +333,20 @@ function dedupeCards(cards: FeedCard[]): FeedCard[] {
     }
   };
   // Event-clustered rows (v2) → ONE card per real-world event, regardless of
-  // how many sources/rows the event has. Then: real URL → dedup by URL+company
-  // (same article cited for two companies must not collapse; same URL+company
-  // from sheet+live lanes still merges). No real URL → company + content.
+  // how many sources/rows the event has. Then: Drive file id → same PDF story.
+  // Then: real URL → dedup by URL+company. No real URL → company + content.
   const keyOf = (c: FeedCard): string => {
     if (c.eventId) return `e:${c.eventId}`;
+    if (c.entityUrid) return `ent:${c.entityUrid}|${storyContentKey("", c.headline, c.summary).slice(0, 80)}`;
+    const driveId = citedDriveIdsFromUrls(c.sourceUrl, c.docUrl)[0];
+    if (driveId) return `d:${driveId}`;
     const company = (c.company || "").trim().toLowerCase();
     if (c.sourceUrl && !c.sourceIsSearch && /^https?:\/\//.test(c.sourceUrl)) {
-      return `u:${normUrl(c.sourceUrl)}|${company}`;
+      return `u:${normUrl(c.sourceUrl)}|${c.entityUrid || company}`;
     }
-    const content = `${c.headline || ""} ${c.summary || ""}`
-      .toLowerCase()
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 200);
-    return `h:${company}|${content}`;
+    const content = storyContentKey(c.company, c.headline, c.summary);
+    if (content) return content;
+    return `h:${company}|${(c.headline || "").toLowerCase().slice(0, 120)}`;
   };
 
   const best = new Map<string, FeedCard>();
@@ -329,10 +363,28 @@ function dedupeCards(cards: FeedCard[]): FeedCard[] {
     if (better) best.set(k, c);
   }
   const kept = new Set(best.values());
-  const surviving = cards.filter((c) => kept.has(c)); // preserve original (sorted) order
+  let surviving = cards.filter((c) => kept.has(c)); // preserve original (sorted) order
+
+  // Second pass: same company + near-identical opening text even when URLs /
+  // event ids differ (Drive re-scan vs NewsAPI paraphrase of the same story).
+  const byStory = new Map<string, FeedCard>();
+  const storySize = new Map<string, number>();
+  for (const c of surviving) {
+    const sk = storyContentKey(c.company, c.headline, c.summary) || keyOf(c);
+    storySize.set(sk, (storySize.get(sk) || 0) + 1);
+    const cur = byStory.get(sk);
+    const better =
+      !cur ||
+      (c.rankScore ?? -1) > (cur.rankScore ?? -1) ||
+      ((c.rankScore ?? -1) === (cur.rankScore ?? -1) && rank(c) < rank(cur));
+    if (better) byStory.set(sk, c);
+  }
+  const storyKept = new Set(byStory.values());
+  surviving = surviving.filter((c) => storyKept.has(c));
+
   // The kept card carries how many corroborating rows it absorbed.
   for (const c of surviving) {
-    const n = groupSize.get(keyOf(c)) || 1;
+    const n = Math.max(groupSize.get(keyOf(c)) || 1, storySize.get(storyContentKey(c.company, c.headline, c.summary) || "") || 1);
     if (n > 1) c.sourceCount = Math.max(c.sourceCount ?? 1, n);
   }
   return surviving;
@@ -349,6 +401,19 @@ export interface BuildFeedInput {
   portfolio: PortfolioCompany[];
   /** Network contacts — used to score network leverage on each card. */
   contacts?: Contact[];
+}
+
+/** Synthetic WS4 burst cards — excluded from the feed when burst detection is off. */
+function isUnusualActivityCard(opts: {
+  category?: string;
+  signal?: string;
+  title?: string;
+  headline?: string;
+}): boolean {
+  const cat = (opts.category || "").trim().toLowerCase();
+  if (cat === "unusual activity") return true;
+  const text = `${opts.signal || ""} ${opts.title || ""} ${opts.headline || ""}`.toLowerCase();
+  return text.startsWith("unusual activity:") || text.includes("unusual activity:");
 }
 
 export function buildFeed(input: BuildFeedInput): FeedCard[] {
@@ -414,15 +479,34 @@ export function buildFeed(input: BuildFeedInput): FeedCard[] {
   const cards: FeedCard[] = [];
 
   input.recommendations.forEach((r, i) => {
+    if (isUnusualActivityCard({ category: r.category, signal: r.signal })) return;
+    if (isActivityTrackingHeadline(r.signal) || isActivityTrackingHeadline(r.subject)) return;
     const text = `${r.signal} ${r.justification}`;
     const ts = parseTs(r.dateFound);
     const seg = segmentFor(r.company || "", text);
     // A real (NewsAPI) URL is durable → link it directly; otherwise search.
     const realUrl = r.sourceUrl && /^https?:\/\//.test(r.sourceUrl) ? r.sourceUrl : "";
     const logo = logoFor(r.company || "", { email: r.email, sourceUrl: realUrl });
+    // Avoid repeating the same paragraph as both "Signal:" and italic justification
+    // (common when Gemini puts the same blurb in both fields).
+    const signal = (r.signal || "").trim();
+    const justification = (r.justification || "").trim();
+    const metaBits = [
+      r.timing,
+      r.relevance != null ? `relevance ${r.relevance}/10` : "",
+    ].filter(Boolean);
+    let detailBlock = "";
+    if (signal && justification && textAlreadyCovered(justification, signal)) {
+      detailBlock = `${justification}${metaBits.length ? `\n\n_${metaBits.join(" · ")}_` : ""}`;
+    } else {
+      detailBlock =
+        (signal ? `**Signal:** ${signal}\n\n` : "") +
+        (justification || metaBits.length
+          ? `_${[justification, ...metaBits].filter(Boolean).join(" · ")}_\n\n`
+          : "");
+    }
     const body =
-      `**Signal:** ${r.signal}\n\n` +
-      `_${[r.justification, r.timing, r.relevance != null ? `relevance ${r.relevance}/10` : ""].filter(Boolean).join(" · ")}_\n\n` +
+      detailBlock +
       (r.subject || r.body
         ? `**Suggested outreach${r.person ? ` to ${r.person}` : ""}**\n\n${r.subject ? `**${r.subject}**\n\n` : ""}${r.body || ""}`
         : "");
@@ -443,7 +527,7 @@ export function buildFeed(input: BuildFeedInput): FeedCard[] {
       // only offer lazy-load when the stored row has a Body we don't already have.
       bodyElided: Boolean(r.hasBody) && !r.body,
       headline: r.signal || "Signal",
-      summary: r.justification || r.signal || "",
+      summary: justification || signal || "",
       body,
       sourceUrl: realUrl || searchUrl(r.company || "", r.signal || ""),
       sourceIsSearch: !realUrl,
@@ -461,10 +545,16 @@ export function buildFeed(input: BuildFeedInput): FeedCard[] {
       materiality: r.materiality ?? null,
       rankScore: r.rankScore ?? null,
       badges: (r.badges || "").split(";").map((b) => b.trim()).filter(Boolean),
+      entityUrid: r.entityUrid || undefined,
+      resolveRung: r.resolveRung || undefined,
+      resolveConfidence: r.resolveConfidence ?? null,
+      ...independenceFromBreakdown(r.scoreBreakdown),
     });
   });
 
   input.otherSignals.forEach((s, i) => {
+    if (isUnusualActivityCard({ category: s.category, title: s.title, signal: s.summary })) return;
+    if (isActivityTrackingHeadline(s.title) || isActivityTrackingHeadline(s.summary)) return;
     const text = `${s.title || ""} ${s.summary} ${s.category}`;
     const ts = parseTs(s.dateFound);
     const seg = segmentFor(s.company || "", text);
@@ -497,6 +587,10 @@ export function buildFeed(input: BuildFeedInput): FeedCard[] {
       materiality: s.materiality ?? null,
       rankScore: s.rankScore ?? null,
       badges: (s.badges || "").split(";").map((b) => b.trim()).filter(Boolean),
+      entityUrid: s.entityUrid || undefined,
+      resolveRung: s.resolveRung || undefined,
+      resolveConfidence: s.resolveConfidence ?? null,
+      ...independenceFromBreakdown(s.scoreBreakdown),
     });
   });
 
@@ -546,6 +640,16 @@ export function buildFeed(input: BuildFeedInput): FeedCard[] {
   });
 
   (input.emails || []).forEach((e, i) => {
+    if (
+      isActivityTrackingMessage({
+        subject: e.subject,
+        body: e.body,
+        snippet: e.snippet,
+        fromEmail: e.fromEmail,
+      })
+    ) {
+      return;
+    }
     // A digest-link signal: one article exploded out of a link-roundup email
     // (e.g. the weekly "Portco blogs" forward). The card is about the
     // ARTICLE's company, grounded in the real article URL — not the email.

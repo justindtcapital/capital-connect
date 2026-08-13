@@ -9,7 +9,7 @@ import {
 import { fetchAsanaPortcoData, type AsanaPortcoData } from "@/utils/asana.functions";
 import { syncPortcoFromAsana, syncPortcoFromWeb } from "@/utils/portco-sync.functions";
 import type { PortfolioCompany, Contact, PortfolioDomain, EmailActivityRecord } from "@/lib/types";
-import { matchSheetToAsanaKeys } from "@/lib/portco-names";
+import { dedupePortfolioCompanies, matchSheetToAsanaKeys } from "@/lib/portco-names";
 import { PortfolioCard } from "@/components/portfolio/PortfolioCard";
 import { PortfolioDetail } from "@/components/portfolio/PortfolioDetail";
 import { AddPortfolioCompanyDialog } from "@/components/portfolio/AddPortfolioCompanyDialog";
@@ -99,7 +99,11 @@ export const Route = createFileRoute("/portfolio")({
       .filter((key) => !claimedAsana.has(key))
       .map((key, i) => buildCompanyFromAsana(key, asana, i));
 
-    return { companies: [...merged, ...asanaOnly], contacts: contacts as Contact[], emailActivity };
+    // Collapse duplicate Sheet rows and Asana-only cards that share a normalized
+    // name or website domain (prefer sheet+URID; fill blanks from the loser).
+    const companiesDeduped = dedupePortfolioCompanies([...merged, ...asanaOnly]);
+
+    return { companies: companiesDeduped, contacts: contacts as Contact[], emailActivity };
   },
   component: PortfolioPage,
 });

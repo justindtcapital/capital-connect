@@ -44,6 +44,9 @@ import {
   updateTargetFields as updateTargetFieldsServer,
   bulkUpdateTargetFields as bulkUpdateTargetFieldsServer,
   repairTargetUrids as repairTargetUridsServer,
+  repairTargetSectors as repairTargetSectorsServer,
+  updateInteractionRow as updateInteractionRowServer,
+  deleteInteractionRow as deleteInteractionRowServer,
   setPortcoIntroSource as setPortcoIntroSourceServer,
   appendTargetRows as appendTargetRowsServer,
   recordDailySnapshot as recordDailySnapshotServer,
@@ -329,16 +332,20 @@ export const addContact = createServerFn({ method: "POST" })
       linkedinUrl?: string;
       /** Keep on Network CRM even if employer matches a PortCo name. */
       skipPortfolioSector?: boolean;
+      /** When true, stamp Contacts "Follow Up Flag" = TRUE. */
+      followUp?: boolean;
     }) => data,
   )
   .handler(async ({ data }) => {
     // Ensure the Source columns exist before the header-aware append writes them.
     await ensureColumn(TAB_NAMES.contacts, "Source");
     if (data.sourceContext) await ensureColumn(TAB_NAMES.contacts, "Source Context");
+    if (data.followUp) await ensureColumn(TAB_NAMES.contacts, "Follow Up Flag");
     await addContactRow({
       ...data,
       linkedin: data.linkedinUrl,
       source: data.source || "Manual Entry",
+      followUp: data.followUp === true,
     });
     return { success: true };
   });
@@ -518,6 +525,65 @@ export const repairTargetUrids = createServerFn({ method: "POST" }).handler(asyn
   }
   return res;
 });
+
+/** Move job titles out of Sector → Role and normalize remaining sector values. */
+export const repairTargetSectors = createServerFn({ method: "POST" }).handler(async () => {
+  const res = await repairTargetSectorsServer();
+  if (res.movedToRole > 0 || res.normalized > 0) {
+    await logOpsEventServer({
+      action: "maintenance",
+      source: "targets_sectors",
+      status: "ok",
+      summary: `Cleaned target sectors · ${res.movedToRole} title${res.movedToRole !== 1 ? "s" : ""} moved to Role, ${res.normalized} normalized (of ${res.total})`,
+      records: res.movedToRole + res.normalized,
+      details: {
+        movedToRole: res.movedToRole,
+        normalized: res.normalized,
+        total: res.total,
+      },
+    });
+  }
+  return res;
+});
+
+/** Patch a manual Notes-tab interaction (summary / type / follow-up flags). */
+export const updateInteraction = createServerFn({ method: "POST" })
+  .inputValidator(
+    (data: {
+      contactEmail: string;
+      originalNoteContent: string;
+      originalTimestamp?: string;
+      summary?: string;
+      type?: string;
+      requiresFollowUp?: boolean;
+      resolved?: boolean;
+    }) => data,
+  )
+  .handler(async ({ data }) => {
+    const type = data.type ? normalizeInteractionType(data.type) : undefined;
+    return updateInteractionRowServer({
+      contactEmail: data.contactEmail,
+      originalNoteContent: data.originalNoteContent,
+      originalTimestamp: data.originalTimestamp,
+      summary: data.summary,
+      type,
+      requiresFollowUp: data.requiresFollowUp,
+      resolved: data.resolved,
+    });
+  });
+
+/** Hard-delete a manual Notes-tab interaction row. */
+export const deleteInteraction = createServerFn({ method: "POST" })
+  .inputValidator(
+    (data: { contactEmail: string; noteContent: string; timestamp?: string }) => data,
+  )
+  .handler(async ({ data }) =>
+    deleteInteractionRowServer({
+      contactEmail: data.contactEmail,
+      noteContent: data.noteContent,
+      timestamp: data.timestamp,
+    }),
+  );
 
 // Batch-set fields (e.g. Stage) across many targets in one write. Overwrites by
 // default; pass fillOnly to leave non-blank cells untouched.

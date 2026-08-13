@@ -6,6 +6,21 @@ import type { AsanaActivity, Contact } from "@/lib/types";
 
 const norm = (s?: string) => (s || "").trim().toLowerCase();
 
+// Whole-address tokens only — substring matching let jo@x.com match inside
+// jjo@x.com. Regex tokens are maximal, so a longer address can never be
+// "contained" by a shorter contact email.
+const EMAIL_TOKEN_RE = /[A-Za-z0-9._%+'-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+
+/** Exact counterparty emails a Gmail activity carries (People line + personEmail). */
+export function gmailActivityEmails(a: AsanaActivity): Set<string> {
+  const out = new Set<string>();
+  const peopleLine =
+    (a.notes || "").split("\n").find((l) => l.trimStart().startsWith("People:")) || "";
+  for (const tok of peopleLine.match(EMAIL_TOKEN_RE) || []) out.add(tok.toLowerCase());
+  if (a.personEmail) out.add(a.personEmail.trim().toLowerCase());
+  return out;
+}
+
 // The Portfolio Company field can tag several companies ("Maven, Comcast"); split
 // it into normalized whole names so matching is exact per-name — never a substring
 // (which would wrongly match "Mave" against "Maven").
@@ -37,9 +52,11 @@ export function matchActivitiesToContact(
 
     // Gmail BD/GTM rows always carry exact counterparty emails in notes. Match by
     // email only — fuzzy name substring was attaching noise to wrong Contacts
-    // (e.g. short names / shared first names in subject lines).
+    // (e.g. short names / shared first names in subject lines). Token-exact
+    // against the People line, never substring over the whole notes blob.
     if (gmailSourced) {
-      return emails.some((e) => e && hay.includes(e));
+      const people = gmailActivityEmails(a);
+      return emails.some((e) => e && people.has(e));
     }
 
     if (name && norm(a.person) === name) return true;
@@ -95,4 +112,99 @@ export function resolvePortcosMentioned(a: AsanaActivity, portfolioNames: string
     claimed.add(p.key);
   }
   return found;
+}
+
+/** Subject collapsed to a comparison key: reply/forward prefixes stripped
+ *  (repeatedly — "RE: FW: x"), punctuation and case folded away. */
+export function normalizeSubjectKey(subject: string): string {
+  let t = (subject || "").trim().toLowerCase();
+  for (;;) {
+    const next = t.replace(/^(re|fw|fwd|aw|wg)\s*:\s*/i, "");
+    if (next === t) break;
+    t = next;
+  }
+  return t
+    .replace(/[^a-z0-9@&\s.-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+const CROSS_SOURCE_WINDOW_DAYS = 3;
+
+/**
+ * Drop Gmail activities that are cross-source twins of an Asana task — most
+ * tracked threads also go to an x+…@mail.asana.com intake address, so the same
+ * touch arrives from both sources with different gids.
+ *
+ * Rule: the ASANA record wins (it carries richer custom fields); the Gmail
+ * activity is dropped when an Asana task has the same normalized subject
+ * within ±3 days (or an undated match on either side).
+ */
+export function dropCrossSourceDupes(
+  asana: AsanaActivity[],
+  gmail: AsanaActivity[],
+): AsanaActivity[] {
+  if (asana.length === 0 || gmail.length === 0) return gmail;
+  const asanaDatesByKey = new Map<string, string[]>();
+  for (const a of asana) {
+    const key = normalizeSubjectKey(a.name);
+    if (!key) continue;
+    const dates = asanaDatesByKey.get(key);
+    if (dates) dates.push(a.date || "");
+    else asanaDatesByKey.set(key, [a.date || ""]);
+  }
+  const windowMs = CROSS_SOURCE_WINDOW_DAYS * 86_400_000;
+  return gmail.filter((g) => {
+    const key = normalizeSubjectKey(g.name);
+    if (!key) return true;
+    const dates = asanaDatesByKey.get(key);
+    if (!dates) return true;
+    const gd = g.date ? Date.parse(g.date) : Number.NaN;
+    const isTwin = dates.some((d) => {
+      const ad = d ? Date.parse(d) : Number.NaN;
+      if (!Number.isFinite(ad) || !Number.isFinite(gd)) return true; // undated same-subject → twin
+      return Math.abs(ad - gd) <= windowMs;
+    });
+    return !isTwin;
+  });
+}
+
+/** Contacts indexed by every email they carry (semicolon-separated), lowercased. */
+export function contactsByEmail(contacts: Contact[]): Map<string, Contact> {
+  const map = new Map<string, Contact>();
+  for (const c of contacts) {
+    for (const raw of (c.email || "").split(";")) {
+      const key = raw.trim().toLowerCase();
+      if (key && !map.has(key)) map.set(key, c);
+    }
+  }
+  return map;
+}
+
+/**
+ * Canonicalize Gmail activities against the CRM before any sheet write, so the
+ * BD/GTM tabs and contact pages always show the same spelling of a person.
+ *
+ * Person: the CRM contact's exact name when personEmail matches a contact;
+ * else the header display name already on the activity.
+ * Company precedence: (1) portfolio company mentioned in subject/notes,
+ * (2) the matched contact's CRM company, (3) the email-domain guess the
+ * activity arrived with. Never the forwarder's domain — the builder already
+ * derives the guess from the external counterparty.
+ */
+export function canonicalizeGmailActivities(
+  gmail: AsanaActivity[],
+  contacts: Contact[],
+  portfolioNames: string[],
+): AsanaActivity[] {
+  const byEmail = contactsByEmail(contacts);
+  return gmail.map((a) => {
+    if (!a.gid.startsWith("gmail-")) return a;
+    const contact = a.personEmail ? byEmail.get(a.personEmail.trim().toLowerCase()) : undefined;
+    const portco = resolvePortcosMentioned(a, portfolioNames)[0] || "";
+    const person = contact?.name?.trim() || a.person;
+    const company = portco || contact?.company?.trim() || a.company;
+    if (person === a.person && company === a.company) return a;
+    return { ...a, person, company };
+  });
 }

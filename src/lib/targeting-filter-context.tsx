@@ -4,7 +4,7 @@ import type { TargetingFilters } from "./types";
 const defaultFilters: TargetingFilters = {
   search: "",
   stage: "all",
-  sector: "all",
+  sector: [],
   city: "all",
   origin: "all",
   title: "",

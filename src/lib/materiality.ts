@@ -280,6 +280,9 @@ export function detectBurst(
   cfg: SignalConfig,
 ): { burst: boolean; recentCount: number; why: string } {
   const s = cfg.surprise;
+  if (!s.burstEnabled) {
+    return { burst: false, recentCount: 0, why: "burst detector disabled" };
+  }
   const recent = allEventDates.filter(
     (d) => d && d <= todayIso && daysDiff(todayIso, d) <= s.burstWindowDays,
   );

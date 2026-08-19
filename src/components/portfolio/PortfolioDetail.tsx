@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import type { PortfolioCompany, Contact, EmailActivityRecord } from "@/lib/types";
+import { formatEngagementSources } from "@/lib/engagement-source";
 import {
   Sheet,
   SheetContent,
@@ -174,7 +175,10 @@ export function PortfolioDetail({
       title: c.title || "",
       sector: c.sector || "",
       type: c.contactType || "",
-      source: (c.portCoEngagements || []).find((e) => e.portco === company.name)?.source || "",
+      source: (() => {
+        const eng = (c.portCoEngagements || []).find((e) => e.portco === company.name);
+        return eng?.sources?.length ? formatEngagementSources(eng.sources) : "";
+      })(),
     }));
     setInsightLoading(true);
     setInsight(null);
@@ -326,7 +330,8 @@ export function PortfolioDetail({
     const introNote = (c.interactions || [])
       .filter((it) => it.type === "intro")
       .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())[0];
-    const engagement = (c.portCoEngagements || []).find((e) => e.portco === company.name)?.source;
+    const eng = (c.portCoEngagements || []).find((e) => e.portco === company.name);
+    const engagement = eng?.sources?.length ? formatEngagementSources(eng.sources) : undefined;
     return {
       id: `crm-${c.id}`,
       date: introNote?.date || c.lastContact || new Date().toISOString().split("T")[0],
@@ -571,7 +576,7 @@ export function PortfolioDetail({
                 <PortcoKpiSection company={company} />
               </section>
 
-              {/* BD / GTM activity from Asana, matched to this company */}
+              {/* BD / GTM activity from the BD/GTM sheets, matched to this company */}
               {(activitiesLoading || companyActivities.length > 0) && (
                 <section className="border-b border-border pb-6">
                   <ActivitySection

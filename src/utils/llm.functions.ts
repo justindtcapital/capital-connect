@@ -31,6 +31,7 @@ import {
 } from "./sheets.server";
 import { savePlatformContent } from "./platform.server";
 import { targetKeyOf } from "@/lib/types";
+import { todayIso } from "@/lib/sheet-date";
 import type { DiligenceDimension } from "@/lib/platform-content";
 import {
   getQuerySession,
@@ -578,7 +579,7 @@ export const saveDraftToCrm = createServerFn({ method: "POST" })
   .handler(async ({ data }): Promise<SaveArtifactResult> => {
     const email = data.email.trim().toLowerCase();
     if (!email) return { saved: false, error: "The draft has no recipient email" };
-    const today = new Date().toISOString().split("T")[0];
+    const today = todayIso();
     const summary = `Outreach draft (via Query) — ${data.subject}\n\n${data.body}`.slice(0, 1500);
 
     const contacts = await buildContacts();

@@ -26,6 +26,7 @@ sa-key.json
 *-sa-key.json
 service-account*.json
 gcp-*.json
+venture-pulse-*.json
 
 # Wrangler / Cloudflare
 .wrangler/

@@ -1,4 +1,5 @@
 import { createServerFn } from "@tanstack/react-start";
+import { todayIso } from "@/lib/sheet-date";
 import {
   buildContacts,
   buildTargets,
@@ -48,9 +49,12 @@ import {
   updateInteractionRow as updateInteractionRowServer,
   deleteInteractionRow as deleteInteractionRowServer,
   setPortcoIntroSource as setPortcoIntroSourceServer,
+  mergePortcoIntroSource as mergePortcoIntroSourceServer,
+  appendPortcoIntroRows as appendPortcoIntroRowsServer,
   appendTargetRows as appendTargetRowsServer,
   recordDailySnapshot as recordDailySnapshotServer,
   ensureEventAttendanceBatch,
+  flagContactsForFollowUp as flagContactsForFollowUpServer,
   primarySheetEmail,
   type ImportResultInput,
   type OpsLogInput,
@@ -61,6 +65,7 @@ import {
 import { enrichPerson } from "./apollo.server";
 import { sampleContacts, sampleTargets, samplePortfolioCompanies } from "@/lib/sample-data";
 import { normalizeInteractionType, targetKeyOf } from "@/lib/types";
+import { formatEngagementSources } from "@/lib/engagement-source";
 import type {
   AsanaEvent,
   Temperature,
@@ -221,7 +226,7 @@ export const addNote = createServerFn({ method: "POST" })
     }) => data,
   )
   .handler(async ({ data }) => {
-    const now = new Date().toISOString().split("T")[0];
+    const now = todayIso();
     await appendInteractionRows([
       {
         email: data.contactEmail,
@@ -244,6 +249,11 @@ export const addEvent = createServerFn({ method: "POST" })
       date?: string;
       /** Ensure App Events catalog row (default true). */
       ensureCatalog?: boolean;
+      /**
+       * Stamp the contact's Follow Up Flag (default true for attended, false for
+       * invited). Keeps post-event outreach visible on Network.
+       */
+      flagFollowUp?: boolean;
     }) => data,
   )
   .handler(async ({ data }) => {
@@ -263,11 +273,17 @@ export const addEvent = createServerFn({ method: "POST" })
         catalogType: "meeting",
       },
     ]);
+    // Attended uploads default to follow-up so names aren't lost after the event.
+    const wantFollowUp = data.flagFollowUp ?? type === "attended";
+    let followUpsFlagged = 0;
+    if (wantFollowUp) {
+      followUpsFlagged = (await flagContactsForFollowUpServer([email])).updated;
+    }
     await logOpsEventServer({
       action: "sync",
       source: "event_attendance",
       status: "ok",
-      summary: `Event ${type} · ${email} ← ${data.eventName.trim()}`,
+      summary: `Event ${type} · ${email} ← ${data.eventName.trim()}${followUpsFlagged ? " · follow-up flagged" : ""}`,
       records: res.attendanceWritten,
       details: {
         email,
@@ -276,38 +292,84 @@ export const addEvent = createServerFn({ method: "POST" })
         attendanceWritten: res.attendanceWritten,
         catalogWritten: res.catalogWritten,
         skipped: res.skipped,
+        followUpsFlagged,
       },
       items: [`${email} ← ${data.eventName.trim()} [${type}]`],
     });
-    return { success: true as const, ...res };
+    return { success: true as const, ...res, followUpsFlagged };
   });
 
 export const addPortcoIntro = createServerFn({ method: "POST" })
   .inputValidator(
-    (data: { contactEmail: string; portcoName: string; source?: EngagementSource }) => data,
+    (data: {
+      contactEmail: string;
+      portcoName: string;
+      /** Single source (legacy) or multi-select list. */
+      source?: EngagementSource | EngagementSource[];
+      sources?: EngagementSource[];
+      urid?: string;
+    }) => data,
   )
   .handler(async ({ data }) => {
     const now = new Date().toISOString().split("T")[0];
-    // Make sure the tab has the Engagement Source column before writing it.
-    await ensureColumn(TAB_NAMES.portcoIntros, "Engagement Source");
-    await appendSheetRow(TAB_NAMES.portcoIntros, [
-      data.contactEmail,
-      data.portcoName,
-      now,
-      data.source || "direct introduction",
+    const sources = data.sources?.length
+      ? data.sources
+      : Array.isArray(data.source)
+        ? data.source
+        : data.source
+          ? [data.source]
+          : (["direct introduction"] as EngagementSource[]);
+    await appendPortcoIntroRowsServer([
+      {
+        email: data.contactEmail,
+        portcoName: data.portcoName,
+        date: now,
+        source: formatEngagementSources(sources),
+        urid: data.urid,
+      },
     ]);
     return { success: true };
   });
 
-// Reclassify an existing portfolio engagement's source in place (inline edit on
-// the contact panel), without deleting/re-adding the intro.
+// Replace engagement source(s) in place (inline multi-select on the contact panel).
 export const setPortcoIntroSource = createServerFn({ method: "POST" })
   .inputValidator(
-    (data: { contactEmail: string; portcoName: string; source: EngagementSource; urid?: string }) =>
-      data,
+    (data: {
+      contactEmail: string;
+      portcoName: string;
+      source?: EngagementSource | EngagementSource[];
+      sources?: EngagementSource[];
+      urid?: string;
+    }) => data,
+  )
+  .handler(async ({ data }) => {
+    const sources = data.sources?.length
+      ? data.sources
+      : Array.isArray(data.source)
+        ? data.source
+        : data.source
+          ? [data.source]
+          : (["direct introduction"] as EngagementSource[]);
+    return setPortcoIntroSourceServer(
+      data.contactEmail,
+      data.portcoName,
+      sources,
+      data.urid,
+    );
+  });
+
+/** Add one source onto an existing engagement when sync determines it applies. */
+export const mergePortcoIntroSource = createServerFn({ method: "POST" })
+  .inputValidator(
+    (data: {
+      contactEmail: string;
+      portcoName: string;
+      source: EngagementSource;
+      urid?: string;
+    }) => data,
   )
   .handler(async ({ data }) =>
-    setPortcoIntroSourceServer(data.contactEmail, data.portcoName, data.source, data.urid),
+    mergePortcoIntroSourceServer(data.contactEmail, data.portcoName, data.source, data.urid),
   );
 
 export const addContact = createServerFn({ method: "POST" })
@@ -471,6 +533,16 @@ export const importTargets = createServerFn({ method: "POST" })
         items: toAdd.map((t) =>
           [`${t.firstName} ${t.lastName}`.trim(), t.company].filter(Boolean).join(" · "),
         ),
+      });
+    } else if (duplicates > 0) {
+      // Nothing added — still record the attempt so the Ops Log has no gaps.
+      await logOpsEventServer({
+        action: "import",
+        source: "targets",
+        status: "warning",
+        summary: `Target import skipped · all ${duplicates} row${duplicates !== 1 ? "s" : ""} already in Targets`,
+        records: 0,
+        details: { duplicates },
       });
     }
     return { added: toAdd.length, duplicates };
@@ -1166,7 +1238,7 @@ export const recordEmailSent = createServerFn({ method: "POST" })
     const subject = (data.subject || "").trim();
     const summary =
       (subject ? `Email sent: ${subject}` : `Email sent to ${email}`) + tag;
-    const today = new Date().toISOString().slice(0, 10);
+    const today = todayIso();
     const sourceRef = `email-sent:${email.toLowerCase()}:${today}:${subject.slice(0, 80).toLowerCase()}`;
 
     await appendInteractionRows([

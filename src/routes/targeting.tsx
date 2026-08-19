@@ -106,6 +106,7 @@ import {
   repairTargetUrids,
   repairTargetSectors,
   addTarget,
+  logOpsEvent,
 } from "@/utils/sheets.functions";
 import { promoteTargetsToCrm } from "@/utils/target-crm.functions";
 import { NetworkBuilderDialog } from "@/components/crm/NetworkBuilderDialog";
@@ -327,6 +328,24 @@ function downloadFile(blob: Blob, filename: string) {
   URL.revokeObjectURL(url);
 }
 
+// Audit trail for exports — lands in the Ops Log tab shown on /activity.
+function logTargetExport(format: "csv" | "xlsx", filename: string, targets: TargetLead[]) {
+  void logOpsEvent({
+    data: {
+      action: "export",
+      source: format === "xlsx" ? "targets_xlsx" : "targets_csv",
+      status: "ok",
+      summary: `Exported ${targets.length} target${targets.length !== 1 ? "s" : ""} to ${filename}`,
+      records: targets.length,
+      details: { format, filename, selection: "filtered_view" },
+      items: targets.slice(0, 80).map((t) => {
+        const email = (t.email || "").split(";")[0]?.trim() || "";
+        return `${t.name || "(no name)"}${email ? ` <${email}>` : ""}${t.company ? ` · ${t.company}` : ""}`;
+      }),
+    },
+  }).catch((e) => console.error("logOpsEvent target export failed", e));
+}
+
 function exportTargetsCsv(targets: TargetLead[]) {
   const rows = buildTargetExportRows(targets);
   const headers = EXPORT_COLUMNS.map((c) => escapeCsvCell(c.label)).join(",");
@@ -334,7 +353,9 @@ function exportTargetsCsv(targets: TargetLead[]) {
   const csv = [headers, ...lines].join("\n");
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
   const date = new Date().toISOString().split("T")[0];
-  downloadFile(blob, `targets-${date}.csv`);
+  const filename = `targets-${date}.csv`;
+  downloadFile(blob, filename);
+  logTargetExport("csv", filename, targets);
 }
 
 function exportTargetsXlsx(targets: TargetLead[]) {
@@ -343,7 +364,9 @@ function exportTargetsXlsx(targets: TargetLead[]) {
   const workbook = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(workbook, worksheet, "Targets");
   const date = new Date().toISOString().split("T")[0];
-  XLSX.writeFile(workbook, `targets-${date}.xlsx`);
+  const filename = `targets-${date}.xlsx`;
+  XLSX.writeFile(workbook, filename);
+  logTargetExport("xlsx", filename, targets);
 }
 
 // Target card — mirrors the Network ContactCard layout (avatar + identity, an
@@ -496,6 +519,7 @@ function TargetingPage() {
   // New targets are manual by default; source is a constrained enum.
   const [newOrigin, setNewOrigin] = useState<string>("Manual Entry");
   const [newTargetSaving, setNewTargetSaving] = useState(false);
+  const [newEnrich, setNewEnrich] = useState(true);
 
   // Bulk import — defaults to the canonical "CSV Import" source.
   const [bulkText, setBulkText] = useState("");
@@ -804,17 +828,50 @@ function TargetingPage() {
     const firstName = parts[0] || fullName;
     const lastName = parts.slice(1).join(" ");
     try {
+      let company = "";
+      let role = "";
+      let email = "";
+      let phone = "";
+      let sector = "";
+      let linkedin = newLinkedin.trim();
+      let location = newLocation.trim();
+      let enriched = false;
+
+      if (newEnrich) {
+        try {
+          const r = await enrichContact({
+            data: {
+              firstName,
+              lastName: lastName || undefined,
+              linkedinUrl: linkedin || undefined,
+            },
+          });
+          if (r.found) {
+            company = r.company || "";
+            role = r.title || "";
+            email = r.email || "";
+            phone = r.phone || "";
+            sector = r.industry || "";
+            linkedin = linkedin || (r.linkedinUrl || "").replace(/\/+$/, "");
+            location = location || [r.city, r.state].filter(Boolean).join(", ");
+            enriched = true;
+          }
+        } catch (err) {
+          console.error("new target enrich failed", err);
+        }
+      }
+
       await addTarget({
         data: {
           firstName,
           lastName,
-          company: "",
-          role: "",
-          linkedin: newLinkedin.trim(),
-          email: "",
-          phone: "",
-          location: newLocation.trim(),
-          sector: "",
+          company,
+          role,
+          linkedin,
+          email,
+          phone,
+          location,
+          sector,
           stage: "Prospecting",
           source: newOrigin || "Manual Entry",
           researchPurpose: "",
@@ -825,7 +882,9 @@ function TargetingPage() {
       setNewLinkedin("");
       setNewLocation("");
       setNewOrigin("Manual Entry");
-      toast.success(`Saved ${fullName} to Targets.`);
+      toast.success(
+        `Saved ${fullName} to Targets.${newEnrich ? (enriched ? " Enriched with Apollo." : " No Apollo match found.") : ""}`,
+      );
       await router.invalidate();
     } catch (e) {
       console.error("addTarget failed", e);
@@ -2314,6 +2373,20 @@ function TargetingPage() {
                 </SelectContent>
               </Select>
             </div>
+            <label className="flex items-start gap-2 text-xs text-muted-foreground cursor-pointer">
+              <Checkbox
+                checked={newEnrich}
+                onCheckedChange={(v) => setNewEnrich(v === true)}
+                className="mt-0.5"
+              />
+              <span>
+                Enrich with Apollo on add.
+                <span className="text-muted-foreground/70">
+                  {" "}
+                  Fills in title, company, email, phone, location and sector when found.
+                </span>
+              </span>
+            </label>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setNewTargetOpen(false)}>
@@ -2322,7 +2395,8 @@ function TargetingPage() {
             <Button onClick={() => void handleNewTarget()} disabled={!newName.trim() || newTargetSaving}>
               {newTargetSaving ? (
                 <>
-                  <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" /> Saving…
+                  <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />{" "}
+                  {newEnrich ? "Enriching & saving…" : "Saving…"}
                 </>
               ) : (
                 "Begin Research"

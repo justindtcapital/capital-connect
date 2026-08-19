@@ -547,14 +547,19 @@ export function AppSidebar({
                     </div>
                   </div>
 
-                  <div className="relative">
-                    <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
-                    <Input
-                      placeholder="Search..."
-                      value={filters.search}
-                      onChange={(e) => update({ search: e.target.value })}
-                      className="pl-8 h-8 text-xs"
-                    />
+                  <div>
+                    <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
+                      Search
+                    </label>
+                    <div className="relative">
+                      <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+                      <Input
+                        placeholder="Name, company, or email…"
+                        value={filters.search}
+                        onChange={(e) => update({ search: e.target.value })}
+                        className="pl-8 h-8 text-xs"
+                      />
+                    </div>
                   </div>
 
                   <div>
@@ -730,25 +735,20 @@ export function AppSidebar({
                     <div className="grid grid-cols-2 gap-2">
                       <div>
                         <span className="text-[10px] text-muted-foreground mb-0.5 block">From</span>
-                        <Input
-                          type="date"
+                        <DateTextField
                           value={filters.dateFrom}
-                          max={filters.dateTo || undefined}
-                          onChange={(e) => update({ dateFrom: e.target.value })}
-                          className="h-8 text-xs"
+                          onChange={(iso) => update({ dateFrom: iso })}
                         />
                       </div>
                       <div>
                         <span className="text-[10px] text-muted-foreground mb-0.5 block">To</span>
-                        <Input
-                          type="date"
+                        <DateTextField
                           value={filters.dateTo}
-                          min={filters.dateFrom || undefined}
-                          onChange={(e) => update({ dateTo: e.target.value })}
-                          className="h-8 text-xs"
+                          onChange={(iso) => update({ dateTo: iso })}
                         />
                       </div>
                     </div>
+
                   </div>
 
                   <div className="flex items-center gap-2 pt-1">

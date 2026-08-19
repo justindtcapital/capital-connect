@@ -20,6 +20,8 @@ interface MultiSelectProps {
   /** Show a search box (default on; useful for long lists like cities). */
   searchable?: boolean;
   className?: string;
+  /** Custom trigger label; defaults to single value / "N selected". */
+  formatLabel?: (value: string[]) => string;
 }
 
 // Searchable multi-select: a popover checkbox list whose trigger summarizes the
@@ -32,13 +34,20 @@ export function MultiSelect({
   placeholder = "All",
   searchable = true,
   className,
+  formatLabel,
 }: MultiSelectProps) {
   const toggle = (option: string) => {
     onChange(value.includes(option) ? value.filter((v) => v !== option) : [...value, option]);
   };
 
   const label =
-    value.length === 0 ? placeholder : value.length === 1 ? value[0] : `${value.length} selected`;
+    value.length === 0
+      ? placeholder
+      : formatLabel
+        ? formatLabel(value)
+        : value.length === 1
+          ? value[0]
+          : `${value.length} selected`;
 
   return (
     <Popover>

@@ -14,6 +14,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Checkbox } from "@/components/ui/checkbox";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Mail, Linkedin, User } from "lucide-react";
+import { contactImportRejectReason } from "@/lib/contact-noise";
 import { addContact, fetchContactEmails, logImportResult, storeApolloRaw } from "@/utils/sheets.functions";
 import { enrichContact } from "@/utils/apollo.functions";
 import { toast } from "sonner";
@@ -152,6 +153,7 @@ export function SmartPasteDialog({ open, onOpenChange, existingEmails = [], onIm
 
     let added = 0;
     let enriched = 0;
+    let skippedNoise = 0;
     for (const p of toImport) {
       const c: {
         name: string;
@@ -214,6 +216,16 @@ export function SmartPasteDialog({ open, onOpenChange, existingEmails = [], onIm
       }
       const finalName = c.name || c.email;
       if (!finalName) continue;
+      if (
+        contactImportRejectReason({
+          name: finalName,
+          email: c.email,
+          company: c.company,
+        })
+      ) {
+        skippedNoise++;
+        continue;
+      }
       try {
         await addContact({
           data: {
@@ -237,7 +249,7 @@ export function SmartPasteDialog({ open, onOpenChange, existingEmails = [], onIm
         console.error("paste add failed", c.email || finalName, e);
       }
     }
-    const failed = toImport.length - added;
+    const failed = toImport.length - added - skippedNoise;
     const totalDupes = skipped + commitDupes;
 
     // Log the import to the Import History tab (audit trail), best-effort.
@@ -264,6 +276,7 @@ export function SmartPasteDialog({ open, onOpenChange, existingEmails = [], onIm
     const parts = [`Added ${added} contact${added !== 1 ? "s" : ""}`];
     if (enrich) parts.push(`${enriched} enriched`);
     if (totalDupes > 0) parts.push(`${totalDupes} duplicate${totalDupes !== 1 ? "s" : ""} skipped`);
+    if (skippedNoise > 0) parts.push(`${skippedNoise} garbage/noise skipped`);
     if (failed > 0) toast.warning(`${parts.join(" · ")} · ${failed} failed (see console)`);
     else toast.success(parts.join(" · "));
 

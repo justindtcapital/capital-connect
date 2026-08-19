@@ -19,7 +19,8 @@ export const ENGAGEMENT_SOURCES: EngagementSource[] = [
 export interface PortCoEngagement {
   portco: string;
   date: string;
-  source: EngagementSource;
+  /** All applicable sources for this (contact, portco) pair. */
+  sources: EngagementSource[];
 }
 
 /** A company-level event exposure row from the PortCo Event Exposure tab. */
@@ -439,8 +440,8 @@ export interface AsanaEvent {
   attendeeCount?: number;
 }
 
-/** A BD or GTM activity pulled from an Asana "Activity Tracking" project, matched
- *  to a Contact and/or PortCo for display on those detail records. */
+/** A BD or GTM activity mirrored onto the BD / GTM sheet tabs, matched to a
+ *  Contact and/or PortCo for display on those detail records. */
 export interface AsanaActivity {
   gid: string;
   /** Which Activity Tracking project this came from. */

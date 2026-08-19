@@ -86,6 +86,22 @@ export function matchActivitiesToCompany(
   });
 }
 
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * True when `key` appears in `hay` as its own token — not as a prefix/substring
+ * of a longer word. Prevents portfolio "Mave" matching subject "Maven".
+ */
+export function portcoNameMentioned(hay: string, key: string): boolean {
+  const k = norm(key);
+  if (!k || k.length < 3) return false;
+  // Allow soft boundaries: start/end, whitespace, or punctuation (/, -, :, etc.).
+  const re = new RegExp(`(?:^|[^a-z0-9])${escapeRegExp(k)}(?=[^a-z0-9]|$)`, "i");
+  return re.test(hay || "");
+}
+
 /**
  * Resolve which portfolio companies an activity mentions — from the Asana/Gmail
  * company field and from name/notes text. Returns canonical PortCo display names
@@ -106,10 +122,16 @@ export function resolvePortcosMentioned(a: AsanaActivity, portfolioNames: string
 
   for (const p of sorted) {
     if (claimed.has(p.key)) continue;
-    const hit = tagged.has(p.key) || hay.includes(p.key);
+    // Exact tag on the company field, or token-boundary mention in text.
+    const hit = tagged.has(p.key) || portcoNameMentioned(hay, p.key);
     if (!hit) continue;
     found.push(p.raw);
     claimed.add(p.key);
+    // Also claim shorter PortCo keys that are prefixes of this match so a
+    // tagged "Maven" row never also picks up a stray "Mave" portfolio entry.
+    for (const other of sorted) {
+      if (other.key !== p.key && p.key.startsWith(other.key)) claimed.add(other.key);
+    }
   }
   return found;
 }

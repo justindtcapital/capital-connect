@@ -10,6 +10,7 @@ import {
   type InteractionRowInput,
 } from "./sheets.server";
 import { normalizeSource, type OutreachAttempt, type RecordSource } from "@/lib/types";
+import { todayIso } from "@/lib/sheet-date";
 
 export interface PromoteTargetInput {
   urid?: string;
@@ -99,7 +100,7 @@ export const promoteTargetsToCrm = createServerFn({ method: "POST" })
 
       const noteRows: InteractionRowInput[] = [];
       const seen = new Set<string>();
-      const today = new Date().toISOString().slice(0, 10);
+      const today = todayIso();
 
       for (const t of targets) {
         const name = (t.name || "").trim();

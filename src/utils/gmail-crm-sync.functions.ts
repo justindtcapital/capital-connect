@@ -13,12 +13,14 @@ import {
   logEmailActivity,
   TAB_NAMES,
   ensureEventAttendanceBatch,
+  flagContactsForFollowUp,
   shipNotesToEventAttendance,
   cleanCalendarEventName,
   type InteractionRowInput,
   type EventAttendanceInput,
 } from "./sheets.server";
 import { isNoiseEmail } from "@/lib/email-noise";
+import { parseToIsoDate, todayIso } from "@/lib/sheet-date";
 import type { Contact, InteractionType } from "@/lib/types";
 
 function syncKey(email: string, gid: string): string {
@@ -108,6 +110,8 @@ export interface SyncGmailCrmResult {
   eventsLogged: number;
   /** App Events catalog rows created. */
   eventCatalogLogged: number;
+  /** Contacts newly stamped Follow Up after calendar attended tags. */
+  followUpsFlagged: number;
 }
 
 const EMPTY: SyncGmailCrmResult = {
@@ -120,6 +124,7 @@ const EMPTY: SyncGmailCrmResult = {
   emailActivityLogged: 0,
   eventsLogged: 0,
   eventCatalogLogged: 0,
+  followUpsFlagged: 0,
 };
 
 /**
@@ -194,7 +199,7 @@ export const syncGmailCrmTouches = createServerFn({ method: "POST" }).handler(
       const touched = new Set<string>();
       let alreadySynced = 0;
       let emailActivityLogged = 0;
-      const today = new Date().toISOString().slice(0, 10);
+      const today = todayIso();
 
       for (const t of fetch.touches) {
         const m = t.message;
@@ -217,7 +222,7 @@ export const syncGmailCrmTouches = createServerFn({ method: "POST" }).handler(
             if (t.kind === "calendar") {
               const eventName = cleanCalendarEventName(m.subject || "");
               if (eventName) {
-                const date = m.dateLabel || today;
+                const date = parseToIsoDate(m.dateLabel) || today;
                 eventItems.push({
                   email: hit.email,
                   eventName,
@@ -235,7 +240,7 @@ export const syncGmailCrmTouches = createServerFn({ method: "POST" }).handler(
           if (queued.has(qk)) continue;
           queued.add(qk);
 
-          const date = m.dateLabel || today;
+          const date = parseToIsoDate(m.dateLabel) || today;
           rows.push({
             email: hit.email,
             date,
@@ -284,12 +289,20 @@ export const syncGmailCrmTouches = createServerFn({ method: "POST" }).handler(
 
       let eventsLogged = 0;
       let eventCatalogLogged = 0;
+      let followUpsFlagged = 0;
       try {
         const live = await ensureEventAttendanceBatch(eventItems);
         // Also backfill Notes already shaped as Meeting: / [Event: …].
         const backfill = await shipNotesToEventAttendance();
         eventsLogged = live.attendanceWritten + backfill.attendanceWritten;
         eventCatalogLogged = live.catalogWritten + backfill.catalogWritten;
+        // Past calendar events (attended) → Follow Up so outreach isn't missed.
+        const attendedEmails = eventItems
+          .filter((i) => (i.type || "attended") === "attended")
+          .map((i) => i.email);
+        if (attendedEmails.length > 0) {
+          followUpsFlagged = (await flagContactsForFollowUp(attendedEmails)).updated;
+        }
       } catch (e) {
         console.error("[gmail-crm] event attendance ship failed:", e);
       }
@@ -304,19 +317,22 @@ export const syncGmailCrmTouches = createServerFn({ method: "POST" }).handler(
         emailActivityLogged,
         eventsLogged,
         eventCatalogLogged,
+        followUpsFlagged,
       };
 
       await logOpsEvent({
         action: "sync",
         source: "gmail_crm",
         status: "ok",
-        summary: `Gmail CRM sync · logged ${result.logged} notes · ${result.eventsLogged} event links across ${result.matchedContacts} contacts`,
+        summary: `Gmail CRM sync · logged ${result.logged} notes · ${result.eventsLogged} event links across ${result.matchedContacts} contacts` +
+          (followUpsFlagged ? ` · ${followUpsFlagged} follow-ups flagged` : ""),
         records: result.logged + result.eventsLogged,
         details: {
           messages: result.messages,
           matchedContacts: result.matchedContacts,
           alreadySynced: result.alreadySynced,
           emailActivityLogged: result.emailActivityLogged,
+          followUpsFlagged,
           eventsLogged: result.eventsLogged,
           eventCatalogLogged: result.eventCatalogLogged,
           sent: fetch.touches.filter((t) => t.kind === "sent").length,

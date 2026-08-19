@@ -24,9 +24,11 @@ import { MultiSelect } from "@/components/ui/multi-select";
 import { addContact, addEvent as addEventToSheet, addPortcoIntro, addNote, fetchContactEmails, logImportResult, fetchImportHistory, storeApolloRaw } from "@/utils/sheets.functions";
 import { enrichContact } from "@/utils/apollo.functions";
 import { toast } from "sonner";
+import { contactImportRejectReason } from "@/lib/contact-noise";
 import { normalizeEmails } from "@/lib/email";
 import { normalizeLinkedinUrl } from "@/lib/linkedin";
 import { ENGAGEMENT_SOURCES, type EngagementSource } from "@/lib/types";
+import { formatEngagementSources, mergeEngagementSources } from "@/lib/engagement-source";
 
 interface BulkUploadDialogProps {
   open: boolean;
@@ -271,12 +273,15 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
   const [portcoNames, setPortcoNames] = useState<string[]>([]);
   // How the tagged contacts came to engage the selected portcos — written to the
   // "PortCos Introduced" tab's Engagement Source column (defaults to a direct intro).
-  const [portcoSource, setPortcoSource] = useState<EngagementSource>("direct introduction");
+  const [portcoSources, setPortcoSources] = useState<EngagementSource[]>([
+    "direct introduction",
+  ]);
   const [source, setSource] = useState("");
   // Hands-off by default: imported contacts are auto-enriched unless unchecked.
   const [enrichOnImport, setEnrichOnImport] = useState(true);
   /** Stamp Contacts "Follow Up Flag" = TRUE for every imported row. */
   const [flagFollowUp, setFlagFollowUp] = useState(false);
+  const [followUpEmails, setFollowUpEmails] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [history, setHistory] = useState<ImportHistoryRow[]>([]);
   const [showHistory, setShowHistory] = useState(false);
@@ -364,18 +369,32 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
 
   const { rows, skipped } = report;
 
+  // Follow-up flags are per person, keyed by the row's primary email.
+  const followUpKey = (email: string) =>
+    email.split(";")[0]?.trim().toLowerCase() || "";
+
+  // Event upload ⇒ default everyone to follow-up so post-event outreach isn't missed.
+  // Clearing the event doesn't wipe manual flags; picking an event re-flags the batch.
+  useEffect(() => {
+    if (!eventName.trim() || rows.length === 0) return;
+    setFollowUpEmails(new Set(rows.map((r) => followUpKey(r.email))));
+  }, [eventName, rows]);
+
   const reset = () => {
     setGrid(null);
     setFileName("");
     setMapping(emptyMapping());
     setEventName("");
     setPortcoNames([]);
-    setPortcoSource("direct introduction");
+    setPortcoSources(["direct introduction"]);
     setSource("");
     setEnrichOnImport(true);
     setFlagFollowUp(false);
+    setFollowUpEmails(new Set());
     setBusy(false);
   };
+
+  const isFlaggedForFollowUp = (email: string) => followUpEmails.has(followUpKey(email));
 
   const submit = async () => {
     if (rows.length === 0) return;
@@ -405,6 +424,17 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
       console.error("commit-time dedup failed (proceeding with client dedup):", e);
     }
 
+    const beforeNoise = toImport.length;
+    toImport = toImport.filter(
+      (r) =>
+        !contactImportRejectReason({
+          name: r.name,
+          email: r.email,
+          company: r.company,
+        }),
+    );
+    const skippedNoise = beforeNoise - toImport.length;
+
     let added = 0;
     let enrichedCount = 0;
     let taggedEvent = 0;
@@ -433,7 +463,7 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
             employmentHistory: r.employmentHistory,
             temperature: "Warm",
             source: "CSV Import",
-            followUp: flagFollowUp,
+            followUp: Boolean(evt) || isFlaggedForFollowUp(r.email) || flagFollowUp,
           },
         });
         added++;
@@ -444,20 +474,24 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
         if (r.email) {
           if (evt) {
             try {
-              await addEventToSheet({ data: { contactEmail: r.email, eventName: evt, type: "attended" } });
+              await addEventToSheet({
+                data: { contactEmail: r.email, eventName: evt, type: "attended", flagFollowUp: true },
+              });
               taggedEvent++;
             } catch (e) {
               console.error("event tag failed", r.email, e);
             }
           }
           if (portcos.length > 0) {
-            // Tag the contact with each selected portfolio company (independent,
-            // best-effort). Count the contact once if any tag lands.
             let taggedAny = false;
             for (const portco of portcos) {
               try {
                 await addPortcoIntro({
-                  data: { contactEmail: r.email, portcoName: portco, source: portcoSource },
+                  data: {
+                    contactEmail: r.email,
+                    portcoName: portco,
+                    sources: mergeEngagementSources([], portcoSources),
+                  },
                 });
                 taggedAny = true;
               } catch (e) {
@@ -508,6 +542,9 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
     const parts = [`Imported ${added} contact${added !== 1 ? "s" : ""}`];
     if (enrichOnImport) parts.push(`${enrichedCount} enriched`);
     if (totalDupes > 0) parts.push(`${totalDupes} duplicate${totalDupes !== 1 ? "s" : ""} skipped`);
+    if (skippedNoise > 0) {
+      parts.push(`${skippedNoise} garbage/noise skipped`);
+    }
     if (evt) parts.push(`${taggedEvent} → event "${evt}"`);
     if (portcos.length > 0)
       parts.push(
@@ -624,21 +661,19 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
                         className="h-9"
                       />
                       {portcoNames.length > 0 && (
-                        <Select
-                          value={portcoSource}
-                          onValueChange={(v) => setPortcoSource(v as EngagementSource)}
-                        >
-                          <SelectTrigger className="h-8 text-xs mt-1.5">
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            {ENGAGEMENT_SOURCES.map((s) => (
-                              <SelectItem key={s} value={s} className="text-xs capitalize">
-                                {s}
-                              </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
+                        <MultiSelect
+                          options={[...ENGAGEMENT_SOURCES]}
+                          value={portcoSources}
+                          onChange={(v) =>
+                            setPortcoSources(
+                              mergeEngagementSources([], (v as EngagementSource[]) || []),
+                            )
+                          }
+                          searchable={false}
+                          placeholder="Engagement sources…"
+                          formatLabel={(v) => formatEngagementSources(v as EngagementSource[])}
+                          className="h-8 text-xs mt-1.5 capitalize"
+                        />
                       )}
                     </div>
                     <div>
@@ -691,9 +726,16 @@ export function BulkUploadDialog({ open, onOpenChange, portcoOptions = [], exist
                   </div>
 
                   <div>
-                    <Label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
-                      Preview · first {Math.min(rows.length, 8)} of {rows.length}
-                    </Label>
+                    <div className="flex items-center justify-between mb-1">
+                      <Label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground block">
+                        Preview · first {Math.min(rows.length, 8)} of {rows.length}
+                      </Label>
+                      <span className="text-[10px] text-muted-foreground">
+                        {followUpEmails.size} flagged for follow-up
+                        {eventName.trim() ? " · event → all flagged" : ""}
+                      </span>
+                    </div>
+
                     <ScrollArea className="h-48 border border-border rounded">
                       <table className="w-full text-[11px]">
                         <thead className="bg-muted/40 sticky top-0">

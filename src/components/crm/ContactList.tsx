@@ -10,6 +10,7 @@ import { BulkEditBar } from "./BulkEditBar";
 import { Button } from "@/components/ui/button";
 import { LayoutGrid, List } from "lucide-react";
 import { useSelection } from "@/lib/selection-context";
+import { scoreContactSearch } from "@/lib/contact-search";
 
 interface ContactListProps {
   contacts: Contact[];
@@ -45,15 +46,7 @@ export function ContactList({
         if (!profile) return false;
         if (!isMyContact(c, owned, profile)) return false;
       }
-      if (filters.search) {
-        const q = filters.search.toLowerCase();
-        if (
-          !c.name.toLowerCase().includes(q) &&
-          !c.company.toLowerCase().includes(q) &&
-          !c.email.toLowerCase().includes(q)
-        )
-          return false;
-      }
+      if (filters.search.trim() && scoreContactSearch(c, filters.search) <= 0) return false;
       // Multi-select categorical filters: empty = no filter; OR within each field.
       if (filters.sector.length && !filters.sector.includes(c.sector)) return false;
       if (filters.temperature.length && !filters.temperature.includes(c.temperature)) return false;
@@ -103,12 +96,21 @@ export function ContactList({
       }
       return true;
     });
-    // Newest contacts first (by Date Added); rows without a date sink to the bottom.
+    const q = filters.search.trim();
+    const scores = q ? new Map(result.map((c) => [c.id, scoreContactSearch(c, q)])) : null;
+    // Sheet order is append-only (newer rows at the bottom). Use it as the
+    // tiebreaker so same-day / undated imports stay newest-first instead of A–Z.
+    const sheetOrder = new Map(localContacts.map((c, i) => [c.id, i]));
+    // When searching, rank name hits above company/email. Otherwise newest first.
     return [...result].sort((a, b) => {
+      if (scores) {
+        const ds = (scores.get(b.id) || 0) - (scores.get(a.id) || 0);
+        if (ds !== 0) return ds;
+      }
       const at = Date.parse(a.dateAdded || "") || 0;
       const bt = Date.parse(b.dateAdded || "") || 0;
       if (bt !== at) return bt - at;
-      return a.name.localeCompare(b.name);
+      return (sheetOrder.get(b.id) ?? 0) - (sheetOrder.get(a.id) ?? 0);
     });
   }, [localContacts, filters, profile, ownedGids]);
 

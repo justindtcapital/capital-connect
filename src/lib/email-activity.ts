@@ -1,6 +1,10 @@
 /**
  * BD / GTM activity-tracking mail vs Signals news.
  * Pure helpers — safe on client and server.
+ *
+ * Ported from capital-connect / DTC_CRM_Local so "DTC: X — GTM Discussion"
+ * threads that never touched a tracking alias still route into the activity
+ * pipeline instead of the news feed.
  */
 
 export type ActivityMailShape = {
@@ -58,4 +62,51 @@ export function isActivityTrackingMessage(
 /** Subject/headline-only check for stored Signals rows (no full headers). */
 export function isActivityTrackingHeadline(text?: string): boolean {
   return isActivityTrackingMessage({ subject: text || "" });
+}
+
+/**
+ * True when a message is a calendar invite / appointment reply (ICS chrome),
+ * not a prose email. Still belongs on BD/GTM as a Meeting with portcos from
+ * the subject — not as a Received Email touch.
+ */
+export function isCalendarAppointmentMessage(m: ActivityMailShape): boolean {
+  const subj = (m.subject || "").trim();
+  if (
+    /^(updated\s+)?invitation:/i.test(subj) ||
+    /^accepted:/i.test(subj) ||
+    /^tentative:/i.test(subj) ||
+    /^declined:/i.test(subj) ||
+    /^canceled?\s+event:/i.test(subj) ||
+    /^cancelled\s+event:/i.test(subj)
+  ) {
+    return true;
+  }
+  const blob = `${subj}\n${m.snippet || ""}\n${(m.body || "").slice(0, 2500)}`;
+  if (/original\s+appointment/i.test(blob)) return true;
+  if (/begin:vcalendar|begin:vevent|filename=.*\.ics/i.test(blob)) return true;
+  // Teams / Zoom invite chrome — including long join blocks Gmail keeps in-body.
+  if (/\bMeeting ID\s*[:=]/i.test(blob) || /zoom\.us\/j\//i.test(blob)) return true;
+  if (
+    /\bMicrosoft Teams meeting\b/i.test(blob) &&
+    (/\bWhen\s*:/i.test(blob) ||
+      /\bJoin\s*:/i.test(blob) ||
+      /teams\.microsoft\.com\//i.test(blob) ||
+      /original\s+appointment/i.test(blob))
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Gmail query fragment that approximates the subject side of
+ * isActivityTrackingMessage for a given track (OR'd into the activity fetch).
+ */
+export function activitySubjectQuery(track: "BD" | "GTM"): string {
+  const tag = track === "GTM" ? "GTM" : "BD";
+  return [
+    `subject:(DTC) subject:(${tag})`,
+    `subject:("${tag} Discussion" OR "${tag} Tracking" OR "${tag} Sync" OR "${tag} Call" OR "${tag} Update")`,
+    `subject:(${tag}-Tracking)`,
+  ].join(" OR ");
 }

@@ -29,7 +29,19 @@ import { buildPortCoCanonicalMap, canonicalizePortCo } from "@/lib/portco-canoni
 import { extractDomain } from "@/lib/domain-utils";
 import { normalizePortcoName } from "@/lib/portco-names";
 import { findSectorColumnIndex, looksLikeJobTitle, normalizeSector } from "@/lib/sectors";
+import { shouldCatalogAsCrmEvent } from "@/lib/event-catalog";
+import {
+  formatEngagementSources,
+  mergeEngagementSources,
+  parseEngagementSources,
+} from "@/lib/engagement-source";
 import { getGoogleOAuthCreds, requireSpreadsheetId } from "./google.server";
+import {
+  compareIsoDatesDesc,
+  isoToSheetDate,
+  parseToIsoDate,
+  todayIso,
+} from "@/lib/sheet-date";
 
 // ── Cache ────────────────────────────────────────────────────
 const TTL_MS = 5 * 60 * 1000; // 5 minutes
@@ -85,6 +97,56 @@ export async function getAccessToken(): Promise<string> {
   return access_token;
 }
 
+// ── Rate-limit-aware Sheets fetch ────────────────────────────
+// Google Sheets allows only 60 write requests per minute per user. Bulk
+// operations (imports, repairs, syncs) easily burst past that and come back as
+// 429 RESOURCE_EXHAUSTED / RATE_LIMIT_EXCEEDED. Two guards:
+//   1. Writes are serialized through a queue with a minimum spacing so we stay
+//      under ~55 writes/min.
+//   2. Any 429 / 5xx (read or write) is retried with exponential backoff +
+//      jitter instead of surfacing as an error toast.
+const WRITE_MIN_SPACING_MS = 1_100;
+const MAX_SHEETS_RETRIES = 5;
+
+let writeChain: Promise<unknown> = Promise.resolve();
+let lastWriteAt = 0;
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+async function runSheetsRequest(url: string, init: RequestInit): Promise<Response> {
+  let attempt = 0;
+  for (;;) {
+    const res = await fetch(url, init);
+    const retryable = res.status === 429 || (res.status >= 500 && res.status < 600);
+    if (!retryable || attempt >= MAX_SHEETS_RETRIES) return res;
+    const backoff = Math.min(30_000, 1_500 * 2 ** attempt) + Math.floor(Math.random() * 500);
+    console.warn(
+      `[sheets] ${res.status} from Sheets API — retrying in ${backoff}ms (attempt ${attempt + 1}/${MAX_SHEETS_RETRIES})`,
+    );
+    await sleep(backoff);
+    attempt++;
+  }
+}
+
+/** Fetch a Sheets API URL with retry; write methods are additionally throttled. */
+export async function sheetsFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  const method = (init.method || "GET").toUpperCase();
+  if (method === "GET") return runSheetsRequest(url, init);
+
+  const run = writeChain.then(async () => {
+    const wait = WRITE_MIN_SPACING_MS - (Date.now() - lastWriteAt);
+    if (wait > 0) await sleep(wait);
+    try {
+      return await runSheetsRequest(url, init);
+    } finally {
+      lastWriteAt = Date.now();
+    }
+  });
+  // Keep the chain alive even if this request rejects.
+  writeChain = run.catch(() => undefined);
+  return run;
+}
+
 // ── Fetch a single sheet tab ─────────────────────────────────
 export async function fetchSheetTab(tabName: string): Promise<string[][]> {
   const cached = getCached(tabName);
@@ -95,7 +157,7 @@ export async function fetchSheetTab(tabName: string): Promise<string[][]> {
   const token = await getAccessToken();
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(tabName)}`;
 
-  const res = await fetch(url, {
+  const res = await sheetsFetch(url, {
     headers: { Authorization: `Bearer ${token}` },
   });
 
@@ -120,7 +182,7 @@ export async function appendSheetRow(tabName: string, values: string[]): Promise
   // appends into the wrong columns).
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(`${tabName}!A1`)}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
 
-  const res = await fetch(url, {
+  const res = await sheetsFetch(url, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${token}`,
@@ -146,7 +208,7 @@ export async function appendSheetRows(tabName: string, rows: string[][]): Promis
   const token = await getAccessToken();
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(`${tabName}!A1`)}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
 
-  const res = await fetch(url, {
+  const res = await sheetsFetch(url, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ values: rows }),
@@ -166,7 +228,7 @@ export async function ensureTab(tabName: string, headers: string[]): Promise<voi
   const base = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}`;
 
   // Is the tab already present?
-  const metaRes = await fetch(`${base}?fields=sheets.properties.title`, {
+  const metaRes = await sheetsFetch(`${base}?fields=sheets.properties.title`, {
     headers: { Authorization: `Bearer ${token}` },
   });
   if (metaRes.ok) {
@@ -176,7 +238,7 @@ export async function ensureTab(tabName: string, headers: string[]): Promise<voi
   }
 
   // Create the tab.
-  const addRes = await fetch(`${base}:batchUpdate`, {
+  const addRes = await sheetsFetch(`${base}:batchUpdate`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ requests: [{ addSheet: { properties: { title: tabName } } }] }),
@@ -191,7 +253,7 @@ export async function ensureTab(tabName: string, headers: string[]): Promise<voi
 
   // Write the header row.
   const headerUrl = `${base}/values/${encodeURIComponent(`${tabName}!A1`)}?valueInputOption=USER_ENTERED`;
-  await fetch(headerUrl, {
+  await sheetsFetch(headerUrl, {
     method: "PUT",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ values: [headers] }),
@@ -209,7 +271,7 @@ export async function ensureHeaderWidth(tabName: string, headers: string[]): Pro
   const spreadsheetId = requireSpreadsheetId();
   const token = await getAccessToken();
   const base = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}`;
-  const getRes = await fetch(`${base}/values/${encodeURIComponent(`${tabName}!1:1`)}`, {
+  const getRes = await sheetsFetch(`${base}/values/${encodeURIComponent(`${tabName}!1:1`)}`, {
     headers: { Authorization: `Bearer ${token}` },
   });
   if (getRes.ok) {
@@ -218,7 +280,7 @@ export async function ensureHeaderWidth(tabName: string, headers: string[]): Pro
     if (current.length >= headers.length) return; // already wide enough
   }
   const headerUrl = `${base}/values/${encodeURIComponent(`${tabName}!A1`)}?valueInputOption=USER_ENTERED`;
-  await fetch(headerUrl, {
+  await sheetsFetch(headerUrl, {
     method: "PUT",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ values: [headers] }),
@@ -229,18 +291,70 @@ export async function ensureHeaderWidth(tabName: string, headers: string[]): Pro
 // Look up a tab's numeric sheetId (needed for structural batchUpdate requests
 // like inserting a row). Returns null if the tab isn't found.
 async function getSheetId(tabName: string): Promise<number | null> {
+  const grid = await getSheetGrid(tabName);
+  return grid?.sheetId ?? null;
+}
+
+async function getSheetGrid(
+  tabName: string,
+): Promise<{ sheetId: number; rowCount: number; columnCount: number } | null> {
   const spreadsheetId = requireSpreadsheetId();
   const token = await getAccessToken();
-  const res = await fetch(
-    `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}?fields=sheets.properties(sheetId,title)`,
+  const res = await sheetsFetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}?fields=sheets.properties(sheetId,title,gridProperties)`,
     { headers: { Authorization: `Bearer ${token}` } },
   );
   if (!res.ok) return null;
   const meta = (await res.json()) as {
-    sheets?: Array<{ properties?: { sheetId?: number; title?: string } }>;
+    sheets?: Array<{
+      properties?: {
+        sheetId?: number;
+        title?: string;
+        gridProperties?: { rowCount?: number; columnCount?: number };
+      };
+    }>;
   };
   const found = (meta.sheets || []).find((s) => s.properties?.title === tabName);
-  return found?.properties?.sheetId ?? null;
+  const sheetId = found?.properties?.sheetId;
+  if (sheetId == null) return null;
+  return {
+    sheetId,
+    rowCount: found?.properties?.gridProperties?.rowCount ?? 0,
+    columnCount: found?.properties?.gridProperties?.columnCount ?? 0,
+  };
+}
+
+/** Grow a tab's grid so values:update can write past the last allocated row. */
+async function ensureSheetRowCount(tabName: string, minRows: number): Promise<void> {
+  const grid = await getSheetGrid(tabName);
+  if (!grid || grid.rowCount >= minRows) return;
+  const extra = minRows - grid.rowCount;
+  const spreadsheetId = requireSpreadsheetId();
+  const token = await getAccessToken();
+  const res = await sheetsFetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}:batchUpdate`,
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        requests: [
+          {
+            appendDimension: {
+              sheetId: grid.sheetId,
+              dimension: "ROWS",
+              length: extra,
+            },
+          },
+        ],
+      }),
+    },
+  );
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(
+      `Sheets appendDimension error for "${tabName}" (need ${minRows} rows, have ${grid.rowCount}) [${res.status}]: ${body}`,
+    );
+  }
 }
 
 // All tab titles physically present in the spreadsheet (not just the ones the app
@@ -248,7 +362,7 @@ async function getSheetId(tabName: string): Promise<number | null> {
 export async function listSheetTabs(): Promise<string[]> {
   const spreadsheetId = requireSpreadsheetId();
   const token = await getAccessToken();
-  const res = await fetch(
+  const res = await sheetsFetch(
     `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}?fields=sheets.properties.title`,
     { headers: { Authorization: `Bearer ${token}` } },
   );
@@ -276,7 +390,7 @@ export async function ensureHeaderRow(tabName: string, headers: string[]): Promi
   const base = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}`;
 
   // Insert a blank row at the very top, then write the header into it.
-  const ins = await fetch(`${base}:batchUpdate`, {
+  const ins = await sheetsFetch(`${base}:batchUpdate`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -292,7 +406,7 @@ export async function ensureHeaderRow(tabName: string, headers: string[]): Promi
   });
   if (!ins.ok) return; // best-effort
   const headerUrl = `${base}/values/${encodeURIComponent(`${tabName}!A1`)}?valueInputOption=USER_ENTERED`;
-  await fetch(headerUrl, {
+  await sheetsFetch(headerUrl, {
     method: "PUT",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ values: [headers] }),
@@ -353,7 +467,7 @@ export async function updateSheetCell(
   const range = `${tabName}!${cellRange}`;
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(range)}?valueInputOption=USER_ENTERED`;
 
-  const res = await fetch(url, {
+  const res = await sheetsFetch(url, {
     method: "PUT",
     headers: {
       Authorization: `Bearer ${token}`,
@@ -383,7 +497,7 @@ export async function updateSheetCells(
   const token = await getAccessToken();
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values:batchUpdate`;
 
-  const res = await fetch(url, {
+  const res = await sheetsFetch(url, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -420,13 +534,14 @@ export async function writeSheetRow(
   rowNumber: number,
   values: string[],
 ): Promise<void> {
+  await ensureSheetRowCount(tabName, rowNumber + 50);
   const spreadsheetId = requireSpreadsheetId();
 
   const token = await getAccessToken();
   const range = `${tabName}!A${rowNumber}`;
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(range)}?valueInputOption=USER_ENTERED`;
 
-  const res = await fetch(url, {
+  const res = await sheetsFetch(url, {
     method: "PUT",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ values: [values] }),
@@ -435,6 +550,36 @@ export async function writeSheetRow(
   if (!res.ok) {
     const body = await res.text();
     throw new Error(`Sheets row write error for "${range}" [${res.status}]: ${body}`);
+  }
+  cache.delete(tabName);
+}
+
+/** Overwrite a block of rows starting at `startRow` (1-based, inclusive). */
+export async function writeSheetBlock(
+  tabName: string,
+  startRow: number,
+  values: string[][],
+): Promise<void> {
+  if (values.length === 0) return;
+  // values.update cannot create rows past the tab's allocated grid. Expand first
+  // (plus a buffer so the next sync does not hit the ceiling again).
+  const lastRow = startRow + values.length - 1;
+  await ensureSheetRowCount(tabName, lastRow + 500);
+  const spreadsheetId = requireSpreadsheetId();
+  const token = await getAccessToken();
+  const range = `${tabName}!A${startRow}`;
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(range)}?valueInputOption=USER_ENTERED`;
+  const res = await sheetsFetch(url, {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ values }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Sheets block write error for "${range}" [${res.status}]: ${body}`);
   }
   cache.delete(tabName);
 }
@@ -540,7 +685,7 @@ export interface ActivityTrackSyncResult {
 function activityTrackRow(a: AsanaActivity): string[] {
   return [
     a.gid,
-    a.date || "",
+    isoToSheetDate(a.date) || "",
     a.name || "",
     a.type || "",
     a.status || "",
@@ -565,7 +710,9 @@ function activityItemLabel(a: AsanaActivity): string {
 }
 
 // Mirror one track's activities into its own tab (BD or GTM), deduped by GID.
-// Also backfills blank Owner cells on existing rows when the live activity has one.
+// Gmail rows are refreshed in place (Type/Company/Person/Notes/…) so appointment
+// → Meeting + multi-PortCo fixes land without deleting the sheet. Asana rows
+// only backfill a blank Owner.
 async function syncOneActivityTrack(
   tabName: string,
   activities: AsanaActivity[],
@@ -575,7 +722,8 @@ async function syncOneActivityTrack(
   const header = (rows[0] || []).map((h) => h.trim().toLowerCase());
   const gidIdx = header.indexOf("activity gid");
   const ownerIdx = header.indexOf("owner");
-  const byGid = new Map<string, { rowNumber: number; owner: string }>();
+  const col = (name: string) => header.indexOf(name);
+  const byGid = new Map<string, { rowNumber: number; owner: string; cells: string[] }>();
   if (gidIdx !== -1) {
     for (let i = 1; i < rows.length; i++) {
       const g = (rows[i][gidIdx] || "").trim();
@@ -583,33 +731,63 @@ async function syncOneActivityTrack(
       byGid.set(g, {
         rowNumber: i + 1,
         owner: ownerIdx !== -1 ? (rows[i][ownerIdx] || "").trim() : "",
+        cells: rows[i],
       });
     }
   }
 
   const newRows: string[][] = [];
   const items: string[] = [];
-  const ownerUpdates: { range: string; value: string }[] = [];
+  const cellUpdates: { range: string; value: string }[] = [];
   let skipped = 0;
+
+  const putIfChanged = (
+    rowNumber: number,
+    colIdx: number,
+    next: string | undefined,
+    prev: string,
+  ) => {
+    if (colIdx < 0) return;
+    const value = next ?? "";
+    if ((prev || "").trim() === value.trim()) return;
+    cellUpdates.push({ range: `${colLetters(colIdx)}${rowNumber}`, value });
+  };
+
   for (const a of activities) {
     const existing = byGid.get(a.gid);
     if (existing) {
       skipped++;
-      if (a.owner && ownerIdx !== -1 && !existing.owner) {
-        ownerUpdates.push({
+      if (a.gid.startsWith("gmail-")) {
+        // Refresh classification so Meeting + multi-PortCo company stick on re-sync.
+        const c = existing.cells;
+        putIfChanged(existing.rowNumber, col("name"), a.name, c[col("name")] || "");
+        putIfChanged(existing.rowNumber, col("type"), a.type, c[col("type")] || "");
+        putIfChanged(existing.rowNumber, col("status"), a.status, c[col("status")] || "");
+        putIfChanged(existing.rowNumber, col("owner"), a.owner, c[col("owner")] || "");
+        putIfChanged(existing.rowNumber, col("company"), a.company, c[col("company")] || "");
+        putIfChanged(existing.rowNumber, col("person"), a.person, c[col("person")] || "");
+        putIfChanged(existing.rowNumber, col("notes"), a.notes, c[col("notes")] || "");
+        putIfChanged(
+          existing.rowNumber,
+          col("completed"),
+          a.completed ? "TRUE" : "FALSE",
+          c[col("completed")] || "",
+        );
+      } else if (a.owner && ownerIdx !== -1 && !existing.owner) {
+        cellUpdates.push({
           range: `${colLetters(ownerIdx)}${existing.rowNumber}`,
           value: a.owner,
         });
       }
       continue;
     }
-    byGid.set(a.gid, { rowNumber: -1, owner: a.owner || "" });
+    byGid.set(a.gid, { rowNumber: -1, owner: a.owner || "", cells: [] });
     newRows.push(activityTrackRow(a));
     items.push(activityItemLabel(a));
   }
 
   if (newRows.length > 0) await appendSheetRows(tabName, newRows);
-  if (ownerUpdates.length > 0) await updateSheetCells(tabName, ownerUpdates);
+  if (cellUpdates.length > 0) await updateSheetCells(tabName, cellUpdates);
   return { logged: newRows.length, skipped, items };
 }
 
@@ -668,6 +846,64 @@ export async function syncActivityTracks(
     bdItems: bdRes.items,
     gtmItems: gtmRes.items,
   };
+}
+
+const ACTIVITY_TRACK_COLS: Record<string, string> = {
+  "Activity GID": "gid",
+  Date: "date",
+  Name: "name",
+  Type: "type",
+  Status: "status",
+  Owner: "owner",
+  Company: "company",
+  Person: "person",
+  Completed: "completed",
+  Notes: "notes",
+  URL: "url",
+};
+
+type ActivityTrackRow = {
+  gid: string;
+  date: string;
+  name: string;
+  type: string;
+  status: string;
+  owner: string;
+  company: string;
+  person: string;
+  completed: string;
+  notes: string;
+  url: string;
+};
+
+function parseActivityTrackTab(rows: string[][], track: "BD" | "GTM"): AsanaActivity[] {
+  return mapRows<ActivityTrackRow>(rows, ACTIVITY_TRACK_COLS)
+    .filter((r) => (r.gid || "").trim())
+    .map((r) => ({
+      gid: r.gid,
+      track,
+      name: r.name || "",
+      date: parseToIsoDate(r.date) || undefined,
+      completed: /^(true|yes|1)$/i.test(r.completed || ""),
+      status: r.status || undefined,
+      owner: r.owner || undefined,
+      type: r.type || undefined,
+      company: r.company || undefined,
+      person: r.person || undefined,
+      notes: r.notes || undefined,
+      url: r.url || undefined,
+    }));
+}
+
+/** BD + GTM activities as stored on the sheet tabs (newest first). */
+export async function buildActivities(): Promise<AsanaActivity[]> {
+  const [bd, gtm] = await Promise.all([
+    fetchSheetTab(TAB_NAMES.bd).catch(() => [] as string[][]),
+    fetchSheetTab(TAB_NAMES.gtm).catch(() => [] as string[][]),
+  ]);
+  const out = [...parseActivityTrackTab(bd, "BD"), ...parseActivityTrackTab(gtm, "GTM")];
+  out.sort((a, b) => compareIsoDatesDesc(a.date || "", b.date || ""));
+  return out;
 }
 
 // One row per day of headline counts — the baseline the Home page diffs against
@@ -833,7 +1069,7 @@ export type OpsLogAction =
 export interface OpsLogInput {
   action: OpsLogAction;
   source: string;
-  status: "ok" | "error";
+  status: "ok" | "error" | "warning";
   summary: string;
   records?: number;
   details?: Record<string, string | number | boolean | undefined | null>;
@@ -1132,6 +1368,16 @@ async function repairContactsNameHeader(): Promise<void> {
 // header matches, so the row aligns with WHATEVER order the columns are in.
 // Shared by the addContact server fn and the prospect-importer.
 export async function addContactRow(data: AddContactInput): Promise<void> {
+  const { contactImportRejectReason } = await import("@/lib/contact-noise");
+  const reject = contactImportRejectReason({
+    name: data.name,
+    email: data.email,
+    company: data.company,
+  });
+  if (reject) {
+    throw new Error(`Skipped contact import: ${reject}`);
+  }
+
   const now = new Date().toISOString().split("T")[0];
   // Unify multi-email separators (| , whitespace) to "; " so the rest of the app
   // (primaryEmail, dedup, mailto) treats the cell consistently.
@@ -1335,10 +1581,371 @@ const EVENT_COLS: Record<string, string> = {
 const PORTCO_INTRO_COLS: Record<string, string> = {
   "contact urid": "curid",
   "contact email": "email",
+  email: "email",
+  "engagement context": "email",
   "portco name": "portcoName",
   date: "date",
   "engagement source": "source",
 };
+
+/** Canonical header row when the PortCos Introduced tab is created from scratch. */
+export const PORTCO_INTRO_HEADERS = [
+  "Contact URID",
+  "Contact Email",
+  "PortCo Name",
+  "Date",
+  "Engagement Source",
+];
+
+const PORTCO_INTRO_EMAIL_HEADERS = ["contact email", "email", "engagement context"];
+
+function headerIdx(headers: string[], ...names: string[]): number {
+  for (const n of names) {
+    const i = headers.indexOf(n);
+    if (i !== -1) return i;
+  }
+  return -1;
+}
+
+/**
+ * Make the PortCos Introduced header row writable. The live tab has shipped
+ * with "Engagement Context" (or "Email") in place of "Contact Email"; sync
+ * used to no-op when that column was missing. Renames the alias in place and
+ * ensures PortCo Name / Date / Source / URID exist.
+ */
+async function ensurePortcoIntroSchema(): Promise<string[][]> {
+  await ensureTab(TAB_NAMES.portcoIntros, PORTCO_INTRO_HEADERS);
+  let rows = await fetchSheetTab(TAB_NAMES.portcoIntros).catch(() => [] as string[][]);
+  const headerRow = rows[0] || [];
+  if (headerRow.every((c) => !(c || "").trim())) {
+    await updateSheetCells(
+      TAB_NAMES.portcoIntros,
+      PORTCO_INTRO_HEADERS.map((h, i) => ({ range: `${colLetters(i)}1`, value: h })),
+    );
+    return fetchSheetTab(TAB_NAMES.portcoIntros);
+  }
+
+  const headers = headerRow.map((h) => h.trim().toLowerCase());
+  if (!headers.includes("contact email")) {
+    const aliasIdx = headerIdx(headers, "engagement context", "email");
+    if (aliasIdx !== -1) {
+      await updateSheetCell(TAB_NAMES.portcoIntros, `${colLetters(aliasIdx)}1`, "Contact Email");
+      console.log(
+        `[portco-intro] renamed "${headerRow[aliasIdx]}" → Contact Email (${colLetters(aliasIdx)}1)`,
+      );
+    } else {
+      await ensureColumn(TAB_NAMES.portcoIntros, "Contact Email");
+    }
+  }
+  await ensureColumn(TAB_NAMES.portcoIntros, "PortCo Name");
+  await ensureColumn(TAB_NAMES.portcoIntros, "Date");
+  await ensureColumn(TAB_NAMES.portcoIntros, "Engagement Source");
+  await ensureColumn(TAB_NAMES.portcoIntros, "Contact URID");
+  return fetchSheetTab(TAB_NAMES.portcoIntros);
+}
+
+function portcoIntroWriteHeaders(headers: string[]): Record<string, string> {
+  const hasContactEmail = headers.includes("contact email");
+  return {
+    "contact urid": "urid",
+    urid: "urid",
+    "contact email": "email",
+    email: "email",
+    // Only dump email into leftover "Engagement Context" columns when that's
+    // still the email header (pre-repair). After rename, leave extras blank.
+    "engagement context": hasContactEmail ? "" : "email",
+    "portco name": "portcoName",
+    date: "date",
+    "engagement source": "source",
+  };
+}
+
+/** One PortCo Introduced row (header-aware write). */
+export interface PortcoIntroRowInput {
+  email: string;
+  portcoName: string;
+  date: string;
+  source: string;
+  urid?: string;
+}
+
+/** Desired PortCos Introduced fields — blank cells are filled, filled cells are left alone. */
+export interface PortcoIntroUpsert {
+  email: string;
+  portcoName: string;
+  date?: string;
+  source?: string;
+  urid?: string;
+}
+
+export interface PortcoIntroUpsertResult {
+  /** New (contact, portco) rows appended. */
+  appended: number;
+  /** Existing rows that had a blank URID / date / source / name filled. */
+  backfilled: number;
+  /** Existing rows that gained an additional engagement source. */
+  sourcesMerged: number;
+}
+
+/** Append PortCo Introduced rows in header order (URID-safe). */
+export async function appendPortcoIntroRows(rows: PortcoIntroRowInput[]): Promise<void> {
+  if (rows.length === 0) return;
+  const sheetRows = await ensurePortcoIntroSchema();
+  const headers = (sheetRows[0] || []).map((h) => h.trim().toLowerCase());
+  const fieldOf = portcoIntroWriteHeaders(headers);
+
+  const toValues = (r: PortcoIntroRowInput): string[] => {
+    const values: Record<string, string> = {
+      urid: r.urid ?? "",
+      email: r.email,
+      portcoName: r.portcoName,
+      date: isoToSheetDate(r.date) || r.date,
+      source: r.source,
+    };
+    return headers.length
+      ? headers.map((h) => {
+          const field = fieldOf[h];
+          return field ? values[field] ?? "" : "";
+        })
+      : [r.email, r.portcoName, isoToSheetDate(r.date) || r.date, r.source];
+  };
+
+  const values = rows.map(toValues);
+  const emailIdx = headerIdx(headers, ...PORTCO_INTRO_EMAIL_HEADERS);
+  const portcoIdx = headerIdx(headers, "portco name");
+  const dateIdx = headerIdx(headers, "date");
+  const sourceIdx = headerIdx(headers, "engagement source");
+  const uridIdx = headerIdx(headers, "contact urid", "urid");
+  const coreIdx = [emailIdx, portcoIdx, dateIdx, sourceIdx, uridIdx].filter((i) => i >= 0);
+  const coreEmpty = (row: string[] | undefined) =>
+    coreIdx.every((i) => !((row || [])[i] || "").trim());
+  let startRow = 2;
+  for (let i = 1; i < sheetRows.length; i++) {
+    if (coreEmpty(sheetRows[i])) {
+      startRow = i + 1;
+      break;
+    }
+    startRow = i + 2;
+  }
+  console.log(
+    `[portco-intro] writing ${values.length} rows at ${TAB_NAMES.portcoIntros}!A${startRow} (${sheetRows.length} rows already in range)`,
+  );
+  await writeSheetBlock(TAB_NAMES.portcoIntros, startRow, values);
+}
+
+function sourcesFromRaw(raw?: string): EngagementSource[] {
+  if (!(raw || "").trim()) return [];
+  return parseEngagementSources(raw);
+}
+
+function portcoIntroKey(email: string, portco: string): string {
+  return `${email.trim().toLowerCase()}|${portco.trim().toLowerCase()}`;
+}
+
+/**
+ * Fill missing PortCos Introduced rows from sync, and backfill blank cells on
+ * existing rows (Contact URID, Date, Engagement Source, canonical PortCo Name).
+ * Never overwrites a filled date/source/URID except to union a new source.
+ */
+export async function upsertPortcoIntros(
+  fills: PortcoIntroUpsert[],
+  opts?: {
+    uridByEmail?: Map<string, string>;
+    canonicalPortcoNames?: string[];
+  },
+): Promise<PortcoIntroUpsertResult> {
+  const result: PortcoIntroUpsertResult = { appended: 0, backfilled: 0, sourcesMerged: 0 };
+  const uridByEmail = opts?.uridByEmail;
+  const portCoMap = buildPortCoCanonicalMap(opts?.canonicalPortcoNames || []);
+
+  await ensureTab(TAB_NAMES.portcoIntros, PORTCO_INTRO_HEADERS);
+  const rows = await ensurePortcoIntroSchema();
+  const headers = (rows[0] || []).map((h) => h.trim().toLowerCase());
+  const emailIdx = headerIdx(headers, ...PORTCO_INTRO_EMAIL_HEADERS);
+  const uridIdx = headerIdx(headers, "contact urid", "urid");
+  const portcoIdx = headerIdx(headers, "portco name");
+  const dateIdx = headerIdx(headers, "date");
+  const sourceIdx = headerIdx(headers, "engagement source");
+  if (portcoIdx === -1 || emailIdx === -1) {
+    console.error(
+      "[portco-intro] still missing Contact Email or PortCo Name after header repair; headers=",
+      rows[0],
+    );
+    return result;
+  }
+
+  type Existing = {
+    rowNumber: number;
+    email: string;
+    portco: string;
+    date: string;
+    source: string;
+    urid: string;
+  };
+  const byKey = new Map<string, Existing>();
+  const index = (e: Existing) => {
+    byKey.set(portcoIntroKey(e.email, e.portco), e);
+    if (e.urid) byKey.set(`${e.urid}|${e.portco}`, e);
+  };
+  for (let i = 1; i < rows.length; i++) {
+    const email = (rows[i][emailIdx] || "").trim().toLowerCase();
+    const portco = (rows[i][portcoIdx] || "").trim().toLowerCase();
+    if (!email || !portco) continue;
+    index({
+      rowNumber: i + 1,
+      email,
+      portco,
+      date: dateIdx === -1 ? "" : (rows[i][dateIdx] || "").trim(),
+      source: sourceIdx === -1 ? "" : (rows[i][sourceIdx] || "").trim(),
+      urid: uridIdx === -1 ? "" : (rows[i][uridIdx] || "").trim().toLowerCase(),
+    });
+  }
+
+  const merged = new Map<string, PortcoIntroUpsert>();
+  for (const f of fills) {
+    const email = (f.email || "").trim();
+    const name = canonicalizePortCo(f.portcoName || "", portCoMap) || (f.portcoName || "").trim();
+    if (!email || !name) continue;
+    const key = portcoIntroKey(email, name);
+    const prev = merged.get(key);
+    if (!prev) {
+      merged.set(key, { email, portcoName: name, date: f.date, source: f.source, urid: f.urid });
+      continue;
+    }
+    const dates = [prev.date, f.date].map((d) => (d || "").trim()).filter(Boolean).sort();
+    const sources = mergeEngagementSources(sourcesFromRaw(prev.source), sourcesFromRaw(f.source));
+    merged.set(key, {
+      email: prev.email,
+      portcoName: prev.portcoName,
+      date: dates[0] || prev.date || f.date,
+      source: sources.length ? formatEngagementSources(sources) : prev.source || f.source,
+      urid: (prev.urid || "").trim() || (f.urid || "").trim(),
+    });
+  }
+
+  const cellUpdates: { range: string; value: string }[] = [];
+  const touchedRows = new Set<number>();
+  const markBackfill = (rowNumber: number) => {
+    if (touchedRows.has(rowNumber)) return;
+    touchedRows.add(rowNumber);
+    result.backfilled++;
+  };
+
+  const findExisting = (email: string, portcoKey: string, urid?: string): Existing | undefined => {
+    const u = (urid || "").trim().toLowerCase();
+    if (u) {
+      const hit = byKey.get(`${u}|${portcoKey}`);
+      if (hit) return hit;
+    }
+    return byKey.get(portcoIntroKey(email, portcoKey));
+  };
+
+  const newRows: PortcoIntroRowInput[] = [];
+  const queuedNew = new Set<string>();
+
+  for (const fill of merged.values()) {
+    const emailKey = fill.email.toLowerCase();
+    const portcoKey = fill.portcoName.toLowerCase();
+    const urid = (fill.urid || uridByEmail?.get(emailKey) || "").trim();
+    const existing = findExisting(emailKey, portcoKey, urid);
+
+    if (!existing) {
+      const nk = portcoIntroKey(emailKey, portcoKey);
+      if (queuedNew.has(nk)) continue;
+      queuedNew.add(nk);
+      newRows.push({
+        email: fill.email,
+        portcoName: fill.portcoName,
+        date: parseToIsoDate(fill.date) || todayIso(),
+        source:
+          (fill.source || "").trim() || formatEngagementSources(["activity interaction"]),
+        urid: urid || undefined,
+      });
+      continue;
+    }
+
+    if (uridIdx !== -1 && urid && !existing.urid) {
+      cellUpdates.push({ range: `${colLetters(uridIdx)}${existing.rowNumber}`, value: urid });
+      existing.urid = urid.toLowerCase();
+      markBackfill(existing.rowNumber);
+    }
+    if (dateIdx !== -1 && (fill.date || "").trim() && !existing.date) {
+      const rawDate = (fill.date || "").trim();
+      const date = isoToSheetDate(rawDate) || rawDate;
+      cellUpdates.push({
+        range: `${colLetters(dateIdx)}${existing.rowNumber}`,
+        value: date,
+      });
+      existing.date = date;
+      markBackfill(existing.rowNumber);
+    }
+    if (portcoIdx !== -1) {
+      const currentName = (rows[existing.rowNumber - 1]?.[portcoIdx] || "").trim();
+      if (
+        fill.portcoName &&
+        currentName &&
+        currentName !== fill.portcoName &&
+        currentName.toLowerCase() === fill.portcoName.toLowerCase()
+      ) {
+        cellUpdates.push({
+          range: `${colLetters(portcoIdx)}${existing.rowNumber}`,
+          value: fill.portcoName,
+        });
+        markBackfill(existing.rowNumber);
+      }
+    }
+    const incoming = sourcesFromRaw(fill.source);
+    if (sourceIdx === -1 || incoming.length === 0) continue;
+    if (!existing.source) {
+      const formatted = formatEngagementSources(incoming);
+      cellUpdates.push({ range: `${colLetters(sourceIdx)}${existing.rowNumber}`, value: formatted });
+      existing.source = formatted;
+      markBackfill(existing.rowNumber);
+    } else {
+      const before = parseEngagementSources(existing.source);
+      const after = mergeEngagementSources(before, incoming);
+      const formatted = formatEngagementSources(after);
+      if (formatted !== formatEngagementSources(before)) {
+        cellUpdates.push({
+          range: `${colLetters(sourceIdx)}${existing.rowNumber}`,
+          value: formatted,
+        });
+        existing.source = formatted;
+        result.sourcesMerged++;
+      }
+    }
+  }
+
+  if (uridByEmail || portCoMap.size > 0) {
+    for (let i = 1; i < rows.length; i++) {
+      const rowNumber = i + 1;
+      const email = (rows[i][emailIdx] || "").trim().toLowerCase();
+      const name = (rows[i][portcoIdx] || "").trim();
+      const urid = uridIdx === -1 ? "" : (rows[i][uridIdx] || "").trim();
+      if (uridIdx !== -1 && !urid && email && uridByEmail) {
+        const next = uridByEmail.get(email);
+        if (next) {
+          cellUpdates.push({ range: `${colLetters(uridIdx)}${rowNumber}`, value: next });
+          markBackfill(rowNumber);
+        }
+      }
+      if (name && portCoMap.size > 0) {
+        const canonical = canonicalizePortCo(name, portCoMap);
+        if (canonical && canonical !== name) {
+          cellUpdates.push({ range: `${colLetters(portcoIdx)}${rowNumber}`, value: canonical });
+          markBackfill(rowNumber);
+        }
+      }
+    }
+  }
+
+  if (newRows.length > 0) {
+    await appendPortcoIntroRows(newRows);
+    result.appended = newRows.length;
+  }
+  if (cellUpdates.length > 0) await updateSheetCells(TAB_NAMES.portcoIntros, cellUpdates);
+  return result;
+}
 
 const INTERACTION_COLS: Record<string, string> = {
   "contact urid": "curid",
@@ -1399,7 +2006,7 @@ export async function appendInteractionRows(rows: InteractionRowInput[]): Promis
     const byHeader: Record<string, string> = {
       "contact urid": r.urid ?? "",
       "contact email": r.email,
-      timestamp: r.date,
+      timestamp: isoToSheetDate(r.date) || r.date,
       "note content": r.summary,
       "requires follow up": r.requiresFollowUp ? "TRUE" : "FALSE",
       "follow up resolved": r.resolved ? "TRUE" : "FALSE",
@@ -1411,7 +2018,7 @@ export async function appendInteractionRows(rows: InteractionRowInput[]): Promis
       ? headers.map((h) => byHeader[h] ?? "")
       : [
           r.email,
-          r.date,
+          isoToSheetDate(r.date) || r.date,
           r.summary,
           r.requiresFollowUp ? "TRUE" : "FALSE",
           r.resolved ? "TRUE" : "FALSE",
@@ -1422,6 +2029,37 @@ export async function appendInteractionRows(rows: InteractionRowInput[]): Promis
   };
 
   await appendSheetRows(TAB_NAMES.interactions, rows.map(toValues));
+  // #region agent log
+  {
+    const samples = rows.slice(0, 8).map((r) => {
+      const out = isoToSheetDate(r.date) || r.date;
+      const ref = r.sourceRef || "";
+      return {
+        inDate: r.date,
+        outDate: out,
+        isoIn: /^\d{4}-\d{2}-\d{2}$/.test(r.date || ""),
+        wroteIso: /^\d{4}-\d{2}-\d{2}$/.test(out || ""),
+        origin: ref.startsWith("gmail") ? "gmail" : ref.startsWith("asana") ? "asana" : "other",
+      };
+    });
+    fetch("http://127.0.0.1:7724/ingest/5184a65b-0c76-4274-b203-81774fe31d23", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "3375d3" },
+      body: JSON.stringify({
+        sessionId: "3375d3",
+        hypothesisId: "A",
+        location: "sheets.server.ts:appendInteractionRows",
+        message: "Notes timestamp write format",
+        data: {
+          n: rows.length,
+          wroteIsoCount: samples.filter((s) => s.wroteIso).length,
+          samples,
+        },
+        timestamp: Date.now(),
+      }),
+    }).catch(() => {});
+  }
+  // #endregion
 }
 
 /** Locate a Notes row by contact email + note text (+ optional timestamp). */
@@ -1738,16 +2376,16 @@ export async function repairTargetUrids(): Promise<{
   return { total: rows.length - 1, filled, deduped };
 }
 
-// Change the Engagement Source of an existing (contact, portco) intro in place —
-// so a partner can reclassify a portfolio engagement (e.g. "event exposure" →
-// "direct introduction") without deleting and re-adding it. Matched by portco name
-// + contact (URID preferred, else email), case-insensitive; the latest matching
-// row wins (mirrors how buildContacts reads it). Falls back to appending a fresh
-// row (header-aware) if no matching intro exists yet.
+// Change the Engagement Source(s) of an existing (contact, portco) intro in place --
+// so a partner can reclassify a portfolio engagement (multi-select) without
+// deleting and re-adding it. Matched by portco name + contact (URID preferred,
+// else email), case-insensitive; the latest matching row wins (mirrors how
+// buildContacts reads it). Falls back to appending a fresh row if none exists.
+// source may be a single value or a semicolon/comma-joined multi list.
 export async function setPortcoIntroSource(
   contactEmail: string,
   portcoName: string,
-  source: string,
+  source: string | EngagementSource[],
   curid?: string,
 ): Promise<{ success: boolean; updated: boolean }> {
   const email = (contactEmail || "").trim().toLowerCase();
@@ -1755,25 +2393,25 @@ export async function setPortcoIntroSource(
   const portco = (portcoName || "").trim().toLowerCase();
   if ((!email && !uridKey) || !portco) return { success: false, updated: false };
 
+  const formatted = Array.isArray(source)
+    ? formatEngagementSources(source)
+    : formatEngagementSources(parseEngagementSources(source));
+
   await ensureColumn(TAB_NAMES.portcoIntros, "Engagement Source");
   const rows = await fetchSheetTab(TAB_NAMES.portcoIntros);
   const headers = (rows[0] || []).map((h) => h.trim().toLowerCase());
   const today = new Date().toISOString().split("T")[0];
 
   const appendFresh = async () => {
-    const valueByHeader: Record<string, string> = {
-      "contact urid": curid || "",
-      "contact email": contactEmail,
-      "portco name": portcoName,
-      date: today,
-      "engagement source": source,
-    };
-    await appendSheetRow(
-      TAB_NAMES.portcoIntros,
-      headers.length > 0
-        ? headers.map((h) => valueByHeader[h] ?? "")
-        : [contactEmail, portcoName, today, source],
-    );
+    await appendPortcoIntroRows([
+      {
+        email: contactEmail,
+        portcoName,
+        date: today,
+        source: formatted,
+        urid: curid,
+      },
+    ]);
   };
 
   if (rows.length < 2) {
@@ -1800,8 +2438,87 @@ export async function setPortcoIntroSource(
     await appendFresh();
     return { success: true, updated: false };
   }
-  await updateSheetCell(TAB_NAMES.portcoIntros, `${colLetters(sourceIdx)}${rowNum}`, source);
+  await updateSheetCell(TAB_NAMES.portcoIntros, `${colLetters(sourceIdx)}${rowNum}`, formatted);
   return { success: true, updated: true };
+}
+
+/** Union a source onto an existing (contact, portco) engagement when it applies.
+ *  No-op when the source is already present. Appends a row if none exists. */
+export async function mergePortcoIntroSource(
+  contactEmail: string,
+  portcoName: string,
+  sourceToAdd: EngagementSource,
+  curid?: string,
+): Promise<{ success: boolean; merged: boolean; added: boolean }> {
+  const email = (contactEmail || "").trim().toLowerCase();
+  const uridKey = (curid || "").trim().toLowerCase();
+  const portco = (portcoName || "").trim().toLowerCase();
+  if ((!email && !uridKey) || !portco || !sourceToAdd) {
+    return { success: false, merged: false, added: false };
+  }
+
+  await ensureColumn(TAB_NAMES.portcoIntros, "Engagement Source");
+  const rows = await fetchSheetTab(TAB_NAMES.portcoIntros);
+  const headers = (rows[0] || []).map((h) => h.trim().toLowerCase());
+  const today = new Date().toISOString().split("T")[0];
+
+  if (rows.length < 2) {
+    await appendPortcoIntroRows([
+      {
+        email: contactEmail,
+        portcoName,
+        date: today,
+        source: formatEngagementSources([sourceToAdd]),
+        urid: curid,
+      },
+    ]);
+    return { success: true, merged: false, added: true };
+  }
+
+  const emailIdx = headers.indexOf("contact email");
+  const uridIdx = headers.indexOf("contact urid");
+  const portcoIdx = headers.indexOf("portco name");
+  const sourceIdx = headers.indexOf("engagement source");
+  if (portcoIdx === -1 || sourceIdx === -1) {
+    return { success: false, merged: false, added: false };
+  }
+
+  let rowNum = -1;
+  let existingRaw = "";
+  for (let i = 1; i < rows.length; i++) {
+    if ((rows[i][portcoIdx] || "").trim().toLowerCase() !== portco) continue;
+    const re = emailIdx !== -1 ? (rows[i][emailIdx] || "").trim().toLowerCase() : "";
+    const ru = uridIdx !== -1 ? (rows[i][uridIdx] || "").trim().toLowerCase() : "";
+    if ((uridKey && ru === uridKey) || (email && re === email)) {
+      rowNum = i + 1;
+      existingRaw = rows[i][sourceIdx] || "";
+    }
+  }
+
+  if (rowNum === -1) {
+    await appendPortcoIntroRows([
+      {
+        email: contactEmail,
+        portcoName,
+        date: today,
+        source: formatEngagementSources([sourceToAdd]),
+        urid: curid,
+      },
+    ]);
+    return { success: true, merged: false, added: true };
+  }
+
+  const before = parseEngagementSources(existingRaw);
+  const after = mergeEngagementSources(before, sourceToAdd);
+  if (after.length === before.length && after.every((s, i) => s === before[i])) {
+    return { success: true, merged: false, added: false };
+  }
+  await updateSheetCell(
+    TAB_NAMES.portcoIntros,
+    `${colLetters(sourceIdx)}${rowNum}`,
+    formatEngagementSources(after),
+  );
+  return { success: true, merged: true, added: false };
 }
 
 const PORTFOLIO_COLS: Record<string, string> = {
@@ -1908,6 +2625,36 @@ export async function buildContacts(): Promise<Contact[]> {
   const rawEvents = mapRows<Record<string, string>>(eventRows, EVENT_COLS);
   const rawIntros = mapRows<Record<string, string>>(introRows, PORTCO_INTRO_COLS);
   const rawInteractions = mapRows<Record<string, string>>(interactionRows, INTERACTION_COLS);
+  // #region agent log
+  {
+    const stats = { n: 0, empty: 0, iso: 0, mdy: 0, serial: 0, parseFail: 0, samples: [] as string[] };
+    for (const i of rawInteractions) {
+      const raw = (i.date || "").trim();
+      stats.n++;
+      if (!raw) {
+        stats.empty++;
+        continue;
+      }
+      if (stats.samples.length < 8) stats.samples.push(raw);
+      if (/^\d{4}-\d{2}-\d{2}/.test(raw)) stats.iso++;
+      else if (/^\d{1,2}\/\d{1,2}\/\d{4}/.test(raw)) stats.mdy++;
+      else if (/^\d+(\.\d+)?$/.test(raw)) stats.serial++;
+      if (!parseToIsoDate(raw)) stats.parseFail++;
+    }
+    fetch("http://127.0.0.1:7724/ingest/5184a65b-0c76-4274-b203-81774fe31d23", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "3375d3" },
+      body: JSON.stringify({
+        sessionId: "3375d3",
+        hypothesisId: "E",
+        location: "sheets.server.ts:buildContacts",
+        message: "Notes timestamp formats on read",
+        data: stats,
+        timestamp: Date.now(),
+      }),
+    }).catch(() => {});
+  }
+  // #endregion
 
   // Children join to a contact by stable urid when present, else by email
   // (transition fallback). Each child row lands in exactly ONE bucket, so a
@@ -1958,20 +2705,28 @@ export async function buildContacts(): Promise<Contact[]> {
           .filter(Boolean),
       ),
     ];
-    const portCoEngagements = contactIntros
-      .filter((i) => i.portcoName)
-      .map((i) => ({
-        portco: canonicalizePortCo(i.portcoName || "", portCoMap),
-        date: i.date || "",
-        source: ((i.source || "direct introduction").trim() ||
-          "direct introduction") as EngagementSource,
-      }))
-      .filter((e) => e.portco);
+    // Merge duplicate (contact, portco) intro rows into one engagement with a
+    // union of sources — multi-select + sync can both contribute.
+    const engByPortco = new Map<string, { portco: string; date: string; sources: EngagementSource[] }>();
+    for (const i of contactIntros) {
+      const portco = canonicalizePortCo(i.portcoName || "", portCoMap);
+      if (!portco) continue;
+      const key = portco.toLowerCase();
+      const parsed = parseEngagementSources(i.source);
+      const existing = engByPortco.get(key);
+      if (!existing) {
+        engByPortco.set(key, { portco, date: i.date || "", sources: parsed });
+      } else {
+        existing.sources = mergeEngagementSources(existing.sources, parsed);
+        if ((i.date || "") > (existing.date || "")) existing.date = i.date || "";
+      }
+    }
+    const portCoEngagements = [...engByPortco.values()];
 
     const interactions: Interaction[] = contactInteractions
       .map((i, iIdx) => ({
         id: `i-${idx}-${iIdx}`,
-        date: i.date || "",
+        date: parseToIsoDate(i.date) || i.date || "",
         type: normalizeInteractionType(i.type),
         summary: i.summary || "",
         isFollowUp: i.isFollowUp?.toLowerCase() === "true",
@@ -1980,7 +2735,7 @@ export async function buildContacts(): Promise<Contact[]> {
         owner: i.owner || undefined,
       }))
       // Newest first so the Interaction Trail and lastContact stay current after sync.
-      .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+      .sort((a, b) => compareIsoDatesDesc(a.date, b.date));
 
     // Follow-up pending: either from Notes tab or from Contact's Follow Up Flag
     const followUpFromNotes = interactions.some((i) => i.isFollowUp && !i.followUpComplete);
@@ -2182,6 +2937,44 @@ export async function recalculateRatings(): Promise<RecalcResult> {
   }
 
   return { scanned: contacts.length, updated: changes.length, skippedLocked, changes };
+}
+
+/** Every usable address from a multi-email cell (lowercased). */
+export function sheetEmails(email: string): string[] {
+  return (email || "")
+    .split(/[;,]/)
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => s.includes("@"));
+}
+
+/**
+ * Stamp Contacts "Follow Up Flag" = TRUE for the given emails (case-insensitive).
+ * Used when event attendees are uploaded/tagged so post-event outreach isn't missed.
+ * Idempotent — already-TRUE cells stay TRUE; missing emails are skipped.
+ */
+export async function flagContactsForFollowUp(emails: string[]): Promise<{ updated: number }> {
+  const wanted = new Set(emails.flatMap((e) => sheetEmails(e)).filter(Boolean));
+  if (wanted.size === 0) return { updated: 0 };
+
+  await ensureColumn(TAB_NAMES.contacts, "Follow Up Flag");
+  const rows = await fetchSheetTab(TAB_NAMES.contacts).catch(() => [] as string[][]);
+  if (rows.length < 2) return { updated: 0 };
+
+  const headers = rows[0].map((h) => h.trim().toLowerCase());
+  const emailIdx = headers.indexOf("email");
+  const flagIdx = headers.indexOf("follow up flag");
+  if (emailIdx === -1 || flagIdx === -1) return { updated: 0 };
+
+  const updates: { range: string; value: string }[] = [];
+  for (let i = 1; i < rows.length; i++) {
+    const addrs = sheetEmails(rows[i][emailIdx] || "");
+    if (!addrs.some((e) => wanted.has(e))) continue;
+    const cur = (rows[i][flagIdx] || "").trim().toLowerCase();
+    if (cur === "true") continue;
+    updates.push({ range: `${colLetters(flagIdx)}${i + 1}`, value: "TRUE" });
+  }
+  if (updates.length > 0) await updateSheetCells(TAB_NAMES.contacts, updates);
+  return { updated: updates.length };
 }
 
 // Manually set a contact's rating. This LOCKS the contact so the automatic
@@ -3098,7 +3891,7 @@ export async function deleteSheetRows(tabName: string, rowNumbers: number[]): Pr
   const spreadsheetId = requireSpreadsheetId();
   const token = await getAccessToken();
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}:batchUpdate`;
-  const res = await fetch(url, {
+  const res = await sheetsFetch(url, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -3647,9 +4440,9 @@ function splitList(v: string): string[] {
     .filter(Boolean);
 }
 
-/** First usable address from a multi-email Contacts cell. */
+/** First usable address from a multi-email Contacts cell (lowercased). */
 export function primarySheetEmail(email: string): string {
-  return (email || "").split(/[;,]/)[0]?.trim() || "";
+  return (email || "").split(/[;,]/)[0]?.trim().toLowerCase() || "";
 }
 
 /** Strip Gmail calendar prefix noise from an invitation subject. */
@@ -3736,6 +4529,11 @@ export async function ensureEventAttendanceBatch(
     const email = primarySheetEmail(item.email);
     const eventName = (item.eventName || "").trim();
     if (!email.includes("@") || !eventName) {
+      skipped++;
+      continue;
+    }
+    // 1:1 syncs / briefings / DTC working meetings stay on Activity — not Events.
+    if (!shouldCatalogAsCrmEvent(eventName)) {
       skipped++;
       continue;
     }
@@ -3872,7 +4670,11 @@ export async function buildAppEvents(): Promise<AsanaEvent[]> {
   const today = new Date().toISOString().split("T")[0];
 
   return raw
-    .filter((e) => (e.name || "").trim())
+    .filter((e) => {
+      const name = (e.name || "").trim();
+      // Hide legacy App Events rows that were auto-imported 1:1 meetings.
+      return name && shouldCatalogAsCrmEvent(name);
+    })
     .map((e, idx) => {
       const date = (e.date || "").trim();
       const status: AsanaEvent["status"] =

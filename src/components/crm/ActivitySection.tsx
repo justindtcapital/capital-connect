@@ -24,9 +24,9 @@ function trackClass(track: AsanaActivity["track"]): string {
     : "bg-purple-50 text-purple-700 border-purple-200";
 }
 
-// BD / GTM activities (from Asana Activity Tracking projects) matched to this
-// record. Renders nothing while there's nothing to show, so it stays out of the
-// way for records with no tracked activity.
+// BD / GTM activities (from the BD / GTM sheet tabs) matched to this record.
+// Renders nothing while there's nothing to show, so it stays out of the way for
+// records with no tracked activity.
 export function ActivitySection({ activities, loading, compact, enableSourcing, defaultCompany }: ActivitySectionProps) {
   const router = useRouter();
   const [sourcing, setSourcing] = useState(false);
@@ -122,7 +122,7 @@ export function ActivitySection({ activities, loading, compact, enableSourcing, 
                 <div className="flex items-center gap-1.5 shrink-0">
                   {a.date && <span className="text-[10px] text-muted-foreground">{a.date}</span>}
                   {a.url && (
-                    <a href={a.url} target="_blank" rel="noopener noreferrer" title="Open in Asana" className="text-muted-foreground hover:text-foreground">
+                    <a href={a.url} target="_blank" rel="noopener noreferrer" title={a.gid.startsWith("gmail-") ? "Open in Gmail" : "Open in Asana"} className="text-muted-foreground hover:text-foreground">
                       <ExternalLink className="h-3 w-3" />
                     </a>
                   )}

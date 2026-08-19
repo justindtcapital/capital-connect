@@ -29,7 +29,10 @@ import {
 } from "@/lib/email-activity-build";
 import { TEAM_MEMBER_EMAILS } from "@/lib/user-ownership";
 import type { AsanaActivity } from "@/lib/types";
-import { isActivityTrackingMessage as isActivityTrackingMessageLib } from "@/lib/email-activity";
+import {
+  activitySubjectQuery,
+  isActivityTrackingMessage as isActivityTrackingMessageLib,
+} from "@/lib/email-activity";
 
 const GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me";
 
@@ -329,7 +332,7 @@ async function searchGmailRaw(query: string, max = 25): Promise<GmailResult> {
   let listRes: Response;
   try {
     listRes = await fetch(
-      `${GMAIL_API}/messages?${new URLSearchParams({ q: query, maxResults: String(Math.min(50, Math.max(1, max))) })}`,
+      `${GMAIL_API}/messages?${new URLSearchParams({ q: query, maxResults: String(Math.min(100, Math.max(1, max))) })}`,
       { headers: { Authorization: `Bearer ${token}` } },
     );
   } catch (e) {
@@ -416,6 +419,13 @@ export function getInternalMailConfig(): InternalMailConfig {
   return { domains, addresses };
 }
 
+/** Prod-compat alias — new activity-sync code imports this name. */
+export function getInternalConfig() {
+  return getInternalMailConfig();
+}
+
+export { ACTIVITY_NOTES_BUDGET as NOTES_BUDGET } from "@/lib/activity-thread-intel";
+
 /** Convert a Gmail message into a BD/GTM activity, or null when it is noise.
  *  Thin wrapper over the pure builder (lib/email-activity-build) — kept for the
  *  diagnostic script and single-message callers; the sync itself groups by
@@ -433,19 +443,42 @@ async function fetchTrackFromAliases(
   aliases: string[],
 ): Promise<AsanaActivity[]> {
   if (aliases.length === 0) return [];
-  const windowDays = Number(process.env.GMAIL_ACTIVITY_WINDOW_DAYS) || 90;
-  const max = Number(process.env.GMAIL_ACTIVITY_MAX) || 50;
-  // Match mail sent as the alias OR received at the alias (To/Cc).
-  const terms = aliases.flatMap((a) => [`from:${a}`, `to:${a}`, `cc:${a}`]).join(" OR ");
-  const q = `newer_than:${windowDays}d (${terms})`;
+  // Show everything for tagged PortCos: at least a year of history and up to 500
+  // threads per track (env vars can widen this further, never narrow it).
+  const windowDays = Math.max(Number(process.env.GMAIL_ACTIVITY_WINDOW_DAYS) || 0, 365);
+  const max = Math.max(Number(process.env.GMAIL_ACTIVITY_MAX) || 0, 500);
+
+  // Alias delivery (from/to/cc/deliveredto) OR DTC:/GTM Discussion subjects that
+  // never touched the alias inbox. deliveredto: catches auto-forwards into the
+  // alias where it never appears in visible To/Cc.
+  const aliasTerms = aliases
+    .flatMap((a) => [`from:${a}`, `to:${a}`, `cc:${a}`, `deliveredto:${a}`])
+    .join(" OR ");
+  const subjectTerms = activitySubjectQuery(track);
+  const clauses = [aliasTerms, subjectTerms].filter(Boolean).map((c) => `(${c})`);
+  if (clauses.length === 0) return [];
+  const q = `newer_than:${windowDays}d (${clauses.join(" OR ")})`;
   const res = await searchGmailRaw(q, max);
   if (!res.ok) {
     console.error(`[gmail] ${track} alias sync failed:`, res.error);
     return [];
   }
+  const aliasSet = new Set(aliases);
+  const kept = res.messages.filter((m) => isActivityTrackingMessage(m, aliasSet));
   // One activity per THREAD — reply chains collapse instead of producing a row
   // per message (counterparties are unioned across the thread's messages).
-  return threadsToActivities(res.messages, track, new Set(aliases), getInternalMailConfig());
+  return threadsToActivities(kept, track, aliasSet, getInternalMailConfig());
+}
+
+/** Fetch one message by Gmail id (used by the Notes backfill repair). */
+export async function fetchGmailMessageById(id: string): Promise<GmailMessage | null> {
+  let token: string;
+  try {
+    token = await getAccessToken();
+  } catch {
+    return null;
+  }
+  return getMessage(token, id);
 }
 
 // Pull BD/GTM emails from the configured Gmail aliases into AsanaActivity-shaped

@@ -12,6 +12,7 @@ import {
 } from "@/utils/sheets.functions";
 import { eventSynopsisDraft } from "@/utils/insights.functions";
 import type { AsanaEvent, Contact, EmailActivityRecord } from "@/lib/types";
+import { scoreContactSearch } from "@/lib/contact-search";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Label } from "@/components/ui/label";
@@ -69,6 +70,7 @@ import { toast } from "sonner";
 import { colorForLead, colorForSector } from "@/lib/event-colors";
 import { useChartDrill, matchesFilters, parseCfParam, type Dimension } from "@/lib/use-chart-drill";
 import { DrillSheet, DrillChips } from "@/components/charts/DrillSheet";
+import { ContactDetail } from "@/components/crm/ContactDetail";
 import { ChartBuilder } from "@/components/charts/ChartBuilder";
 import type { Metric } from "@/lib/chart-spec";
 import {
@@ -104,23 +106,46 @@ export const Route = createFileRoute("/events")({
 
   validateSearch: (search: Record<string, unknown>) => ({ cf: parseCfParam(search.cf) }),
   loader: async () => {
-    const [asanaEvents, appEvents, contacts, emailActivity, synopses] = await Promise.all([
+    const [asanaEvents, contacts, emailActivity, synopses] = await Promise.all([
       fetchAsanaEvents().catch((): AsanaEvent[] => []),
-      fetchAppEvents().catch((): AsanaEvent[] => []),
       fetchContacts().catch((): Contact[] => []),
       fetchEmailActivity().catch((): EmailActivityRecord[] => []),
       fetchEventSynopses().catch((): Record<string, string> => ({})),
     ]);
-    // App-added events first so newest local additions are easy to spot.
-    const events = [...(appEvents as AsanaEvent[]), ...(asanaEvents as AsanaEvent[])];
+    // This page is Asana-sourced only: no app-added events, no meetings, and
+    // one card per real event (same name + date collapses to a single row).
+    const events = dedupeEvents(
+      (asanaEvents as AsanaEvent[]).filter((e) => !isAppEvent(e) && !isMeeting(e)),
+    );
     return { events, contacts: contacts as Contact[], emailActivity, synopses };
   },
   component: EventsPage,
 });
 
-// App-added events get an "app-" gid prefix so we can mark them in the UI.
+// App-added events carry an "app-" gid prefix; they belong to the CRM flows,
+// not this Asana-sourced page.
 function isAppEvent(e: AsanaEvent): boolean {
   return e.gid.startsWith("app-");
+}
+
+// 1:1s / briefing calls are meetings, not events.
+function isMeeting(e: AsanaEvent): boolean {
+  return (e.type || "").trim().toLowerCase() === "meeting";
+}
+
+// Collapse duplicates that come from Asana having the same event listed twice
+// (or an event repeated across sections). Key on name + date; richer row wins.
+function dedupeEvents(events: AsanaEvent[]): AsanaEvent[] {
+  const filled = (e: AsanaEvent) =>
+    [e.lead, e.format, e.role, e.type, e.date].filter(Boolean).length +
+    (e.portcos?.length ? 1 : 0);
+  const byKey = new Map<string, AsanaEvent>();
+  for (const e of events) {
+    const key = `${e.name.trim().toLowerCase()}|${(e.date || "").trim()}`;
+    const prev = byKey.get(key);
+    if (!prev || filled(e) > filled(prev)) byKey.set(key, e);
+  }
+  return Array.from(byKey.values());
 }
 
 const EVENT_TYPES = ["conference", "dinner", "webinar", "meeting"] as const;
@@ -155,9 +180,8 @@ function EventsPage() {
   const router = useRouter();
   const [view, setView] = useState<"list" | "calendar" | "analytics">("list");
   const [selected, setSelected] = useState<AsanaEvent | null>(null);
-  const [addOpen, setAddOpen] = useState(false);
+  const [selectedContact, setSelectedContact] = useState<Contact | null>(null);
   const [filters, setFilters] = useState<Filters>({ lead: "", format: "", sector: "" });
-  const appEventCount = useMemo(() => events.filter(isAppEvent).length, [events]);
 
   const leads = useMemo(
     () => Array.from(new Set(events.map((e) => e.lead).filter((v): v is string => !!v))).sort(),
@@ -204,10 +228,10 @@ function EventsPage() {
         <div>
           <h1 className="text-lg font-bold text-foreground">Events</h1>
           <p className="text-xs text-muted-foreground mt-0.5">
-            Asana + app-added · {filtered.length} of {events.length} event
+            Asana-sourced · {filtered.length} of {events.length} event
             {events.length !== 1 ? "s" : ""}
-            {appEventCount > 0 && <span> · {appEventCount} added here</span>}
           </p>
+
         </div>
         <div className="flex items-center gap-2">
           <div className="flex items-center gap-1 rounded-md border border-border p-0.5">
@@ -236,9 +260,6 @@ function EventsPage() {
               <BarChart3 className="h-3.5 w-3.5 mr-1.5" /> Analytics
             </Button>
           </div>
-          <Button size="sm" className="h-8 text-xs" onClick={() => setAddOpen(true)}>
-            <Plus className="h-3.5 w-3.5 mr-1.5" /> Add event
-          </Button>
         </div>
       </div>
 
@@ -257,10 +278,8 @@ function EventsPage() {
               <p className="text-sm text-muted-foreground">
                 No events found in the Asana Events project.
               </p>
-              <Button size="sm" className="h-8 text-xs mt-3" onClick={() => setAddOpen(true)}>
-                <Plus className="h-3.5 w-3.5 mr-1.5" /> Add an event
-              </Button>
             </div>
+
           ) : view === "list" ? (
             <ListView
               upcoming={upcoming}
@@ -295,16 +314,18 @@ function EventsPage() {
         onClose={() => setSelected(null)}
         onChanged={() => router.invalidate()}
         synopsis={selected ? synopses[selected.name.trim().toLowerCase()] || "" : ""}
+        onSelectContact={setSelectedContact}
       />
 
-      <AddEventDialog
-        open={addOpen}
-        onOpenChange={setAddOpen}
-        leadOptions={leads}
-        portcoOptions={Array.from(new Set(events.flatMap((e) => e.portcos))).sort()}
-        sectorOptions={sectors}
-        onAdded={() => router.invalidate()}
+      <ContactDetail
+        contact={selectedContact}
+        open={!!selectedContact}
+        onOpenChange={(open) => {
+          if (!open) setSelectedContact(null);
+        }}
+        onContactUpdate={() => router.invalidate()}
       />
+
     </div>
   );
 }
@@ -502,19 +523,8 @@ function EventTable({
             return (
               <TableRow key={e.gid} className="cursor-pointer" onClick={() => onSelect(e)}>
                 <TableCell className="text-xs whitespace-nowrap">{e.date}</TableCell>
-                <TableCell className="text-xs font-medium">
-                  <span className="inline-flex items-center gap-1.5">
-                    {e.name}
-                    {isAppEvent(e) && (
-                      <Badge
-                        variant="outline"
-                        className="text-[9px] px-1 py-0 border-primary/40 text-primary"
-                      >
-                        App
-                      </Badge>
-                    )}
-                  </span>
-                </TableCell>
+                <TableCell className="text-xs font-medium">{e.name}</TableCell>
+
                 <TableCell className="text-xs">
                   {e.lead ? (
                     <span
@@ -1154,6 +1164,7 @@ function EventDetailSheet({
   onClose,
   onChanged,
   synopsis = "",
+  onSelectContact,
 }: {
   event: AsanaEvent | null;
   contacts: Contact[];
@@ -1161,6 +1172,7 @@ function EventDetailSheet({
   onClose: () => void;
   onChanged?: () => void;
   synopsis?: string;
+  onSelectContact?: (c: Contact) => void;
 }) {
   const [bulkOpen, setBulkOpen] = useState(false);
   const [bulkType, setBulkType] = useState<"attended" | "invited">("attended");
@@ -1382,7 +1394,7 @@ function EventDetailSheet({
               ) : (
                 <div className="space-y-1.5">
                   {attended.map((c) => (
-                    <AttendeeRow key={c.id} contact={c} />
+                    <AttendeeRow key={c.id} contact={c} onSelect={onSelectContact} />
                   ))}
                 </div>
               )}
@@ -1413,7 +1425,7 @@ function EventDetailSheet({
               ) : (
                 <div className="space-y-1.5">
                   {invited.map((c) => (
-                    <AttendeeRow key={c.id} contact={c} />
+                    <AttendeeRow key={c.id} contact={c} onSelect={onSelectContact} />
                   ))}
                 </div>
               )}
@@ -1470,11 +1482,27 @@ function EventDetailSheet({
   );
 }
 
-function AttendeeRow({ contact }: { contact: Contact }) {
+function AttendeeRow({
+  contact,
+  onSelect,
+}: {
+  contact: Contact;
+  onSelect?: (c: Contact) => void;
+}) {
   return (
     <div className="flex items-center justify-between border border-border rounded px-2 py-1.5">
       <div className="min-w-0">
-        <div className="text-xs font-medium truncate">{contact.name}</div>
+        {onSelect ? (
+          <button
+            type="button"
+            onClick={() => onSelect(contact)}
+            className="text-xs font-medium truncate text-left hover:text-primary hover:underline"
+          >
+            {contact.name}
+          </button>
+        ) : (
+          <div className="text-xs font-medium truncate">{contact.name}</div>
+        )}
         <div className="text-[10px] text-muted-foreground truncate">
           {contact.title}
           {contact.company ? ` · ${contact.company}` : ""}
@@ -1799,7 +1827,10 @@ function UploadAttendedDialog({
     let ok = 0;
     for (const c of matched) {
       try {
-        await addEventToSheet({ data: { contactEmail: c.email, eventName, type: "attended" } });
+        // Attended → Follow Up Flag on by default (post-event outreach).
+        await addEventToSheet({
+          data: { contactEmail: c.email, eventName, type: "attended", flagFollowUp: true },
+        });
         ok++;
       } catch (e) {
         console.error("Failed to tag attended for", c.email, e);
@@ -1807,7 +1838,7 @@ function UploadAttendedDialog({
     }
     setBusy(false);
     toast.success(
-      `Marked ${ok} attended for "${eventName}"${unmatched.length ? ` · ${unmatched.length} email${unmatched.length !== 1 ? "s" : ""} not in network` : ""}`,
+      `Marked ${ok} attended for "${eventName}" (flagged for follow-up)${unmatched.length ? ` · ${unmatched.length} email${unmatched.length !== 1 ? "s" : ""} not in network` : ""}`,
     );
     setText("");
     onOpenChange(false);
@@ -1888,17 +1919,14 @@ function BulkAddAttendeesDialog({
   const verb = type === "invited" ? "invitees" : "attendees";
 
   const candidates = useMemo(() => {
-    const q = query.trim().toLowerCase();
+    const q = query.trim();
     return contacts
       .filter((c) => !alreadyTagged.has(c.id))
-      .filter(
-        (c) =>
-          !q ||
-          c.name.toLowerCase().includes(q) ||
-          c.company.toLowerCase().includes(q) ||
-          c.email.toLowerCase().includes(q),
-      )
-      .slice(0, 200);
+      .map((c) => ({ c, s: q ? scoreContactSearch(c, q) : 1 }))
+      .filter((x) => x.s > 0)
+      .sort((a, b) => b.s - a.s || a.c.name.localeCompare(b.c.name))
+      .slice(0, 200)
+      .map((x) => x.c);
   }, [contacts, query, alreadyTagged]);
 
   const toggle = (id: string) => {
@@ -1917,14 +1945,25 @@ function BulkAddAttendeesDialog({
     let ok = 0;
     for (const c of targets) {
       try {
-        await addEventToSheet({ data: { contactEmail: c.email, eventName, type } });
+        // Attended defaults to follow-up; invitees are left unflagged.
+        await addEventToSheet({
+          data: {
+            contactEmail: c.email,
+            eventName,
+            type,
+            flagFollowUp: type === "attended",
+          },
+        });
         ok++;
       } catch (e) {
         console.error("Failed to add event for", c.email, e);
       }
     }
     setBusy(false);
-    toast.success(`Tagged ${ok} contact${ok !== 1 ? "s" : ""} as ${verb} of "${eventName}"`);
+    toast.success(
+      `Tagged ${ok} contact${ok !== 1 ? "s" : ""} as ${verb} of "${eventName}"` +
+        (type === "attended" ? " (flagged for follow-up)" : ""),
+    );
     setSelected(new Set());
     onOpenChange(false);
     onChanged?.();

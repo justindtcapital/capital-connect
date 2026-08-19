@@ -3,7 +3,7 @@
 
 /** Local-parts that are almost never a real relationship contact. */
 const SYSTEM_LOCAL =
-  /^(no-?reply|do-?not-?reply|donotreply|notifications?|notify|mailer-daemon|postmaster|calendar(-notification)?|info|support|admin|team|hello|contact|help|news(letter)?|marketing|updates?|noreply|bounce|bounces|email\.customerservice|customerservice|service|feedback|survey|digest|alerts?|automated?|robot|system|mailman|listserv|unsubscribe|subscriptions?|billing|receipts?|invoices?|orders?|shipping|noreply[\w.-]*)$/i;
+  /^(no-?reply|do-?not-?reply|donotreply|notifications?|notify|mailer-daemon|postmaster|calendar(-notification)?|info|support|admin|sales|events?|teams?|group|groups|dl|distro|distribution|listserv|hello|contact|help|news(letter)?|marketing|updates?|noreply|bounce|bounces|email\.customerservice|customerservice|service|feedback|survey|digest|alerts?|automated?|robot|system|mailman|unsubscribe|subscriptions?|billing|receipts?|invoices?|orders?|shipping|booking|bookings|scheduler|scheduling|appointments?|rsvp|invites?|reservations?|tracking|(bd|gtm)[-_.]?track(ing)?|calendly|rooms?|noreply[\w.-]*)$/i;
 
 /** Domains that are almost always marketing / platform noise. */
 /** ESP / marketing platforms — almost never a human relationship contact. */
@@ -26,7 +26,20 @@ const NOISE_DOMAINS = new Set([
   "exacttarget.com",
   "pardot.com",
   "constantcontact.com",
+  // Conferencing / calendar room connectors (e.g. 97132749933@zoomcrc.com).
+  "zoomcrc.com",
+  "zoom.us",
+  "teams.microsoft.com",
+  "webex.com",
+  "asana.com",
 ]);
+
+/**
+ * Calendar / room / automation domains — never a relationship contact.
+ * Matches the domain or any subdomain (resource.calendar.google.com).
+ */
+const NON_PERSON_DOMAIN =
+  /(?:^|\.)(zoomcrc\.com|zoom\.us|teams\.microsoft\.com|webex\.com|asana\.com|calendar\.google\.com|calendar-server\.google\.com|resource\.calendar\.google\.com)$/i;
 
 export function emailLocalPart(email: string): string {
   return (email || "").trim().toLowerCase().split("@")[0] || "";
@@ -47,6 +60,20 @@ export function isNoiseEmail(email: string): boolean {
   // Nested system locals: alerts+xyz@, newsletter=foo@
   if (/^(no-?reply|newsletter|mailer|bounce|notifications?)/i.test(local)) return true;
   if (NOISE_DOMAINS.has(domain)) return true;
+  if (NON_PERSON_DOMAIN.test(domain)) return true;
+  // Meeting IDs / room connectors: local part has no letters (97132749933@zoomcrc.com).
+  if (!/[a-z]/i.test(local)) return true;
+  // Calendar RSVP / intake robots (Response <response@calendar-response.jifflenow.com>).
+  if (/calendar-response\./i.test(domain) || /\.jifflenow\.com$/i.test(domain)) return true;
+  // Shared "portfolio+" alias mailboxes and encoded junk locals.
+  if (/^portfolio([+%._-]|$)/i.test(local)) return true;
+  // Role / tracking / booking mailboxes (bd-tracking@, booking@mavenagi.com).
+  if (/(^|[-_.])(track(ing)?|booking|scheduler|alias)$/i.test(local)) return true;
+  if (/^(incident\.recovery|noreply|mailer-daemon)$/i.test(local)) return true;
+  // Long hex / uuid locals (Bafeacacdddcec-style person ids mistaken for names).
+  if (/^[a-f0-9]{20,}$/i.test(local)) return true;
+  // Outlook "Name on behalf of Other" mashed into a local-part.
+  if (/\bon\.behalf(\.of)?\./i.test(local)) return true;
   // Common ESP subdomains: bounce.example.com, email.example.com (weak — only mailer patterns)
   if (/^(bounce|email|mail|news|newsletter|marketing|m)\./i.test(domain)) return true;
   return false;
@@ -58,6 +85,38 @@ export interface BulkMailSignals {
   autoSubmitted?: string;
   xMailer?: string;
   feedbackId?: string;
+}
+
+export interface InternalConfig {
+  domains: Set<string>;
+  addresses: Set<string>;
+}
+
+export const EMPTY_INTERNAL: InternalConfig = { domains: new Set(), addresses: new Set() };
+
+/** Build an InternalConfig from comma/semicolon-separated env strings. */
+export function buildInternalConfig(domainsRaw?: string, addressesRaw?: string): InternalConfig {
+  const split = (raw?: string) =>
+    (raw || "")
+      .split(/[;,\s]+/)
+      .map((s) => s.trim().toLowerCase().replace(/^@/, ""))
+      .filter(Boolean);
+  return {
+    domains: new Set(split(domainsRaw).filter((d) => !d.includes("@"))),
+    addresses: new Set(split(addressesRaw).filter((a) => a.includes("@"))),
+  };
+}
+
+/** True when the address belongs to our own team (or is a tracking alias). */
+export function isInternalEmail(email: string, cfg: InternalConfig): boolean {
+  const e = (email || "").trim().toLowerCase();
+  if (!e.includes("@")) return false;
+  if (cfg.addresses.has(e)) return true;
+  const domain = emailDomain(e);
+  if (!domain) return false;
+  if (cfg.domains.has(domain)) return true;
+  for (const d of cfg.domains) if (domain.endsWith(`.${d}`)) return true;
+  return false;
 }
 
 /** True when headers look like a newsletter / bulk / automated blast. */
@@ -74,7 +133,7 @@ export function isBulkOrAutomatedMail(signals: BulkMailSignals): boolean {
 export interface Counterparty {
   name: string;
   email: string;
-  role: "from" | "to" | "cc";
+  role: "from" | "to" | "cc" | "forwarded";
   /** Our side (team roster / internal domains) — never the relationship contact
    *  while an external human is on the thread. Absent = external. */
   internal?: boolean;

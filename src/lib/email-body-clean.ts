@@ -53,6 +53,8 @@ export function isEmailChromeText(text: string): boolean {
   if (!s) return true;
   if (/^(internal use|confidential|from:|to:|cc:|bcc:|subject:|sent:|date:)/i.test(s))
     return true;
+  if (/^-+original\s+appointment-+$/i.test(s) || /^original\s+appointment$/i.test(s))
+    return true;
   if (/mailto:/i.test(s)) return true;
   if (/&(?:lt|gt|nbsp|#\d+);/i.test(s)) return true;
   // Dense address-book dump from a forwarded To:/Cc: line.

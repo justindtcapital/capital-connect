@@ -6,12 +6,15 @@ import {
   buildPortcoExposures,
   fetchSheetTab,
   appendSheetRows,
+  appendPortcoIntroRows,
+  mergePortcoIntroSource,
   ensureTab,
-  ensureColumn,
   logOpsEvent,
   TAB_NAMES,
   PORTCO_EXPOSURE_HEADERS,
+  type PortcoIntroRowInput,
 } from "./sheets.server";
+import { engagementSourcesInclude } from "@/lib/engagement-source";
 import type { AsanaEvent, PortCoExposure } from "@/lib/types";
 
 export interface SyncExposureResult {
@@ -90,27 +93,32 @@ export async function runSyncEventExposure(): Promise<SyncExposureResult> {
       if (company && event) existingExposure.add(`${company}|${event}`);
     }
 
-    // Existing event-exposure engagements (dedupe on email|portco).
+    // Existing PortCo engagements: email|portco → raw Engagement Source cell.
+    // "event exposure" may already be one of several multi-select sources.
     const introRows = await fetchSheetTab(TAB_NAMES.portcoIntros).catch(
       () => [] as string[][],
     );
-    const existingEngagement = new Set<string>();
+    const existingEngagementSources = new Map<string, string>();
     if (introRows.length > 0) {
       const header = (introRows[0] || []).map((h) => norm(h));
       const emailIdx = header.indexOf("contact email");
       const portcoIdx = header.indexOf("portco name");
       const srcIdx = header.indexOf("engagement source");
       for (const r of introRows.slice(1)) {
-        if (srcIdx === -1 || norm(r[srcIdx] || "") !== "event exposure") continue;
         const email = emailIdx === -1 ? "" : norm(r[emailIdx] || "");
         const portco = portcoIdx === -1 ? "" : norm(r[portcoIdx] || "");
-        if (email && portco) existingEngagement.add(`${email}|${portco}`);
+        if (!email || !portco) continue;
+        existingEngagementSources.set(
+          `${email}|${portco}`,
+          srcIdx === -1 ? "" : r[srcIdx] || "",
+        );
       }
     }
 
     const today = new Date().toISOString().slice(0, 10);
     const newExposures: string[][] = [];
-    const newEngagements: string[][] = [];
+    const newEngagements: PortcoIntroRowInput[] = [];
+    const mergeEngagements: { email: string; portco: string; urid?: string }[] = [];
     const queuedExp = new Set<string>();
     const queuedEng = new Set<string>();
     let skipped = 0;
@@ -137,10 +145,22 @@ export async function runSyncEventExposure(): Promise<SyncExposureResult> {
           const email = (c.email || "").split(";")[0]?.trim() || "";
           if (!email) continue;
           const engKey = `${norm(email)}|${pKey}`;
-          if (existingEngagement.has(engKey) || queuedEng.has(engKey)) continue;
+          if (queuedEng.has(engKey)) continue;
+          const existingRaw = existingEngagementSources.get(engKey);
+          if (existingRaw !== undefined) {
+            if (engagementSourcesInclude(existingRaw, "event exposure")) continue;
+            queuedEng.add(engKey);
+            mergeEngagements.push({ email, portco, urid: c.urid });
+            continue;
+          }
           queuedEng.add(engKey);
-          // Order mirrors addPortcoIntro: email, portco, date, engagement source.
-          newEngagements.push([email, portco, e.date || today, "event exposure"]);
+          newEngagements.push({
+            email,
+            portcoName: portco,
+            date: e.date || today,
+            source: "event exposure",
+            urid: c.urid,
+          });
         }
       }
     }
@@ -149,22 +169,32 @@ export async function runSyncEventExposure(): Promise<SyncExposureResult> {
       await appendSheetRows(TAB_NAMES.portcoExposure, newExposures);
     }
     if (newEngagements.length > 0) {
-      await ensureColumn(TAB_NAMES.portcoIntros, "Engagement Source");
-      await appendSheetRows(TAB_NAMES.portcoIntros, newEngagements);
+      await appendPortcoIntroRows(newEngagements);
+    }
+    let mergedCount = 0;
+    for (const m of mergeEngagements) {
+      const res = await mergePortcoIntroSource(m.email, m.portco, "event exposure", m.urid);
+      if (res.success && res.merged) mergedCount++;
     }
 
     const result = {
       ok: true as const,
       events: events.length,
       exposuresLogged: newExposures.length,
-      engagementsLogged: newEngagements.length,
+      engagementsLogged: newEngagements.length + mergedCount,
       skipped,
     };
     const items = [
       ...newExposures.map(
         (r) => `[exposure] ${r[0]} ← ${r[1]}${r[2] ? ` · ${r[2]}` : ""}${r[4] ? ` · via ${r[4]}` : ""}`,
       ),
-      ...newEngagements.map((r) => `[attendee] ${r[0]} ← ${r[1]}${r[2] ? ` · ${r[2]}` : ""}`),
+      ...newEngagements.map(
+        (r) =>
+          `[attendee] ${r.email} ← ${r.portcoName}${r.date ? ` · ${r.date}` : ""}`,
+      ),
+      ...mergeEngagements.map(
+        (m) => `[attendee-merge] ${m.email} ← ${m.portco} + event exposure`,
+      ),
     ];
     await logOpsEvent({
       action: "sync",
@@ -176,6 +206,7 @@ export async function runSyncEventExposure(): Promise<SyncExposureResult> {
         events: result.events,
         exposuresLogged: result.exposuresLogged,
         engagementsLogged: result.engagementsLogged,
+        merged: mergedCount,
         skipped: result.skipped,
       },
       items,

@@ -24,8 +24,11 @@ import type {
   EngagementSource,
 } from "@/lib/types";
 import { ENGAGEMENT_SOURCES, CONTACT_TYPES, RECORD_SOURCES, interactionSource } from "@/lib/types";
+import { formatEngagementSources, mergeEngagementSources } from "@/lib/engagement-source";
 import { inferInterestAreas } from "@/lib/interest-domains";
+import { compareIsoDatesDesc, formatIsoMdY, localTodayIso } from "@/lib/sheet-date";
 import { suggestAreasOfInterest } from "@/utils/gemini.functions";
+import { MultiSelect } from "@/components/ui/multi-select";
 import {
   Sheet,
   SheetContent,
@@ -273,7 +276,9 @@ export function ContactDetail({
   const [savingInteraction, setSavingInteraction] = useState(false);
   const [addPortCoOpen, setAddPortCoOpen] = useState(false);
   const [newPortCo, setNewPortCo] = useState("");
-  const [newPortCoSource, setNewPortCoSource] = useState<EngagementSource>("direct introduction");
+  const [newPortCoSources, setNewPortCoSources] = useState<EngagementSource[]>([
+    "direct introduction",
+  ]);
   const [addEventOpen, setAddEventOpen] = useState(false);
   const [newEvent, setNewEvent] = useState({
     name: "",
@@ -663,7 +668,7 @@ export function ContactDetail({
     if (!newInteraction.summary.trim()) return;
     const interaction: Interaction = {
       id: `i-${Date.now()}`,
-      date: new Date().toISOString().split("T")[0],
+      date: localTodayIso(),
       type: newInteraction.type,
       summary: newInteraction.summary,
       isFollowUp: newInteraction.isFollowUp,
@@ -817,22 +822,28 @@ export function ContactDetail({
   const addPortCoIntro = async () => {
     if (!newPortCo.trim() || contact.portCoIntros.includes(newPortCo)) return;
     const today = new Date().toISOString().split("T")[0];
+    const sources = mergeEngagementSources([], newPortCoSources);
     const updated = {
       ...contact,
       portCoIntros: [...contact.portCoIntros, newPortCo],
       portCoEngagements: [
         ...(contact.portCoEngagements || []),
-        { portco: newPortCo, date: today, source: newPortCoSource },
+        { portco: newPortCo, date: today, sources },
       ],
     };
     if (onContactUpdate) onContactUpdate(updated);
     setNewPortCo("");
-    setNewPortCoSource("direct introduction");
+    setNewPortCoSources(["direct introduction"]);
     setAddPortCoOpen(false);
 
     try {
       await addPortcoIntro({
-        data: { contactEmail: contact.email, portcoName: newPortCo, source: newPortCoSource },
+        data: {
+          contactEmail: contact.email,
+          portcoName: newPortCo,
+          sources,
+          urid: contact.urid,
+        },
       });
     } catch (e) {
       console.error("Failed to write portco intro to sheet:", e);
@@ -947,16 +958,25 @@ export function ContactDetail({
     if (onContactUpdate) onContactUpdate(updated);
   };
 
-  // Reclassify a portfolio engagement's source inline (persisted in place).
-  const updatePortcoSource = async (co: string, source: EngagementSource) => {
+  // Reclassify a portfolio engagement's sources inline (multi-select, persisted).
+  const updatePortcoSources = async (co: string, next: EngagementSource[]) => {
+    const sources = mergeEngagementSources([], next.length ? next : ["direct introduction"]);
     const engagements = contact.portCoEngagements || [];
     const nextEngagements = engagements.some((e) => e.portco === co)
-      ? engagements.map((e) => (e.portco === co ? { ...e, source } : e))
-      : [...engagements, { portco: co, date: new Date().toISOString().split("T")[0], source }];
+      ? engagements.map((e) => (e.portco === co ? { ...e, sources } : e))
+      : [
+          ...engagements,
+          { portco: co, date: new Date().toISOString().split("T")[0], sources },
+        ];
     if (onContactUpdate) onContactUpdate({ ...contact, portCoEngagements: nextEngagements });
     try {
       await setPortcoIntroSource({
-        data: { contactEmail: contact.email, portcoName: co, source, urid: contact.urid },
+        data: {
+          contactEmail: contact.email,
+          portcoName: co,
+          sources,
+          urid: contact.urid,
+        },
       });
     } catch (e) {
       console.error("setPortcoIntroSource failed", e);
@@ -979,8 +999,8 @@ export function ContactDetail({
     if (onContactUpdate) onContactUpdate(updated);
   };
 
-  const sortedInteractions = [...contact.interactions].sort(
-    (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime(),
+  const sortedInteractions = [...contact.interactions].sort((a, b) =>
+    compareIsoDatesDesc(a.date, b.date),
   );
 
   return (
@@ -1234,7 +1254,7 @@ export function ContactDetail({
                           e.stopPropagation();
                           const interaction = {
                             id: `i-${Date.now()}`,
-                            date: new Date().toISOString().split("T")[0],
+                            date: localTodayIso(),
                             type: "email" as InteractionType,
                             summary: `Email sent to ${primaryEmail}`,
                             isFollowUp: false,
@@ -1422,7 +1442,7 @@ export function ContactDetail({
                 />
               </section>
 
-              {/* BD / GTM activity from Asana, matched to this contact */}
+              {/* BD / GTM activity from the BD/GTM sheets, matched to this contact */}
               {(activitiesLoading || contactActivities.length > 0) && (
                 <section className="border-b border-border pb-6">
                   <ActivitySection
@@ -1454,33 +1474,27 @@ export function ContactDetail({
                 {contact.portCoIntros.length > 0 ? (
                   <div className="space-y-1.5">
                     {contact.portCoIntros.map((co) => {
-                      const src = (contact.portCoEngagements || []).find(
-                        (e) => e.portco === co,
-                      )?.source;
+                      const sources =
+                        (contact.portCoEngagements || []).find((e) => e.portco === co)
+                          ?.sources || (["direct introduction"] as EngagementSource[]);
                       return (
                         <div
                           key={co}
                           className="flex items-center justify-between gap-2 rounded border border-primary/20 bg-primary/5 px-2 py-1"
                         >
-                          <div className="min-w-0">
+                          <div className="min-w-0 flex-1">
                             <div className="text-xs font-medium text-primary truncate">{co}</div>
-                            <Select
-                              value={src || "direct introduction"}
-                              onValueChange={(v) =>
-                                void updatePortcoSource(co, v as EngagementSource)
+                            <MultiSelect
+                              options={[...ENGAGEMENT_SOURCES]}
+                              value={sources}
+                              onChange={(v) =>
+                                void updatePortcoSources(co, v as EngagementSource[])
                               }
-                            >
-                              <SelectTrigger className="h-4 mt-0.5 w-auto gap-1 border-0 bg-transparent px-0 text-[10px] capitalize text-muted-foreground shadow-none hover:text-foreground focus:ring-0 [&>svg]:h-3 [&>svg]:w-3">
-                                <SelectValue />
-                              </SelectTrigger>
-                              <SelectContent>
-                                {ENGAGEMENT_SOURCES.map((s) => (
-                                  <SelectItem key={s} value={s} className="text-xs capitalize">
-                                    {s}
-                                  </SelectItem>
-                                ))}
-                              </SelectContent>
-                            </Select>
+                              searchable={false}
+                              placeholder="Select sources…"
+                              formatLabel={(v) => formatEngagementSources(v as EngagementSource[])}
+                              className="mt-0.5 h-auto min-h-0 w-full justify-start border-0 bg-transparent px-0 py-0 text-[10px] capitalize text-muted-foreground shadow-none hover:bg-transparent hover:text-foreground [&>span:last-child]:opacity-70"
+                            />
                           </div>
                           <button
                             type="button"
@@ -1711,7 +1725,7 @@ export function ContactDetail({
                                     {interaction.type}
                                   </span>
                                   <span className="text-[10px] text-muted-foreground">
-                                    {interaction.date}
+                                    {formatIsoMdY(interaction.date) || interaction.date}
                                   </span>
                                   {interaction.isFollowUp && (
                                     <button
@@ -1900,21 +1914,19 @@ export function ContactDetail({
               <label className="text-[10px] uppercase tracking-wider font-semibold text-muted-foreground mb-1 block">
                 Engagement Source
               </label>
-              <Select
-                value={newPortCoSource}
-                onValueChange={(v) => setNewPortCoSource(v as EngagementSource)}
-              >
-                <SelectTrigger className="h-9 text-sm capitalize">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {ENGAGEMENT_SOURCES.map((s) => (
-                    <SelectItem key={s} value={s} className="capitalize">
-                      {s}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              <MultiSelect
+                options={[...ENGAGEMENT_SOURCES]}
+                value={newPortCoSources}
+                onChange={(v) =>
+                  setNewPortCoSources(
+                    mergeEngagementSources([], (v as EngagementSource[]) || []),
+                  )
+                }
+                searchable={false}
+                placeholder="Select sources…"
+                formatLabel={(v) => formatEngagementSources(v as EngagementSource[])}
+                className="h-9 text-sm capitalize"
+              />
             </div>
           </div>
           <DialogFooter>
@@ -2121,7 +2133,7 @@ export function ContactDetail({
         onOpenChange={setEmailDraftOpen}
         contact={contact}
         onSent={(info) => {
-          const date = new Date().toISOString().split("T")[0];
+          const date = localTodayIso();
           const tag =
             info.linkedPortcos && info.linkedPortcos.length
               ? ` [PortCo: ${info.linkedPortcos.join(", ")}]`

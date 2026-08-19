@@ -16,7 +16,18 @@ import {
 } from "./sheets.server";
 import { enrichPerson } from "./apollo.server";
 import { readThreads, type ThreadParticipant, type ThreadInteractionType } from "./thread-reader.server";
+import { normalizeSector } from "@/lib/sectors";
+import { shouldCatalogAsCrmEvent } from "@/lib/event-catalog";
+import { parseToIsoDate, todayIso } from "@/lib/sheet-date";
+import { contactImportRejectReason } from "@/lib/contact-noise";
 import type { InteractionType } from "@/lib/types";
+
+function nameParts(name: string): { firstName?: string; lastName?: string } {
+  const parts = (name || "").trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return {};
+  if (parts.length === 1) return { firstName: parts[0] };
+  return { firstName: parts[0], lastName: parts.slice(1).join(" ") };
+}
 
 // Map the LLM's classified thread type onto the CRM interaction taxonomy. BD/GTM
 // activities are pasted email threads by construction, so an unclassified ("other")
@@ -122,6 +133,8 @@ export const sourceContactsFromActivities = createServerFn({ method: "POST" })
       const existing = new Set((await fetchContactEmails()).map((e) => e.toLowerCase()));
       await ensureColumn(TAB_NAMES.contacts, "Source");
       await ensureColumn(TAB_NAMES.contacts, "Source Context");
+      await ensureColumn(TAB_NAMES.contacts, "LinkedIn");
+      await ensureColumn(TAB_NAMES.contacts, "Sector");
 
       const created: string[] = [];
       let existingCount = 0;
@@ -145,10 +158,21 @@ export const sourceContactsFromActivities = createServerFn({ method: "POST" })
         let phone = "";
         let location = "";
         let linkedin = "";
+        let sector = "";
+
+        if (contactImportRejectReason({ name, email: p.email, company })) {
+          continue;
+        }
 
         if (!apolloOff) {
           try {
-            const ap = await enrichPerson({ email: p.email, organizationName: company || undefined });
+            const { firstName, lastName } = nameParts(name);
+            const ap = await enrichPerson({
+              email: p.email,
+              organizationName: company || undefined,
+              firstName,
+              lastName,
+            });
             if (ap.accessDenied) {
               apolloOff = true; // key/plan can't enrich — degrade to parsed values
             } else if (ap.found) {
@@ -157,6 +181,7 @@ export const sourceContactsFromActivities = createServerFn({ method: "POST" })
               if (ap.company) company = ap.company;
               if (ap.phone) phone = ap.phone;
               if (ap.linkedinUrl) linkedin = ap.linkedinUrl;
+              if (ap.industry) sector = normalizeSector(ap.industry);
               const loc = [ap.city, ap.state, ap.country].filter(Boolean).join(", ");
               if (loc) location = loc;
               enrichedCount++;
@@ -177,7 +202,7 @@ export const sourceContactsFromActivities = createServerFn({ method: "POST" })
           location,
           linkedin,
           prime: "",
-          sector: "",
+          sector,
           temperature: "Cold",
           source: "Manual Entry",
           sourceContext: "Sourced from Asana BD/GTM activity",
@@ -191,7 +216,7 @@ export const sourceContactsFromActivities = createServerFn({ method: "POST" })
       // label), the LLM-inferred follow-up flag, and the interaction type the LLM
       // classified (so a sourced thread lands as Email / Meeting / Call /
       // Portfolio Intro instead of a generic Note).
-      const today = new Date().toISOString().split("T")[0];
+      const today = todayIso();
       const noteRows: InteractionRowInput[] = [];
       let summariesWritten = 0;
       let followUpsFlagged = 0;
@@ -207,7 +232,7 @@ export const sourceContactsFromActivities = createServerFn({ method: "POST" })
         for (const p of t.people) {
           noteRows.push({
             email: p.email,
-            date: t.date || today,
+            date: parseToIsoDate(t.date) || today,
             summary,
             type,
             requiresFollowUp: owed,
@@ -228,6 +253,8 @@ export const sourceContactsFromActivities = createServerFn({ method: "POST" })
         const ev = insightByGid.get(t.gid)?.event;
         const evName = ev?.name?.trim();
         if (!ev?.mentioned || !evName) continue;
+        // Skip 1:1 / briefing / DTC sync titles — those are activities, not Events.
+        if (!shouldCatalogAsCrmEvent(evName)) continue;
         const key = evName.toLowerCase();
         let entry = eventByName.get(key);
         if (!entry) {

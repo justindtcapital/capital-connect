@@ -1,6 +1,8 @@
 import { createServerFn } from "@tanstack/react-start";
-import { fetchPortcoFields, fetchPortfolioEvents, discoverFields, fetchAllAsanaEvents, fetchActivities } from "./asana.server";
-import { fetchAliasActivities } from "./gmail.server";
+import { fetchPortcoFields, fetchPortfolioEvents, discoverFields, fetchAllAsanaEvents } from "./asana.server";
+import { buildActivities } from "./sheets.server";
+import { loadAttributionCorrections } from "./activity-attribution.server";
+import { applyAttributionCorrections } from "@/lib/activity-canonical";
 import type { PortfolioEvent, AsanaEvent, AsanaActivity } from "@/lib/types";
 
 export interface AsanaPortcoData {
@@ -66,28 +68,17 @@ export const fetchAsanaEvents = createServerFn({ method: "GET" }).handler(
   }
 );
 
-// BD + GTM activities (Asana tasks) merged with Gmail BD/GTM alias emails —
-// one stream for the activity feed and client-side matching.
+// BD + GTM activities for display — read from the mirrored BD / GTM sheet tabs
+// (populated by Sync activity from Asana + Gmail aliases). Attribution flags
+// overlay immediately so a correction shows before the next sync rewrites the tab.
 export const fetchAsanaActivities = createServerFn({ method: "GET" }).handler(
   async (): Promise<AsanaActivity[]> => {
     try {
-      const [asana, gmail] = await Promise.all([
-        fetchActivities().catch((err) => {
-          console.error("[asana] fetchActivities failed:", err);
-          return [] as AsanaActivity[];
-        }),
-        fetchAliasActivities().catch((err) => {
-          console.error("[asana] fetchAliasActivities failed:", err);
-          return [] as AsanaActivity[];
-        }),
-      ]);
-      return [...asana, ...gmail].sort((a, b) => {
-        const ad = Date.parse(a.date || "") || 0;
-        const bd = Date.parse(b.date || "") || 0;
-        return bd - ad;
-      });
+      const activities = await buildActivities();
+      const corrections = await loadAttributionCorrections().catch(() => []);
+      return applyAttributionCorrections(activities, corrections);
     } catch (err) {
-      console.error("[asana] fetchAsanaActivities failed:", err);
+      console.error("[activity] fetchAsanaActivities (sheets) failed:", err);
       return [];
     }
   }

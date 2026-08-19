@@ -3,6 +3,17 @@
 // In-memory caching avoids hammering Asana's 150 req/min rate limit.
 
 import type { PortfolioEvent, AsanaEvent, AsanaActivity } from "@/lib/types";
+import {
+  ACTIVITY_NOTES_BUDGET,
+  enrichActivityFromThreadText,
+  formatActivityNotes,
+} from "@/lib/activity-thread-intel";
+import { emailBodyExcerpt } from "../lib/email-excerpt";
+import { isInternalEmail, isNoiseEmail, type InternalConfig } from "@/lib/email-noise";
+import { peopleEntriesFromActivity } from "@/lib/activity-canonical";
+import { isNameOnlyAttendeeEmail } from "@/lib/email-address";
+import { fetchAliasActivities, getActivityAliases, getInternalConfig } from "./gmail.server";
+import { parseToIsoDate, compareIsoDatesDesc } from "@/lib/sheet-date";
 
 const ASANA_BASE = "https://app.asana.com/api/1.0";
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
@@ -16,6 +27,7 @@ interface AsanaCustomField {
   number_value?: number | null;
   enum_value?: { gid: string; name: string } | null;
   multi_enum_values?: { gid: string; name: string }[] | null;
+  date_value?: { date?: string | null; date_time?: string | null } | null;
 }
 
 interface AsanaTask {
@@ -50,22 +62,43 @@ function setCached<T>(key: string, value: T) {
   cache.set(key, { value, expires: Date.now() + CACHE_TTL_MS });
 }
 
+function asanaNetworkError(err: unknown): Error {
+  const msg = err instanceof Error ? err.message : String(err);
+  const cause = err instanceof Error ? (err as Error & { cause?: unknown }).cause : undefined;
+  const code =
+    cause && typeof cause === "object" && cause !== null && "code" in cause
+      ? String((cause as { code: unknown }).code)
+      : "";
+  if (
+    code === "UND_ERR_CONNECT_TIMEOUT" ||
+    code === "UND_ERR_HEADERS_TIMEOUT" ||
+    /fetch failed|Connect Timeout|ECONNRESET|ENOTFOUND|ETIMEDOUT/i.test(`${msg} ${code}`)
+  ) {
+    return new Error("Couldn't reach Asana — connection timed out.");
+  }
+  return err instanceof Error ? err : new Error(msg);
+}
+
 async function asanaFetch<T = unknown>(path: string): Promise<T> {
   const token = process.env.ASANA_ACCESS_TOKEN;
   if (!token) throw new Error("ASANA_ACCESS_TOKEN is not configured");
 
   const url = path.startsWith("http") ? path : `${ASANA_BASE}${path}`;
-  const res = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: "application/json",
-    },
-  });
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`Asana API ${res.status}: ${body.slice(0, 300)}`);
+  try {
+    const res = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/json",
+      },
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`Asana API ${res.status}: ${body.slice(0, 300)}`);
+    }
+    return (await res.json()) as T;
+  } catch (err) {
+    throw asanaNetworkError(err);
   }
-  return (await res.json()) as T;
 }
 
 // Fetch all tasks in a project with custom fields expanded.
@@ -73,7 +106,7 @@ export async function fetchProjectTasks(
   projectGid: string,
   opts: { dueAfter?: string; dueBefore?: string; extraFields?: string } = {}
 ): Promise<AsanaTask[]> {
-  const baseFields = "name,due_on,due_at,completed,custom_fields,custom_fields.name,custom_fields.type,custom_fields.display_value,custom_fields.enum_value,custom_fields.multi_enum_values,custom_fields.text_value,custom_fields.number_value";
+  const baseFields = "name,due_on,due_at,completed,custom_fields,custom_fields.name,custom_fields.type,custom_fields.display_value,custom_fields.enum_value,custom_fields.multi_enum_values,custom_fields.text_value,custom_fields.number_value,custom_fields.date_value";
   const params = new URLSearchParams({
     opt_fields: opts.extraFields ? `${baseFields},${opts.extraFields}` : baseFields,
     limit: "100",
@@ -344,28 +377,83 @@ const isPersonField = (n: string) => /contact|attendee|stakeholder|champion|\bpe
 const isStatusField = (n: string) => /status|stage|state|progress/i.test(n);
 const isOwnerField = (n: string) => /owner|rep|\blead\b|assignee|responsible|bd\s*lead|account\s*lead/i.test(n);
 const isTypeField = (n: string) => /type|activity|category|channel|motion|initiative/i.test(n);
-const isDateField = (n: string) => /date|when|met|completed\s*on|activity\s*date/i.test(n);
+const isDateField = (n: string) => /date|when|completed\s*on|activity\s*date|\bmet\b/i.test(n);
 const isNotesField = (n: string) => /notes|comment|description|detail|summary/i.test(n);
 
-function parseActivity(task: AsanaTask, track: "BD" | "GTM"): AsanaActivity {
-  const dueDate = task.due_on || (task.due_at ? task.due_at.split("T")[0] : "");
-  const fieldDate = fieldByName(task, isDateField);
+function fieldDateValue(task: AsanaTask): string {
+  for (const f of task.custom_fields || []) {
+    if (!isDateField(f.name)) continue;
+    const fromVal = f.date_value?.date || f.date_value?.date_time || "";
+    const parsed = parseToIsoDate(fromVal) || parseToIsoDate(f.display_value || "");
+    if (parsed) return parsed;
+  }
+  return "";
+}
+
+/**
+ * Map an Asana BD/GTM task into an activity. When notes look like a pasted
+ * email/calendar thread, shared thread intel fills Type/Status/People (and
+ * Person/Company only when Asana custom fields left them blank).
+ */
+export function parseActivity(
+  task: AsanaTask,
+  track: "BD" | "GTM",
+  opts?: { aliases?: Set<string>; internal?: InternalConfig },
+): AsanaActivity {
+  const dueDate = parseToIsoDate(task.due_on || "") || parseToIsoDate(task.due_at || "");
+  const fieldDate = fieldDateValue(task);
   const section = task.memberships?.find((m) => m.section?.name)?.section?.name || "";
   // Built-in task description, else a custom "Notes"/"Comments" field (BD uses one).
-  const notes = (task.notes || "").trim() || fieldByName(task, isNotesField);
+  const rawNotes = (task.notes || "").trim() || fieldByName(task, isNotesField);
+  const existingPerson = fieldByName(task, isPersonField) || undefined;
+  const existingCompany = fieldByName(task, isCompanyField) || undefined;
+  const existingType = fieldByName(task, isTypeField) || undefined;
+  const existingStatus =
+    section || fieldByName(task, isStatusField) || (task.completed ? "Completed" : undefined);
+
+  const aliases = opts?.aliases ?? new Set(getActivityAliases());
+  const internal = opts?.internal ?? getInternalConfig();
+  const intel = enrichActivityFromThreadText(
+    {
+      subject: task.name || "",
+      body: rawNotes,
+      existingPerson,
+      existingCompany,
+      existingType,
+      existingStatus,
+    },
+    aliases,
+    internal,
+  );
+
+  let notes: string | undefined;
+  if (intel.detected) {
+    const audit = task.permalink_url ? `Asana: ${task.permalink_url}` : "";
+    const excerpt = emailBodyExcerpt(rawNotes, ACTIVITY_NOTES_BUDGET) || rawNotes;
+    notes = formatActivityNotes({
+      headLine: intel.headLine,
+      peopleLine: intel.peopleLine,
+      channelLine: intel.channelLine,
+      auditLine: audit,
+      bodyExcerpt: excerpt,
+      budget: ACTIVITY_NOTES_BUDGET,
+    });
+  } else if (rawNotes) {
+    notes = rawNotes.slice(0, ACTIVITY_NOTES_BUDGET);
+  }
 
   return {
     gid: task.gid,
     track,
     name: task.name,
-    date: (dueDate || fieldDate || "").slice(0, 10) || undefined,
+    date: dueDate || fieldDate || undefined,
     completed: Boolean(task.completed),
-    status: section || fieldByName(task, isStatusField) || (task.completed ? "Completed" : undefined),
+    status: intel.detected ? intel.status || existingStatus : existingStatus,
     owner: task.assignee?.name || fieldByName(task, isOwnerField) || undefined,
-    type: fieldByName(task, isTypeField) || undefined,
-    company: fieldByName(task, isCompanyField) || undefined,
-    person: fieldByName(task, isPersonField) || undefined,
-    notes: notes ? notes.slice(0, 600) : undefined,
+    type: intel.detected ? intel.type || existingType : existingType,
+    company: intel.company || existingCompany,
+    person: intel.person || existingPerson,
+    notes,
     url: task.permalink_url,
   };
 }
@@ -385,7 +473,27 @@ export async function fetchActivities(): Promise<AsanaActivity[]> {
     ...gtmTasks.map((t) => parseActivity(t, "GTM")),
   ];
   // Newest first; undated activities sink to the bottom.
-  out.sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+  out.sort((a, b) => compareIsoDatesDesc(a.date || "", b.date || ""));
+  // #region agent log
+  fetch("http://127.0.0.1:7724/ingest/5184a65b-0c76-4274-b203-81774fe31d23", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "3375d3" },
+    body: JSON.stringify({
+      sessionId: "3375d3",
+      hypothesisId: "D",
+      location: "asana.server.ts:fetchActivities",
+      message: "Asana activity date coverage",
+      data: {
+        n: out.length,
+        dated: out.filter((a) => a.date).length,
+        undated: out.filter((a) => !a.date).length,
+        isoOk: out.filter((a) => /^\d{4}-\d{2}-\d{2}$/.test(a.date || "")).length,
+        samples: out.slice(0, 8).map((a) => a.date || ""),
+      },
+      timestamp: Date.now(),
+    }),
+  }).catch(() => {});
+  // #endregion
   return out;
 }
 
@@ -410,12 +518,6 @@ export interface ActivityThread {
 }
 
 const EMAIL_RE = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
-// Skip shared/system mailboxes — they aren't people.
-const SYSTEM_LOCALPART = /^(no-?reply|do-?not-?reply|notifications?|mailer-daemon|postmaster|calendar|info|support|admin|sales|marketing|events?|team|hello|contact|help|billing)$/i;
-// Conferencing / calendar / automation domains whose addresses aren't people
-// (e.g. Zoom room connectors "<meeting-id>@zoomcrc.com", Google Calendar resources,
-// and Asana's own add-by-email addresses "x+<project-gid>@mail.asana.com").
-const NON_PERSON_DOMAIN = /(?:zoomcrc\.com|calendar\.google\.com|calendar-server\.|resource\.calendar\.|@?webex\.com$|teams\.microsoft\.com|asana\.com)$/i;
 
 const titleCaseWords = (s: string) => s.replace(/\b[a-z]/g, (c) => c.toUpperCase());
 
@@ -457,47 +559,110 @@ function parsePeople(text: string, excludeDomains: string[]): ParsedActivityPers
     const [local, domain] = email.split("@");
     if (!domain || out.has(email)) continue;
     if (excludeDomains.some((d) => domain === d || domain.endsWith(`.${d}`))) continue;
-    if (NON_PERSON_DOMAIN.test(domain)) continue;
-    if (SYSTEM_LOCALPART.test(local)) continue;
-    // Reject addresses whose local part has no letters (meeting IDs, etc.) — not a person.
-    if (!/[a-z]/i.test(local)) continue;
+    if (isNoiseEmail(email)) continue;
     out.set(email, { name: namesByEmail.get(email) || nameFromLocalPart(local), email, company: companyFromDomain(domain) });
   }
   return [...out.values()];
 }
 
-// Parse the given activities' threads into per-activity people lists. Re-fetches
-// the projects (cached) so it sees FULL notes, not the display-truncated copy.
+function peopleForThreadText(
+  text: string,
+  excludeDomains: string[],
+): ParsedActivityPerson[] {
+  return parsePeople(text, excludeDomains).filter((p) => !isNameOnlyAttendeeEmail(p.email));
+}
+
+function peopleForGmailActivity(
+  a: AsanaActivity,
+  excludeDomains: string[],
+): ParsedActivityPerson[] {
+  const fromLine = peopleEntriesFromActivity(a).filter(
+    (p) => !isNameOnlyAttendeeEmail(p.email),
+  );
+  const out: ParsedActivityPerson[] = [];
+  const seen = new Set<string>();
+  for (const p of fromLine) {
+    const email = p.email.toLowerCase();
+    const domain = email.split("@")[1] || "";
+    if (seen.has(email)) continue;
+    if (excludeDomains.some((d) => domain === d || domain.endsWith(`.${d}`))) continue;
+    if (isNoiseEmail(email)) continue;
+    seen.add(email);
+    out.push({
+      name: p.name,
+      email,
+      company: companyFromDomain(domain),
+    });
+  }
+  // Fall back to full-text scan when People line was missing.
+  if (out.length === 0) {
+    return peopleForThreadText(`${a.name}\n${a.notes || ""}`, excludeDomains);
+  }
+  return out;
+}
+
+// Parse the given activities' threads into per-activity people lists.
+// Asana gids re-fetch project tasks (full notes). gmail-* gids load alias
+// activities and use the People line / notes (Source contacts on PortCo pages).
 export async function parseActivityThreads(
   activityGids: string[],
   excludeDomains: string[] = ["dell.com"],
 ): Promise<ActivityThread[]> {
+  const aliases = new Set(getActivityAliases().map((e) => e.toLowerCase()));
+  const internal = getInternalConfig();
+  const skipDomains = [
+    ...excludeDomains,
+    ...[...internal.domains],
+  ].map((d) => d.toLowerCase());
+  const skipPerson = (email: string) =>
+    aliases.has(email.toLowerCase()) ||
+    isInternalEmail(email, internal) ||
+    isNoiseEmail(email);
+
+  const asanaWanted = new Set(activityGids.filter((g) => !g.startsWith("gmail-")));
+  const gmailWanted = new Set(activityGids.filter((g) => g.startsWith("gmail-")));
+  const out: ActivityThread[] = [];
+
   const bdGid = process.env.ASANA_BD_PROJECT_GID;
   const gtmGid = process.env.ASANA_GTM_PROJECT_GID;
-  if (!bdGid && !gtmGid) return [];
-  const wanted = new Set(activityGids);
-
-  const [bd, gtm] = await Promise.all([
-    bdGid ? fetchProjectTasks(bdGid, { extraFields: RICH_TASK_FIELDS }) : Promise.resolve([]),
-    gtmGid ? fetchProjectTasks(gtmGid, { extraFields: RICH_TASK_FIELDS }) : Promise.resolve([]),
-  ]);
-  const tagged: { task: AsanaTask; track: "BD" | "GTM" }[] = [
-    ...bd.map((t) => ({ task: t, track: "BD" as const })),
-    ...gtm.map((t) => ({ task: t, track: "GTM" as const })),
-  ];
-
-  const out: ActivityThread[] = [];
-  for (const { task, track } of tagged) {
-    if (!wanted.has(task.gid)) continue;
-    const text = `${task.name}\n${task.notes || ""}`;
-    out.push({
-      gid: task.gid,
-      track,
-      name: task.name,
-      text,
-      date: (task.due_on || (task.due_at ? task.due_at.split("T")[0] : "")) || undefined,
-      people: parsePeople(text, excludeDomains),
-    });
+  if (asanaWanted.size > 0 && (bdGid || gtmGid)) {
+    const [bd, gtm] = await Promise.all([
+      bdGid ? fetchProjectTasks(bdGid, { extraFields: RICH_TASK_FIELDS }) : Promise.resolve([]),
+      gtmGid ? fetchProjectTasks(gtmGid, { extraFields: RICH_TASK_FIELDS }) : Promise.resolve([]),
+    ]);
+    const tagged: { task: AsanaTask; track: "BD" | "GTM" }[] = [
+      ...bd.map((t) => ({ task: t, track: "BD" as const })),
+      ...gtm.map((t) => ({ task: t, track: "GTM" as const })),
+    ];
+    for (const { task, track } of tagged) {
+      if (!asanaWanted.has(task.gid)) continue;
+      const text = `${task.name}\n${task.notes || ""}`;
+      out.push({
+        gid: task.gid,
+        track,
+        name: task.name,
+        text,
+        date: parseToIsoDate(task.due_on || "") || parseToIsoDate(task.due_at || "") || fieldDateValue(task) || undefined,
+        people: peopleForThreadText(text, skipDomains).filter((p) => !skipPerson(p.email)),
+      });
+    }
   }
+
+  if (gmailWanted.size > 0) {
+    const acts = await fetchAliasActivities().catch(() => [] as AsanaActivity[]);
+    for (const a of acts) {
+      if (!gmailWanted.has(a.gid)) continue;
+      const text = `${a.name}\n${a.notes || ""}`;
+      out.push({
+        gid: a.gid,
+        track: a.track,
+        name: a.name,
+        text,
+        date: parseToIsoDate(a.date) || a.date,
+        people: peopleForGmailActivity(a, skipDomains).filter((p) => !skipPerson(p.email)),
+      });
+    }
+  }
+
   return out;
 }

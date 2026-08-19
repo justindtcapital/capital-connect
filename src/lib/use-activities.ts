@@ -1,7 +1,7 @@
-// Shared client-side loader for Asana BD/GTM activities. The detail panels (Contact
-// and PortCo) all call this; a module-level cache + in-flight promise dedupes the
-// fetch so opening several records doesn't re-hit the server (which is itself cached
-// 5 min). Refreshes once per page load.
+// Shared client-side loader for BD/GTM activities from the sheet tabs. The detail
+// panels (Contact and PortCo) all call this; a module-level cache + in-flight
+// promise dedupes the fetch so opening several records doesn't re-hit the server
+// (which is itself cached 5 min). Refreshes once per page load.
 
 import { useEffect, useState } from "react";
 import { fetchAsanaActivities } from "@/utils/asana.functions";

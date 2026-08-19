@@ -21,6 +21,7 @@ import {
   APP_EVENT_HEADERS,
 } from "./sheets.server";
 import { normalizeInteractionType, targetKeyOf } from "@/lib/types";
+import { todayIso } from "@/lib/sheet-date";
 import type { JsonValue } from "./llm.server";
 
 // A1 column letters for any index (0 → A, 26 → AA, …).
@@ -112,7 +113,7 @@ export async function applyQueryWrite(
         await appendInteractionRows([
           {
             email,
-            date: new Date().toISOString().split("T")[0],
+            date: todayIso(),
             summary: note,
             type,
             requiresFollowUp: d.requiresFollowUp === true,
